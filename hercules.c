@@ -1435,7 +1435,7 @@ static void join_thread(pthread_t pt)
 }
 
 struct hercules_stats
-hercules_tx(const char* filename, const struct hercules_path *path, int max_rate_limit, bool enable_pcc, int xdp_mode)
+hercules_tx(const char* filename, const struct hercules_path *paths, int num_paths, int max_rate_limit, bool enable_pcc, int xdp_mode)
 {
 	// Open mmaped send file
 	int f = open(filename, O_RDONLY);
@@ -1457,12 +1457,12 @@ hercules_tx(const char* filename, const struct hercules_path *path, int max_rate
 	}
 	close(f);
 
-	const size_t chunklen = path->payloadlen - rbudp_headerlen;
+	const size_t chunklen = paths->payloadlen - rbudp_headerlen;
 	init_tx_state(filesize, chunklen, max_rate_limit, mem);
 
 	struct sender_path_state *path_state = calloc(1, sizeof(struct sender_path_state));
 	path_state_for_stats = path_state; // TODO get rid of this workaround
-	memcpy(&path_state->path, path, sizeof(struct hercules_path));
+	memcpy(&path_state->path, paths, sizeof(struct hercules_path));
 
 	// Open RAW socket for control messages
 	int sockfd = socket_on_if(opt_ifindex);
