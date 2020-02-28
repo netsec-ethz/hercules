@@ -138,6 +138,9 @@ func realMain() error {
 	}
 
 	local, err := parseSCIONAddrs(localAddr)
+	if local.Host.L4 == nil {
+		return errors.New("You must specify a source port")
+	}
 	if err != nil {
 		return err
 	}
@@ -159,7 +162,10 @@ func realMain() error {
 		if err != nil {
 			return err
 		}
-		return mainTx(transmitFilename, local, remote, iface, queue, maxRateLimit, enablePCC, xdpMode, dumpInterval)
+		if remote.Host.L4 == nil {
+			return errors.New("You must specify a destination port")
+		}
+		return mainTx(transmitFilename, local, remote, iface, queue, maxRateLimit, enablePCC, xdpMode, dumpInterval, numPaths)
 	}
 	return mainRx(outputFilename, local, iface, queue, xdpMode, dumpInterval)
 }
