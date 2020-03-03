@@ -35,6 +35,7 @@ struct ccontrol_state {
 	float sign;
 	int adjust_iter;
 	unsigned long mi_start;
+	u32 mi_tx_npkts;
 
 	struct rct rcts[RCTS_INTERVALS];
 	int rcts_iter;
@@ -50,7 +51,7 @@ struct ccontrol_state {
  * @result	A ccontrol_state struct
 */
 // Initialize congestion control state
-struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 total_chunks);
+struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 total_chunks, size_t num_paths);
 
 // Apply PCC control decision, return new rate
 u32 pcc_control(struct ccontrol_state *cc_state, float throughput, float loss);

@@ -12,26 +12,30 @@
 
 #define MSS 1460
 
-struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 total_chunks)
+struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 total_chunks, size_t num_paths)
 {
-	struct ccontrol_state *cc_state = calloc(1, sizeof(*cc_state));
-	cc_state->max_rate_limit = max_rate_limit;
-	cc_state->rtt = rtt / 1e9;
-	bitset__create(&cc_state->mi_acked_chunks, total_chunks);
+	struct ccontrol_state *cc_states = calloc(num_paths, sizeof(struct ccontrol_state));
+	for (size_t i = 0; i < num_paths; i++) {
+		struct ccontrol_state *cc_state = &cc_states[i];
+		cc_state->max_rate_limit = max_rate_limit;
+		cc_state->rtt = rtt / 1e9;
+		bitset__create(&cc_state->mi_acked_chunks, total_chunks);
 
-	float m = (rand() % 6) / 10.f + 1.7; // m in [1.7, 2.2]
-	cc_state->pcc_mi_duration = m * cc_state->rtt;
+		float m = (rand() % 6) / 10.f + 1.7; // min [1.7, 2.2]
+		cc_state->pcc_mi_duration = m * cc_state->rtt;
 
-	u32 initial_rate = umin32((u32)(MSS / cc_state->rtt), max_rate_limit);
+		u32 initial_rate = umin32((u32) (MSS / cc_state->rtt), max_rate_limit);
 
-	cc_state->state = pcc_startup;
-	cc_state->prev_rate = initial_rate;
-	cc_state->curr_rate = initial_rate;
-	cc_state->eps = EPS_MIN;
-	cc_state->sign = 1;
-	cc_state->mi_start = get_nsecs();
-	cc_state->rcts_iter = -1;
-	return cc_state;
+		cc_state->state = pcc_startup;
+		cc_state->prev_rate = initial_rate;
+		cc_state->curr_rate = initial_rate;
+		cc_state->eps = EPS_MIN;
+		cc_state->sign = 1;
+		cc_state->mi_start = get_nsecs();
+		cc_state->rcts_iter = -1;
+		cc_state->mi_tx_npkts = 0;
+	}
+	return cc_states;
 }
 
 // XXX: explicitly use symbols from old libc version to allow building on

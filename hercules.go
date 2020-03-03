@@ -23,7 +23,9 @@ package main
 // #include <stdlib.h>
 // #include <string.h>
 import "C"
-import "unsafe"
+import (
+	"unsafe"
+)
 
 import (
 	"context"
@@ -43,6 +45,7 @@ import (
 	"github.com/scionproto/scion/go/lib/snet"
 	"github.com/scionproto/scion/go/lib/sock/reliable"
 	"github.com/scionproto/scion/go/lib/spath"
+	"github.com/scionproto/scion/go/lib/spath/spathmeta"
 	"github.com/scionproto/scion/go/lib/spkt"
 	"github.com/vishvananda/netlink"
 	"net"
@@ -58,6 +61,11 @@ type HerculesPath struct {
 }
 
 type herculesStats = C.struct_hercules_stats
+
+type TxPath struct {
+	overlayAddr *overlay.OverlayAddr
+	path        *spath.Path
+}
 
 const (
 	etherLen    int = 1500
@@ -84,6 +92,7 @@ func realMain() error {
 		localAddr        string
 		maxRateLimit     int
 		mode             string
+		numPaths         int
 		queue            int
 		remoteAddr       string
 		transmitFilename string
@@ -102,6 +111,7 @@ func realMain() error {
 	flag.StringVar(&transmitFilename, "t", "", "transmit file (sender)")
 	flag.StringVar(&outputFilename, "o", "", "output file (receiver)")
 	flag.StringVar(&verbose, "v", "", "verbose output (from v to vvv)")
+	flag.IntVar(&numPaths, "np", 1, "Maximum number of different paths to use at the same time")
 	flag.Parse()
 
 	if (transmitFilename == "") == (outputFilename == "") {
@@ -128,6 +138,9 @@ func realMain() error {
 	}
 
 	local, err := parseSCIONAddrs(localAddr)
+	if local.Host.L4 == nil {
+		return errors.New("You must specify a source port")
+	}
 	if err != nil {
 		return err
 	}
@@ -149,27 +162,37 @@ func realMain() error {
 		if err != nil {
 			return err
 		}
-		return mainTx(transmitFilename, local, remote, iface, queue, maxRateLimit, enablePCC, xdpMode, dumpInterval)
+		if remote.Host.L4 == nil {
+			return errors.New("You must specify a destination port")
+		}
+		return mainTx(transmitFilename, local, remote, iface, queue, maxRateLimit, enablePCC, xdpMode, dumpInterval, numPaths)
 	}
 	return mainRx(outputFilename, local, iface, queue, xdpMode, dumpInterval)
 }
 
-func mainTx(filename string, src, dst *snet.Addr, iface *net.Interface, queue int, maxRateLimit int, enablePCC bool, xdpMode int, dumpInterval time.Duration) (err error) {
-
-	dst.NextHop, dst.Path, err = resolvePath(src, dst)
+func mainTx(filename string, src, dst *snet.Addr, iface *net.Interface, queue int, maxRateLimit int, enablePCC bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
+	var txPaths []TxPath
+	txPaths, err = resolvePaths(src, dst, numPaths)
 	if err != nil {
 		fmt.Println("Unable to resolve SCION path.")
 		return err
 	}
-	path, err := prepareSCIONPacketHeader(src, dst, iface)
-	if err != nil {
-		return err
+
+	var paths []HerculesPath
+	for _, txPath := range txPaths {
+		curDst := dst.Copy()
+		curDst.NextHop, curDst.Path = txPath.overlayAddr, txPath.path
+		path, err := prepareSCIONPacketHeader(src, curDst, iface)
+		if err != nil {
+			return err
+		}
+		paths = append(paths, *path)
 	}
 
 	herculesInit(iface, src, queue)
 	go statsDumper(true, dumpInterval)
 	go cleanupOnSignal()
-	stats := herculesTx(filename, *path, maxRateLimit, enablePCC, xdpMode)
+	stats := herculesTx(filename, paths, maxRateLimit, enablePCC, xdpMode)
 	printSummary(stats)
 	return nil
 	//ticker := time.NewTicker(500 * time.Millisecond)
@@ -388,12 +411,14 @@ func herculesInit(iface *net.Interface, local *snet.Addr, queue int) {
 	activeInterface = iface
 }
 
-func herculesTx(filename string, path HerculesPath, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
+func herculesTx(filename string, paths []HerculesPath, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
 	filenamec := C.CString(filename)
 	defer C.free(unsafe.Pointer(filenamec))
-	p := C.struct_hercules_path{}
-	toCPath(path, &p)
-	return C.hercules_tx(filenamec, &p, C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
+	p := make([]C.struct_hercules_path, len(paths))
+	for i, path := range paths {
+		toCPath(path, &p[i])
+	}
+	return C.hercules_tx(filenamec, &p[0], C.int(len(paths)), C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
 }
 
 // HerculesGetReplyPath creates a reply path header for the packet header in headerPtr with given length.
@@ -782,32 +807,53 @@ func getSCIONDPath(ia *addr.IA) string {
 	return sciond.GetDefaultSCIONDPath(ia)
 }
 
-func resolvePath(src, dst *snet.Addr) (*overlay.OverlayAddr, *spath.Path, error) {
+func resolvePaths(src, dst *snet.Addr, numPaths int) ([]TxPath, error) {
 
 	if src.IA == dst.IA {
 		hop, err := overlay.NewOverlayAddr(dst.Host.L3, addr.NewL4UDPInfo(overlay.EndhostPort))
-		return hop, nil, err
+		return []TxPath{{hop, nil}}, err
 	}
-	return resolveRemotePath(src.IA, dst.IA)
+	return resolveRemotePaths(src.IA, dst.IA, numPaths)
 }
 
-// XXX: copied from snet/internal/pathsource
-func resolveRemotePath(srcIA, dstIA addr.IA) (*overlay.OverlayAddr, *spath.Path, error) {
-
+func resolveRemotePaths(srcIA, dstIA addr.IA, numPaths int) ([]TxPath, error) {
 	resolver := snet.DefNetwork.PathResolver()
 
-	paths := resolver.Query(context.Background(), srcIA, dstIA, sciond.PathReqFlags{})
-	sciondPath := paths.GetAppPath("")
-	if sciondPath == nil {
-		return nil, nil, errors.New("No path")
+	availablePaths := resolver.Query(context.Background(), srcIA, dstIA, sciond.PathReqFlags{})
+
+	selectedPaths := make([]*spathmeta.AppPath, 0, numPaths)
+	if len(availablePaths) == 0 {
+		return nil, errors.New("No path")
 	}
-	path := &spath.Path{Raw: sciondPath.Entry.Path.FwdPath}
-	if err := path.InitOffsets(); err != nil {
-		return nil, nil, err
+
+	// TODO choose paths more cleverly
+	for _, p := range availablePaths {
+		selectedPaths = append(selectedPaths, p)
+		if len(selectedPaths) >= numPaths {
+			break
+		}
 	}
-	overlayAddr, err := sciondPath.Entry.HostInfo.Overlay()
-	if err != nil {
-		return nil, nil, err
+	if len(selectedPaths) == 1 {
+		fmt.Printf("Using 1 path:\n")
+		fmt.Printf("\t%s\n", selectedPaths[0].Entry.Path)
+	} else {
+		fmt.Printf("Using %d paths:\n", len(selectedPaths))
+		for _, p := range selectedPaths {
+			fmt.Printf("\t%s\n", p.Entry.Path)
+		}
 	}
-	return overlayAddr, path, nil
+
+	paths := make([]TxPath, 0, len(selectedPaths))
+	for _, p := range selectedPaths {
+		path := &spath.Path{Raw: p.Entry.Path.FwdPath}
+		if err := path.InitOffsets(); err != nil {
+			return nil, err
+		}
+		overlayAddr, err := p.Entry.HostInfo.Overlay()
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, TxPath{overlayAddr, path})
+	}
+	return paths, nil
 }
