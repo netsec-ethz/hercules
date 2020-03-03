@@ -128,7 +128,7 @@ For data packets (sender to receiver), the index field is the index of the chunk
 	  The congestion control naturally solves this too, but is fairly slow to adapt.
 	  Maybe a simple window size would work.
 * [ ] Abort of transmission not handled (if one side is stopped, the other side will wait forever).
-* [ ] Jumbo frames; requires increasing FRAME_SIZE
+* [ ] Jumbo frames; requires increasing FRAME_SIZE (but there are additional limitations, since "XDP doesn't support packets spanning more than one memory page.")
 * [ ] (Huge) Move SCION packet parsing & port dispatching to an XDP program;
       Allows that SCION traffic can go through while hercules is running & allows running multiple instances of hercules on same NIC.
 * [ ] Use multiple paths; some tricky parts may be "load balancing", splitting the congestion control and applying separate rate limits.

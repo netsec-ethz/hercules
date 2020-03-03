@@ -175,17 +175,15 @@ struct sender_state {
 
 	struct bitset acked_chunks;
 
+	struct hercules_path path;
+
 	u64 handshake_rtt; // Handshake RTT in ns
+	struct ccontrol_state *cc_state;
 	_Atomic u32 rate_limit;
 
 	// Start/end time of the current transfer
 	u64 start_time;
 	u64 end_time;
-};
-
-struct sender_path_state {
-    struct hercules_path path;
-    struct ccontrol_state *cc_state;
 };
 
 // XXX: cleanup naming: these things are called `opt_XXX` because they corresponded to options in the example application.
@@ -199,7 +197,6 @@ static u32 prog_id;
 
 static struct receiver_state *rx_state;
 static struct sender_state *tx_state;
-static struct sender_path_state *path_state_for_stats; // TODO get rid of this workaround
 
 // State for transmit rate control
 static size_t tx_npkts;
@@ -633,7 +630,7 @@ static void send_eth_frame(int sockfd, void *buf, size_t len)
 	}
 }
 
-static void tx_register_acks(const struct rbudp_ack_pkt *ack, const struct sender_path_state *path_state)
+static void tx_register_acks(const struct rbudp_ack_pkt *ack)
 {
 	for(uint16_t e = 0; e < ack->num_acks; ++e)
 	{
@@ -645,60 +642,60 @@ static void tx_register_acks(const struct rbudp_ack_pkt *ack, const struct sende
 		for(u32 i = begin; i < end; ++i) { // XXX: this can *obviously* be optimized
 			bitset__set(&tx_state->acked_chunks, i);
 		}
-		if (path_state->cc_state) {
+		if (tx_state->cc_state) {
 			// Counts ACKed packets from the range that was sent during the MI.
 			// ack_start is the packet with the lowest index sent during the MI,
 			// ack_end the packet with the highest index that could have been sent during the MI
 			// TODO: Improve the granularity of the accounting of the ACKed packets during a MI
 			// if required by the CC algorithm.
-			const u32 begin_cc = umax32(begin, path_state->cc_state->ack_start);
-			const u32 end_cc = umin32(end, path_state->cc_state->ack_end + 1);
+			const u32 begin_cc = umax32(begin, tx_state->cc_state->ack_start);
+			const u32 end_cc = umin32(end, tx_state->cc_state->ack_end + 1);
 			for(u32 i = begin_cc; i < end_cc; ++i) {
-				bitset__set(&path_state->cc_state->mi_acked_chunks, i);
+				bitset__set(&tx_state->cc_state->mi_acked_chunks, i);
 			}
 		}
 	}
 }
 
-static bool pcc_mi_elapsed(const struct sender_path_state *path_state)
+static bool pcc_mi_elapsed()
 {
 	unsigned long now = get_nsecs();
-	unsigned long dt = now - path_state->cc_state->mi_start;
-	return dt > (path_state->cc_state->pcc_mi_duration + path_state->cc_state->rtt) * 1e9;
+	unsigned long dt = now - tx_state->cc_state->mi_start;
+	return dt > (tx_state->cc_state->pcc_mi_duration + tx_state->cc_state->rtt) * 1e9;
 }
 
-static void pcc_monitor(const struct sender_path_state *path_state)
+static void pcc_monitor(void)
 {
-	if (pcc_mi_elapsed(path_state)) {
-		u32 sent_mi = path_state->cc_state->curr_rate * path_state->cc_state->pcc_mi_duration; // pkts sent in MI
-		u32 acked_mi = path_state->cc_state->mi_acked_chunks.num_set; // acked pkts from MI
+	if (pcc_mi_elapsed()) {
+		u32 sent_mi = tx_state->cc_state->curr_rate * tx_state->cc_state->pcc_mi_duration; // pkts sent in MI
+		u32 acked_mi = tx_state->cc_state->mi_acked_chunks.num_set; // acked pkts from MI
 
 		sent_mi = umax32(sent_mi, 1);
 		acked_mi = umin32(acked_mi, sent_mi);
 		float loss = (sent_mi - acked_mi) / sent_mi;
-		float throughput = path_state->cc_state->curr_rate * (1 - loss);
+		float throughput = tx_state->cc_state->curr_rate * (1 - loss);
 
-		u32 new_rate = pcc_control(path_state->cc_state, throughput, loss);
+		u32 new_rate = pcc_control(tx_state->cc_state, throughput, loss);
 		tx_state->rate_limit = new_rate; // Update atomic rate_limit, only read from tx_only
 
 		bool retransmitting = tx_npkts > tx_state->total_chunks;
 		// Reset MI state info, only safe because no acks are processed during those updates
-		bitset__reset(&path_state->cc_state->mi_acked_chunks);
+		bitset__reset(&tx_state->cc_state->mi_acked_chunks);
 		if (!retransmitting) {
-			path_state->cc_state->ack_start = tx_npkts;
-			path_state->cc_state->ack_end = path_state->cc_state->ack_start + new_rate * path_state->cc_state->pcc_mi_duration; // misses acks from a MI straddling initial transmissions and retransmission (efficiency trade-off)
+			tx_state->cc_state->ack_start = tx_npkts;
+			tx_state->cc_state->ack_end = tx_state->cc_state->ack_start + new_rate * tx_state->cc_state->pcc_mi_duration; // misses acks from a MI straddling initial transmissions and retransmission (efficiency trade-off)
 		} else {
 			// overestimates the number of pkts sent during MI (tx_state->cc_state->mi_start not yet updated)
-			path_state->cc_state->ack_start =  bitset__scan_neg(&tx_state->acked_chunks, 0);
+			tx_state->cc_state->ack_start =  bitset__scan_neg(&tx_state->acked_chunks, 0);
 			// underestimates the number of pkts sent during MI (does not wrap)
-			path_state->cc_state->ack_end = bitset__scan_neg_n(&tx_state->acked_chunks, path_state->cc_state->ack_start, new_rate * path_state->cc_state->pcc_mi_duration);
+			tx_state->cc_state->ack_end = bitset__scan_neg_n(&tx_state->acked_chunks, tx_state->cc_state->ack_start, new_rate * tx_state->cc_state->pcc_mi_duration);
 		}
 
-		path_state->cc_state->mi_start = get_nsecs(); // start new MI
+		tx_state->cc_state->mi_start = get_nsecs(); // start new MI
 	}
 }
 
-static void tx_recv_acks(int sockfd, const struct sender_path_state *state)
+static void tx_recv_acks(int sockfd)
 {
 	struct timeval to = { .tv_sec = 0, .tv_usec = 100 };
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
@@ -710,12 +707,12 @@ static void tx_recv_acks(int sockfd, const struct sender_path_state *state)
 		if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen)) {
 			const struct rbudp_ack_pkt *ack = (const struct rbudp_ack_pkt*)payload;
 			if((u32)payloadlen >= ack__len(ack)) {
-                tx_register_acks(ack, state);
+				tx_register_acks(ack);
 			}
 		}
 
-		if(state->cc_state) {
-            pcc_monitor(state);
+		if(tx_state->cc_state) {
+			pcc_monitor();
 		}
 	}
 }
@@ -780,11 +777,11 @@ static void tx_send_initial(int sockfd, const struct hercules_path *path, size_t
 	send_eth_frame(sockfd, buf, path->framelen);
 }
 
-static bool tx_handshake(int sockfd, const struct sender_path_state *path_state)
+static bool tx_handshake(int sockfd)
 {
 	for(int i = 0; i < tx_handshake_retries; ++i) {
 		unsigned long timestamp = get_nsecs();
-		tx_send_initial(sockfd, &path_state->path, tx_state->filesize, tx_state->chunklen, timestamp);
+		tx_send_initial(sockfd, &tx_state->path, tx_state->filesize, tx_state->chunklen, timestamp);
 		if(tx_await_rtt_ack(sockfd)) {
 			return true;
 		}
@@ -939,14 +936,12 @@ static void send_batch(struct xsk_socket_info *xsk, u32 *frame_nb, const struct 
 		const size_t chunk_start = (size_t)chunk_idx * tx_state->chunklen;
 		const size_t len = umin64(tx_state->chunklen, tx_state->filesize - chunk_start);
 
-		// TODO put path header
 		fill_rbudp_pkt(pkt + path->headerlen, chunk_idx, tx_state->mem + chunk_start, len, path->payloadlen);
 		stitch_checksum(path, pkt);
 	}
 	submit_batch(xsk, frame_nb, i);
 }
 
-// TODO obsolete
 static void splat_path(struct xsk_socket_info *xsk, const struct hercules_path *path) {
 	// splat header into umem
 	void *buffer = xsk->umem->buffer;
@@ -970,7 +965,7 @@ static void tx_transmit_round(struct xsk_socket_info *xsk, u32 *frame_nb, const 
 			chunks[i] = chunk_idx++;
 		}
 		send_batch(xsk, frame_nb, path, chunks, i);
-		rate_limit_tx(); // TODO refactor rate limit to consider different paths
+		rate_limit_tx();
 	}
 }
 
@@ -1045,10 +1040,10 @@ static void tx_retransmit_round(struct xsk_socket_info *xsk, u32 *frame_nb, cons
 	}
 }
 
-static void tx_only(struct xsk_socket_info *xsk, const struct sender_path_state *path_state)
+static void tx_only(struct xsk_socket_info *xsk)
 {
-	const struct hercules_path *path = &path_state->path;
-    splat_path(xsk, path);
+	const struct hercules_path *path = &tx_state->path;
+	splat_path(xsk, path);
 
 	prev_rate_check = get_nsecs();
 	u64 prev_round_start = prev_rate_check;
@@ -1070,7 +1065,7 @@ static void tx_only(struct xsk_socket_info *xsk, const struct sender_path_state 
 	}
 }
 
-static void init_tx_state(size_t filesize, int chunklen, int max_rate_limit, char *mem)
+static void init_tx_state(size_t filesize, int chunklen, int max_rate_limit, const struct hercules_path *path, char *mem)
 {
 	tx_state = calloc(1, sizeof(*tx_state));
 	tx_state->filesize = filesize;
@@ -1082,6 +1077,7 @@ static void init_tx_state(size_t filesize, int chunklen, int max_rate_limit, cha
 	tx_state->rate_limit = max_rate_limit;
 	tx_state->start_time = 0;
 	tx_state->end_time = 0;
+	memcpy(&tx_state->path, path, sizeof(struct hercules_path));
 }
 
 static struct receiver_state* make_rx_state(size_t filesize, int chunklen)
@@ -1328,18 +1324,13 @@ static int load_xsk_nop_passthrough()
 	return 0;
 }
 
-struct tx_p_args {
-	int xdp_mode;
-	const struct sender_path_state *path_state;
-};
-
 static void *tx_p(void *arg)
 {
-	struct tx_p_args *args = (struct tx_p_args *)arg;
+	int xdp_mode = *(int *)arg;
 
 	load_xsk_nop_passthrough();
-	struct xsk_socket_info *xsk = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, args->xdp_mode);
-	tx_only(xsk, args->path_state);
+	struct xsk_socket_info *xsk = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, xdp_mode);
+	tx_only(xsk);
 	close_xsk(xsk);
 
 	return NULL;
@@ -1368,7 +1359,7 @@ void hercules_init(int ifindex, const struct hercules_app_addr local_addr_, int 
 
 }
 
-static struct hercules_stats tx_stats(struct sender_state *t, const struct sender_path_state *path_state) {
+static struct hercules_stats tx_stats(struct sender_state *t) {
 	return (struct hercules_stats){
 		.start_time = t->start_time,
 		.end_time = t->end_time,
@@ -1376,7 +1367,7 @@ static struct hercules_stats tx_stats(struct sender_state *t, const struct sende
 		.tx_npkts = tx_npkts,
 		.rx_npkts = rx_npkts,
 		.filesize = t->filesize,
-		.framelen = path_state->path.framelen,
+		.framelen = t->path.framelen,
 		.chunklen = t->chunklen,
 		.total_chunks = t->total_chunks,
 		.completed_chunks = t->acked_chunks.num_set,
@@ -1409,8 +1400,7 @@ struct hercules_stats hercules_get_stats()
 	}
 
 	if(tx_state) {
-		// TODO use all paths for stats
-		return tx_stats(tx_state, path_state_for_stats);
+		return tx_stats(tx_state);
 	} else {
 		return rx_stats(rx_state);
 	}
@@ -1435,7 +1425,7 @@ static void join_thread(pthread_t pt)
 }
 
 struct hercules_stats
-hercules_tx(const char* filename, const struct hercules_path *paths, int num_paths, int max_rate_limit, bool enable_pcc, int xdp_mode)
+hercules_tx(const char* filename, const struct hercules_path *path, int max_rate_limit, bool enable_pcc, int xdp_mode)
 {
 	// Open mmaped send file
 	int f = open(filename, O_RDONLY);
@@ -1457,12 +1447,8 @@ hercules_tx(const char* filename, const struct hercules_path *paths, int num_pat
 	}
 	close(f);
 
-	const size_t chunklen = paths->payloadlen - rbudp_headerlen;
-	init_tx_state(filesize, chunklen, max_rate_limit, mem);
-
-	struct sender_path_state *path_state = calloc(1, sizeof(struct sender_path_state));
-	path_state_for_stats = path_state; // TODO get rid of this workaround
-	memcpy(&path_state->path, paths, sizeof(struct hercules_path));
+	const size_t chunklen = path->payloadlen - rbudp_headerlen;
+	init_tx_state(filesize, chunklen, max_rate_limit, path, mem);
 
 	// Open RAW socket for control messages
 	int sockfd = socket_on_if(opt_ifindex);
@@ -1470,17 +1456,17 @@ hercules_tx(const char* filename, const struct hercules_path *paths, int num_pat
 		exit_with_error(errno);
 	}
 
-	if(!tx_handshake(sockfd, path_state)) {
+	if(!tx_handshake(sockfd)) {
 		exit_with_error(ETIMEDOUT);
 	}
 
 	if(enable_pcc) {
-		path_state->cc_state = init_ccontrol_state(max_rate_limit, tx_state->handshake_rtt, tx_state->total_chunks);
+		tx_state->cc_state = init_ccontrol_state(max_rate_limit, tx_state->handshake_rtt, tx_state->total_chunks);
 	}
 
-	if (path_state->cc_state) {
-		debug_printf("handshake_rtt: %fs, MI: %fs", tx_state->handshake_rtt/1e9, path_state->cc_state->pcc_mi_duration);
-		tx_state->rate_limit = path_state->cc_state->curr_rate; // Set initial send rate for PCC
+	if (tx_state->cc_state) {
+		debug_printf("handshake_rtt: %fs, MI: %fs", tx_state->handshake_rtt/1e9, tx_state->cc_state->pcc_mi_duration);
+		tx_state->rate_limit = tx_state->cc_state->curr_rate; // Set initial send rate for PCC
 	} else {
 		tx_state->rate_limit = max_rate_limit;
 	}
@@ -1494,22 +1480,18 @@ hercules_tx(const char* filename, const struct hercules_path *paths, int num_pat
 
 	tx_state->start_time = get_nsecs();
 	running = true;
-	struct tx_p_args args = {
-	        xdp_mode,
-	        path_state,
-	};
-	pthread_t worker = start_thread(tx_p, &args);
+	pthread_t worker = start_thread(tx_p, &xdp_mode);
 
-	tx_recv_acks(sockfd, path_state);
+	tx_recv_acks(sockfd);
 
 	tx_state->end_time = get_nsecs();
 	running = false;
 	join_thread(worker);
 
-	struct hercules_stats stats = tx_stats(tx_state, path_state);
+	struct hercules_stats stats = tx_stats(tx_state);
 
 	bitset__destroy(&tx_state->acked_chunks);
-	free(path_state->cc_state);
+	free(tx_state->cc_state);
 	free(tx_state);
 	close(sockfd);
 
