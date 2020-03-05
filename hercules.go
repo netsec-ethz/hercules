@@ -51,6 +51,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -76,6 +77,17 @@ var (
 	activeInterface *net.Interface // activeInterface remembers the chosen interface for callbacks from C
 )
 
+type arrayFlags []string
+
+func (i *arrayFlags) String() string {
+	return "[\n\t\"" + strings.Join(*i, "\",\n\t\"") + "\"\n]"
+}
+
+func (i *arrayFlags) Set(value string) error {
+	*i = append(*i, value)
+	return nil
+}
+
 func main() {
 	err := realMain()
 	if err != nil {
@@ -94,7 +106,7 @@ func realMain() error {
 		mode             string
 		numPaths         int
 		queue            int
-		remoteAddr       string
+		remoteAddrs      arrayFlags
 		transmitFilename string
 		outputFilename   string
 		verbose          string
@@ -107,11 +119,11 @@ func realMain() error {
 	flag.IntVar(&maxRateLimit, "p", 3333333, "Maximum allowed send rate in Packets per Second (default: 3'333'333, ~40Gbps)")
 	flag.StringVar(&mode, "m", "", "XDP socket bind mode (Zero copy: z; Copy mode: c)")
 	flag.IntVar(&queue, "q", 0, "Use queue n")
-	flag.StringVar(&remoteAddr, "d", "", "destination host address")
+	flag.Var(&remoteAddrs, "d", "destination host address(es)")
 	flag.StringVar(&transmitFilename, "t", "", "transmit file (sender)")
 	flag.StringVar(&outputFilename, "o", "", "output file (receiver)")
 	flag.StringVar(&verbose, "v", "", "verbose output (from v to vvv)")
-	flag.IntVar(&numPaths, "np", 1, "Maximum number of different paths to use at the same time")
+	flag.IntVar(&numPaths, "np", 1, "Maximum number of different paths per destination to use at the same time")
 	flag.Parse()
 
 	if (transmitFilename == "") == (outputFilename == "") {
@@ -158,41 +170,52 @@ func realMain() error {
 	xdpMode := getXDPMode(mode)
 
 	if transmitFilename != "" {
-		remote, err := parseSCIONAddrs(remoteAddr)
-		if err != nil {
-			return err
+		var remotes []*snet.Addr
+		for _, remoteAddr := range(remoteAddrs) {
+			remote, err := parseSCIONAddrs(remoteAddr)
+			if err != nil {
+				return err
+			}
+			if remote.Host.L4 == nil {
+				return errors.New("You must specify a destination port")
+			}
+			remotes = append(remotes, remote)
 		}
-		if remote.Host.L4 == nil {
-			return errors.New("You must specify a destination port")
+		if len(remotes) == 0 {
+			return errors.New("You must specify at least one destination")
 		}
-		return mainTx(transmitFilename, local, remote, iface, queue, maxRateLimit, enablePCC, xdpMode, dumpInterval, numPaths)
+		return mainTx(transmitFilename, local, remotes, iface, queue, maxRateLimit, enablePCC, xdpMode, dumpInterval, numPaths)
 	}
 	return mainRx(outputFilename, local, iface, queue, xdpMode, dumpInterval)
 }
 
-func mainTx(filename string, src, dst *snet.Addr, iface *net.Interface, queue int, maxRateLimit int, enablePCC bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
-	var txPaths []TxPath
-	txPaths, err = resolvePaths(src, dst, numPaths)
-	if err != nil {
-		fmt.Println("Unable to resolve SCION path.")
-		return err
-	}
-
-	var paths []HerculesPath
-	for _, txPath := range txPaths {
-		curDst := dst.Copy()
-		curDst.NextHop, curDst.Path = txPath.overlayAddr, txPath.path
-		path, err := prepareSCIONPacketHeader(src, curDst, iface)
+func mainTx(filename string, src *snet.Addr, dsts []*snet.Addr, iface *net.Interface, queue int, maxRateLimit int, enablePCC bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
+	var pathsPerDestination [][]HerculesPath
+	for _, dst := range dsts {
+		var txPaths []TxPath
+		txPaths, err = resolvePaths(src, dst, numPaths)
 		if err != nil {
+			fmt.Printf("Unable to resolve SCION path to %s.\n", dst)
 			return err
 		}
-		paths = append(paths, *path)
+
+		var paths []HerculesPath
+		for _, txPath := range txPaths {
+			curDst := dst.Copy()
+			curDst.NextHop, curDst.Path = txPath.overlayAddr, txPath.path
+			path, err := prepareSCIONPacketHeader(src, curDst, iface)
+			if err != nil {
+				return err
+			}
+			paths = append(paths, *path)
+		}
+		pathsPerDestination = append(pathsPerDestination, paths)
 	}
 
 	herculesInit(iface, src, queue)
 	go statsDumper(true, dumpInterval)
 	go cleanupOnSignal()
-	stats := herculesTx(filename, paths, maxRateLimit, enablePCC, xdpMode)
+	stats := herculesTx(filename, pathsPerDestination, maxRateLimit, enablePCC, xdpMode)
 	printSummary(stats)
 	return nil
 	//ticker := time.NewTicker(500 * time.Millisecond)
@@ -221,6 +244,7 @@ func mainRx(filename string, local *snet.Addr, iface *net.Interface, queue int, 
 }
 
 func statsDumper(tx bool, interval time.Duration) {
+	// TODO dump stats for each receiver individually
 
 	if interval == 0 {
 		return
@@ -411,14 +435,28 @@ func herculesInit(iface *net.Interface, local *snet.Addr, queue int) {
 	activeInterface = iface
 }
 
-func herculesTx(filename string, paths []HerculesPath, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
-	filenamec := C.CString(filename)
-	defer C.free(unsafe.Pointer(filenamec))
-	p := make([]C.struct_hercules_path, len(paths))
-	for i, path := range paths {
-		toCPath(path, &p[i])
+func herculesTx(filename string, pathsPerDestination [][]HerculesPath, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
+	cfilename := C.CString(filename)
+	defer C.free(unsafe.Pointer(cfilename))
+
+	numDsts := len(pathsPerDestination)
+	maxPaths := 0
+	cnumPathsPerDest := make([]C.int, numDsts)
+	for i, pathsPerDst := range pathsPerDestination {
+		curLen := len(pathsPerDst)
+		cnumPathsPerDest[i] = C.int(curLen)
+		if curLen > maxPaths {
+			maxPaths = curLen
+		}
 	}
-	return C.hercules_tx(filenamec, &p[0], C.int(len(paths)), C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
+
+	cpathsPerDest := make([]C.struct_hercules_path, numDsts * maxPaths)
+	for d, pathsPerDest := range pathsPerDestination {
+		for p, path := range pathsPerDest {
+			toCPath(path, &cpathsPerDest[d * maxPaths + p])
+		}
+	}
+	return C.hercules_tx(cfilename, &cpathsPerDest[0], C.int(numDsts), &cnumPathsPerDest[0], C.int(maxPaths), C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
 }
 
 // HerculesGetReplyPath creates a reply path header for the packet header in headerPtr with given length.
@@ -834,10 +872,10 @@ func resolveRemotePaths(srcIA, dstIA addr.IA, numPaths int) ([]TxPath, error) {
 		}
 	}
 	if len(selectedPaths) == 1 {
-		fmt.Printf("Using 1 path:\n")
+		fmt.Printf("Using 1 path to %s:\n", dstIA)
 		fmt.Printf("\t%s\n", selectedPaths[0].Entry.Path)
 	} else {
-		fmt.Printf("Using %d paths:\n", len(selectedPaths))
+		fmt.Printf( "Using %d paths to %s:\n", len(selectedPaths), dstIA)
 		for _, p := range selectedPaths {
 			fmt.Printf("\t%s\n", p.Entry.Path)
 		}

@@ -38,6 +38,13 @@ struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 tota
 	return cc_states;
 }
 
+void destroy_ccontrol_state(struct ccontrol_state *cc_states, size_t num_paths) {
+	for (size_t i = 0; i < num_paths; i++) {
+		bitset__destroy(&cc_states[i].mi_acked_chunks);
+	}
+	free(cc_states);
+}
+
 // XXX: explicitly use symbols from old libc version to allow building on
 //			ubuntu 19.04 but running on ubuntu 16.04.
 __asm__(".symver expf,expf@GLIBC_2.2.5");

@@ -71,7 +71,7 @@ struct hercules_stats hercules_get_stats();
 // Synchronous; returns when the transfer has been completed or if it has failed.
 // Does not take ownership of `paths`.
 // Retur
-struct hercules_stats hercules_tx(const char *filename, const struct hercules_path *paths, int num_paths, int max_rate_limit, bool enable_pcc, int xdp_mode);
+struct hercules_stats hercules_tx(const char *filename, const struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode);
 
 // Initiate receiver, waiting for a transmitter to initiate the file transfer.
 struct hercules_stats hercules_rx(const char *filename, int xdp_mode);

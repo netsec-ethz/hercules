@@ -52,6 +52,7 @@ struct ccontrol_state {
 */
 // Initialize congestion control state
 struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 total_chunks, size_t num_paths);
+void destroy_ccontrol_state(struct ccontrol_state *cc_states, size_t num_paths);
 
 // Apply PCC control decision, return new rate
 u32 pcc_control(struct ccontrol_state *cc_state, float throughput, float loss);
