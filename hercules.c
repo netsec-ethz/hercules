@@ -225,13 +225,12 @@ static bool running;
  * @param scionaddrhdr
  * @return The receiver index given by the sender address in scionaddrhdr
  */
-static u32 rcvr_by_src_address(const struct scionaddrhdr_ipv4 *scionaddrhdr)
+static u32 rcvr_by_src_address(const struct scionaddrhdr_ipv4 *scionaddrhdr, const struct udphdr *udphdr)
 {
 	u32 r;
 	for (r = 0; r < tx_state->num_receivers; r++) {
 		struct hercules_app_addr *addr = &tx_state->receiver[r].addr;
-		// TODO compare port too
-		if (scionaddrhdr->src_ia == addr->ia && scionaddrhdr->src_ip == addr->ip) {
+		if (scionaddrhdr->src_ia == addr->ia && scionaddrhdr->src_ip == addr->ip && udphdr->uh_sport == addr->port) {
 			break;
 		}
 	}
@@ -346,7 +345,7 @@ u16 scion_udp_checksum(const u8 *buf, int len)
 // check SCION-UDP checksum if set.
 // sets scionaddrh_o to SCION address header, if provided
 // return rbudp-packet (i.e. SCION/UDP packet payload)
-static const char* parse_pkt(const char *pkt, size_t length, bool check, const struct scionaddrhdr_ipv4 **scionaddrh_o)
+static const char* parse_pkt(const char *pkt, size_t length, bool check, const struct scionaddrhdr_ipv4 **scionaddrh_o, const struct udphdr **udphdr_o)
 {
 	// Parse Ethernet frame
 	if(sizeof(struct ether_header) > length) {
@@ -435,7 +434,7 @@ static const char* parse_pkt(const char *pkt, size_t length, bool check, const s
 		return NULL;
 	}
 
-	if (check) {
+	if(check) {
 		u16 header_checksum = l4udph->check;
 		u16 computed_checksum = scion_udp_checksum((u8 *)scionh, length - offset);
 		if (header_checksum != computed_checksum) {
@@ -447,13 +446,16 @@ static const char* parse_pkt(const char *pkt, size_t length, bool check, const s
 	}
 
 	offset += sizeof(struct udphdr);
-	if (scionaddrh_o != NULL) {
+	if(scionaddrh_o != NULL) {
 		*scionaddrh_o = scionaddrh;
+	}
+	if(udphdr_o != NULL) {
+		*udphdr_o = l4udph;
 	}
 	return pkt + offset;
 }
 
-static bool recv_rbudp_control_pkt(int sockfd, char *buf, size_t buflen, const char **payload, int *payloadlen, const struct scionaddrhdr_ipv4 **scionaddrh)
+static bool recv_rbudp_control_pkt(int sockfd, char *buf, size_t buflen, const char **payload, int *payloadlen, const struct scionaddrhdr_ipv4 **scionaddrh, const struct udphdr **udphdr)
 {
 	ssize_t len = recv(sockfd, buf, buflen, 0); // XXX set timeout
 	if(len == -1) {
@@ -463,7 +465,7 @@ static bool recv_rbudp_control_pkt(int sockfd, char *buf, size_t buflen, const c
 		exit_with_error(errno); // XXX: are there situations where we want to try again?
 	}
 
-	const char *rbudp_pkt = parse_pkt(buf, len, true, scionaddrh);
+	const char *rbudp_pkt = parse_pkt(buf, len, true, scionaddrh, udphdr);
 	if(rbudp_pkt == NULL) {
 		return false;
 	}
@@ -749,10 +751,11 @@ static void tx_recv_acks(int sockfd)
 		const char *payload;
 		int payloadlen;
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
-		if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, &scionaddrhdr)) {
+		const struct udphdr *udphdr;
+		if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
 			const struct rbudp_ack_pkt *ack = (const struct rbudp_ack_pkt*)payload;
 			if((u32)payloadlen >= ack__len(ack)) {
-                tx_register_acks(ack, rcvr_by_src_address(scionaddrhdr));
+                tx_register_acks(ack, rcvr_by_src_address(scionaddrhdr, udphdr));
 			}
 		}
 
@@ -789,9 +792,10 @@ static bool tx_await_cts(int sockfd)
 	const char *payload;
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
+	const struct udphdr *udphdr;
 	for(u32 i = 0; i < tx_state->num_receivers; ++i) {
-		if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, &scionaddrhdr)) {
-			if (tx_handle_cts(payload, rcvr_by_src_address(scionaddrhdr))) {
+		if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
+			if (tx_handle_cts(payload, rcvr_by_src_address(scionaddrhdr, udphdr))) {
 				received++;
 				if (received >= tx_state->num_receivers) {
 					return true;
@@ -802,12 +806,18 @@ static bool tx_await_cts(int sockfd)
 	return false;
 }
 
-static bool tx_await_rtt_ack(int sockfd, const struct scionaddrhdr_ipv4 **scionaddrhdr)
+static bool tx_await_rtt_ack(int sockfd, const struct scionaddrhdr_ipv4 **scionaddrhdr, const struct udphdr **udphdr)
 {
 	const struct scionaddrhdr_ipv4 *scionaddrhdr_fallback;
 	if (scionaddrhdr == NULL) {
 		scionaddrhdr = &scionaddrhdr_fallback;
 	}
+
+	const struct udphdr *udphdr_fallback;
+	if (udphdr == NULL) {
+		udphdr = &udphdr_fallback;
+	}
+
 	// Set 1 second timeout on the socket
 	struct timeval to = { .tv_sec = 1, .tv_usec = 0 };
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
@@ -815,10 +825,10 @@ static bool tx_await_rtt_ack(int sockfd, const struct scionaddrhdr_ipv4 **sciona
 	char buf[ETHER_SIZE];
 	const char *payload;
 	int payloadlen;
-	if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, scionaddrhdr)) {
+	if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, scionaddrhdr, udphdr)) {
 		struct rbudp_initial_pkt parsed_pkt;
 		if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
-			u32 rcvr = rcvr_by_src_address(*scionaddrhdr);
+			u32 rcvr = rcvr_by_src_address(*scionaddrhdr, *udphdr);
 			if (rcvr < tx_state->num_receivers && tx_state->receiver[rcvr].handshake_rtt == 0) {
 				tx_state->receiver[rcvr].handshake_rtt = (u64) (get_nsecs() - parsed_pkt.timestamp);
 				if (parsed_pkt.filesize != tx_state->filesize ||
@@ -866,8 +876,9 @@ static bool tx_handshake(int sockfd)
 		}
 
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
-		while(tx_await_rtt_ack(sockfd, &scionaddrhdr)) {
-			u32 rcvr = rcvr_by_src_address(scionaddrhdr);
+		const struct udphdr *udphdr;
+		while(tx_await_rtt_ack(sockfd, &scionaddrhdr, &udphdr)) {
+			u32 rcvr = rcvr_by_src_address(scionaddrhdr, udphdr);
 			if (rcvr < tx_state->num_receivers && !succeeded[rcvr]) {
 				succeeded[rcvr] = true;
 				await--;
@@ -917,7 +928,7 @@ static void rx_receive_batch(struct xsk_socket_info *xsk)
 		u64 addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->addr;
 		u32 len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->len;
 		const char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
-		const char *rbudp_pkt = parse_pkt(pkt, len, true, NULL);
+		const char *rbudp_pkt = parse_pkt(pkt, len, true, NULL, NULL);
 		if(rbudp_pkt &&
 				handle_rbudp_data_pkt(rbudp_pkt, len - (rbudp_pkt-pkt)))
 		{
@@ -1423,7 +1434,7 @@ static bool rx_accept(int sockfd)
 	while(true) { // Wait for well formed startup packet
 		const char *payload;
 		int payloadlen;
-		if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, NULL)) {
+		if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, NULL, NULL)) {
 			struct rbudp_initial_pkt parsed_pkt;
 			if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
 				rx_state = make_rx_state(parsed_pkt.filesize, parsed_pkt.chunklen);
