@@ -215,7 +215,7 @@ func mainTx(filename string, src *snet.Addr, dsts []*snet.Addr, iface *net.Inter
 	herculesInit(iface, src, queue)
 	go statsDumper(true, dumpInterval)
 	go cleanupOnSignal()
-	stats := herculesTx(filename, pathsPerDestination, maxRateLimit, enablePCC, xdpMode)
+	stats := herculesTx(filename, dsts, pathsPerDestination, maxRateLimit, enablePCC, xdpMode)
 	printSummary(stats)
 	return nil
 	//ticker := time.NewTicker(500 * time.Millisecond)
@@ -244,8 +244,6 @@ func mainRx(filename string, local *snet.Addr, iface *net.Interface, queue int, 
 }
 
 func statsDumper(tx bool, interval time.Duration) {
-	// TODO dump stats for each receiver individually
-
 	if interval == 0 {
 		return
 	}
@@ -435,7 +433,7 @@ func herculesInit(iface *net.Interface, local *snet.Addr, queue int) {
 	activeInterface = iface
 }
 
-func herculesTx(filename string, pathsPerDestination [][]HerculesPath, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
+func herculesTx(filename string, destinations []*snet.Addr, pathsPerDestination [][]HerculesPath, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
 	cfilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cfilename))
 
@@ -456,7 +454,12 @@ func herculesTx(filename string, pathsPerDestination [][]HerculesPath, maxRateLi
 			toCPath(path, &cpathsPerDest[d * maxPaths + p])
 		}
 	}
-	return C.hercules_tx(cfilename, &cpathsPerDest[0], C.int(numDsts), &cnumPathsPerDest[0], C.int(maxPaths), C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
+
+	cdests := make([]C.struct_hercules_app_addr, numDsts)
+	for d, dest := range destinations {
+		cdests[d] = toCAddr(dest)
+	}
+	return C.hercules_tx(cfilename, &cdests[0], &cpathsPerDest[0], C.int(numDsts), &cnumPathsPerDest[0], C.int(maxPaths), C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
 }
 
 // HerculesGetReplyPath creates a reply path header for the packet header in headerPtr with given length.
