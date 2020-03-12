@@ -246,11 +246,12 @@ static bool rx_received_all(const struct receiver_state *r) {
 }
 
 static bool tx_acked_all(const struct sender_state *t) {
-	bool acked_all = true;
 	for (u32 r = 0; r < tx_state->num_receivers; r++) {
-		acked_all = acked_all && (t->receiver[r].acked_chunks.num_set == t->total_chunks);
+		if(t->receiver[r].acked_chunks.num_set != t->total_chunks) {
+			return false;
+		}
 	}
-	return acked_all;
+	return true;
 }
 
 static void set_rx_sample(struct receiver_state* r, const char *pkt, int len)
@@ -1110,64 +1111,17 @@ void iterate_paths()
 	}
 }
 
-// Initial transmit round
-// Send each chunk once to each destination
-static void tx_transmit_round(struct xsk_socket_info *xsk, u32 *frame_nb)
-{
-	u32 chunks[BATCH_SIZE];
-	u32 chunk_rcvr[BATCH_SIZE];
-	u32 max_chunks_per_rcvr[tx_state->num_receivers];
-	u32 chunk_idx_per_rcvr[tx_state->num_receivers];
-	memset(chunk_idx_per_rcvr, 0, sizeof(chunk_idx_per_rcvr));
-
-	for(u32 completed = 0; completed < tx_state->num_receivers; ) {
-		// TODO: check for new paths
-
-		u32 total_chunks = compute_max_chunks_per_rcvr(max_chunks_per_rcvr);
-		total_chunks = exclude_completed_receivers(max_chunks_per_rcvr, chunk_idx_per_rcvr, total_chunks);
-		if(total_chunks == 0) { // we hit the rate limits on every path
-			iterate_paths();
-			continue;
-		}
-
-		// send a max of BATCH_SIZE chunks per iteration
-		total_chunks = shrink_sending_rates(max_chunks_per_rcvr, total_chunks);
-
-		// prepare paths to use by send_batch
-		const struct hercules_path *rcvr_path[tx_state->num_receivers];
-		prepare_rcvr_paths(rcvr_path);
-
-		// pass consecutive chunk ids per receiver to send_batch
-		u32 num_chunks_per_rcvr[tx_state->num_receivers];
-		memset(num_chunks_per_rcvr, 0, sizeof(num_chunks_per_rcvr));
-		size_t num_chunks = 0;
-		for(u32 r = 0; num_chunks < total_chunks; r = (r + 1) % tx_state->num_receivers) {
-			if(num_chunks_per_rcvr[r] >= max_chunks_per_rcvr[r]) {
-				continue;
-			}
-
-			tx_state->receiver[r].path_map[chunk_idx_per_rcvr[r]] = tx_state->receiver[r].path_index;
-			chunks[num_chunks] = chunk_idx_per_rcvr[r]++;
-			chunk_rcvr[num_chunks] = r;
-			num_chunks_per_rcvr[r]++;
-			num_chunks++;
-
-			if(chunk_idx_per_rcvr[r] == tx_state->total_chunks) { // we've sent all chunks to this receiver
-				completed++;
-				total_chunks -= max_chunks_per_rcvr[r] - num_chunks_per_rcvr[r]; // account for unused available bandwidth
-			}
-		}
-		send_batch(xsk, frame_nb, rcvr_path, chunks, chunk_rcvr, num_chunks);
-		rate_limit_tx();
-		iterate_paths();
-	}
-}
-
 /**
- * Retransmit chunks that have not been ACKed.
+ * Transmit and retransmit chunks that have not been ACKed.
  * For each retransmit chunk, wait (at least) one round trip time for the ACK to arrive.
  * For large files transfers, this naturally allows to start retransmitting chunks at the beginning
  * of the file, while chunks of the previous round at the end of the file are still in flight.
+ *
+ * Transmission to different receivers is interleaved in a round-robin fashion.
+ * Transmission through different paths is batched (i.e. use the same path within a batch) to prevent the receiver from
+ * ACKing individual chunks.
+ *
+ * The rounds of different receivers are isolated from each other.
  *
  * The estimates for the ACK-arrival time dont need to be accurate for correctness, i.e. regardless
  * of how bad our estimate is, all chunks will be (re-)transmitted eventually.
@@ -1181,26 +1135,42 @@ static void tx_transmit_round(struct xsk_socket_info *xsk, u32 *frame_nb)
  * Thus it seems preferrable to *over-estimate* the ACK-arrival time.
  *
  * To avoid recording transmit time per chunk, only record start and end time of a transmit round
- * and linearly interpolate.
+ * and linearly interpolate for each receiver separately.
  * This assumes a uniform send rate and that chunks that need to be retransmitted (i.e. losses)
  * occur uniformly.
  */
-static void tx_retransmit_round(struct xsk_socket_info *xsk, u32 *frame_nb, u64 prev_round_start, u64 prev_round_end)
+static void tx_only(struct xsk_socket_info *xsk)
 {
-	const u64 prev_round_dt = prev_round_end - prev_round_start;
-	const u64 slope = (prev_round_dt + tx_state->total_chunks - 1) / tx_state->total_chunks; // round up
-	u64 ack_wait_duration_per_rcvr[tx_state->num_receivers]; // timeout after which a chunk is retransmitted. Allows for some lost ACKs.
-	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		ack_wait_duration_per_rcvr[r] = 3 * (ACK_RATE_TIME_MS * 1000000UL + tx_state->receiver[r].handshake_rtt);
+	prev_rate_check = get_nsecs();
+	u32 frame_nb = 0;
+	u64 prev_round_start[tx_state->num_receivers];
+	memset(prev_round_start, 0, sizeof(prev_round_start));
+	u64 prev_round_end[tx_state->num_receivers];
+	for (u32 r = 0; r < tx_state->num_receivers; r++) {
+		prev_round_end[r] = prev_rate_check;
 	}
+	u64 prev_round_dt[tx_state->num_receivers];
+	u64 slope[tx_state->num_receivers];
+	memset(slope, 0, sizeof(slope)); // set slope to 0 for first round
+	u64 ack_wait_duration_per_rcvr[tx_state->num_receivers]; // timeout after which a chunk is retransmitted. Allows for some lost ACKs.
+	memset(ack_wait_duration_per_rcvr, 0, sizeof(ack_wait_duration_per_rcvr));
+	bool finished[tx_state->num_receivers];
+	memset(finished, false, sizeof(finished));
+	u32 finished_count = 0;
 
+	debug_printf("Start transmit round for all receivers\n");
+
+#ifndef NDEBUG
+	u32 round[tx_state->num_receivers];
+	memset(round, 0, sizeof(round));
+#endif
 	u32 chunks[BATCH_SIZE];
 	u32 chunk_rcvr[BATCH_SIZE];
 	u32 max_chunks_per_rcvr[tx_state->num_receivers];
 	u32 chunk_idx_per_rcvr[tx_state->num_receivers];
 	memset(chunk_idx_per_rcvr, 0, sizeof(chunk_idx_per_rcvr));
 
-	for(u32 completed = 0; completed < tx_state->num_receivers; )
+	while(finished_count < tx_state->num_receivers)
 	{
 		u64 chunk_ack_due = 0;
 		u32 num_chunks_per_rcvr[tx_state->num_receivers];
@@ -1223,20 +1193,39 @@ static void tx_retransmit_round(struct xsk_socket_info *xsk, u32 *frame_nb, u64 
 		// waiting a bit before retransmit.
 		const u64 now = get_nsecs();
 		u32 num_chunks = 0;
-		for(u32 r = 0; num_chunks < total_chunks; r = (r + 1) % tx_state->num_receivers) {
-			if(num_chunks_per_rcvr[r] >= max_chunks_per_rcvr[r]) {
+		for(u32 r = 0; finished_count < tx_state->num_receivers && num_chunks < total_chunks; r = (r + 1) % tx_state->num_receivers) {
+			if(num_chunks_per_rcvr[r] >= max_chunks_per_rcvr[r] || finished[r]) {
 				continue;
 			}
 
+			u32 prev_chunk_idx = chunk_idx_per_rcvr[r];
 			chunk_idx_per_rcvr[r] = bitset__scan_neg(&tx_state->receiver[r].acked_chunks, chunk_idx_per_rcvr[r]);
 			if(chunk_idx_per_rcvr[r] == tx_state->total_chunks) {
-				completed++;
-				total_chunks -= max_chunks_per_rcvr[r] - num_chunks_per_rcvr[r]; // account for unused available bandwidth
+				if(prev_chunk_idx == 0) { // this receiver has finished
+					debug_printf("receiver %d has finished\n", r);
+					finished[r] = true;
+					finished_count++;
+					total_chunks -= max_chunks_per_rcvr[r] - num_chunks_per_rcvr[r]; // account for unused available bandwidth
+					continue;
+				}
+
+				// switch round for this receiver:
+				debug_printf("Receiver %d enters retransmit round %u\n", r, round[r]++);
+
+				chunk_idx_per_rcvr[r] = 0;
+				prev_round_start[r] = prev_round_end[r];
+				prev_round_end[r] = get_nsecs();
+				prev_round_dt[r] = prev_round_end[r] - prev_round_start[r];
+				slope[r] = (prev_round_dt[r] + tx_state->total_chunks - 1) / tx_state->total_chunks; // round up
+				ack_wait_duration_per_rcvr[r] = 3 * (ACK_RATE_TIME_MS * 1000000UL + tx_state->receiver[r].handshake_rtt);
+
+				// try again with this receiver
+				r--;
 				continue;
 			}
 
-			const u64 prev_transmit = umin64(prev_round_start + slope * chunk_idx_per_rcvr[r], prev_round_end);
-			const u64 ack_due = prev_transmit + ack_wait_duration_per_rcvr[r];
+			const u64 prev_transmit = umin64(prev_round_start[r] + slope[r] * chunk_idx_per_rcvr[r], prev_round_end[r]);
+			const u64 ack_due = prev_transmit + ack_wait_duration_per_rcvr[r]; // 0 for first round
 			if(now >= ack_due) {
 				tx_state->receiver[r].path_map[chunk_idx_per_rcvr[r]] = tx_state->receiver[r].path_index;
 				chunks[num_chunks] = chunk_idx_per_rcvr[r]++;
@@ -1262,7 +1251,7 @@ static void tx_retransmit_round(struct xsk_socket_info *xsk, u32 *frame_nb, u64 
 		if(num_chunks > 0) {
 			const struct hercules_path *rcvr_path[tx_state->num_receivers];
 			prepare_rcvr_paths(rcvr_path);
-			send_batch(xsk, frame_nb, rcvr_path, chunks, chunk_rcvr, num_chunks);
+			send_batch(xsk, &frame_nb, rcvr_path, chunks, chunk_rcvr, num_chunks);
 			rate_limit_tx();
 		}
 		iterate_paths();
@@ -1273,28 +1262,6 @@ static void tx_retransmit_round(struct xsk_socket_info *xsk, u32 *frame_nb, u64 
 			}
 			sleep_until(chunk_ack_due);
 		}
-	}
-}
-
-static void tx_only(struct xsk_socket_info *xsk)
-{
-	prev_rate_check = get_nsecs();
-	u64 prev_round_start = prev_rate_check;
-
-	u32 frame_nb = 0;
-	tx_transmit_round(xsk, &frame_nb);
-
-	debug_printf("Starting retransmit");
-#ifndef NDEBUG
-	u32 r = 0;
-#endif
-	while (running) {
-		u64 curr_round_start = get_nsecs();
-
-		debug_printf("Retransmit round %u", r++);
-		tx_retransmit_round(xsk, &frame_nb, prev_round_start, curr_round_start);
-
-		prev_round_start = curr_round_start;
 	}
 }
 
