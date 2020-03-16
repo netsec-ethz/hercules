@@ -7,7 +7,7 @@
 #define RCTS_INTERVALS 4 // Must be even
 
 // PCC state machine states
-enum pcc_state{pcc_startup, pcc_decision, pcc_adjust};
+enum pcc_state{pcc_startup, pcc_decision, pcc_adjust, pcc_terminated};
 
 struct rct {
 	u32 rate;
@@ -52,6 +52,8 @@ struct ccontrol_state {
 */
 // Initialize congestion control state
 struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 total_chunks, size_t num_paths);
+void terminate_ccontrol(struct ccontrol_state *cc_state);
+void kick_ccontrol(struct ccontrol_state *cc_state);
 void destroy_ccontrol_state(struct ccontrol_state *cc_states, size_t num_paths);
 
 // Apply PCC control decision, return new rate

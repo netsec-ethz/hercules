@@ -24,9 +24,10 @@ struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 tota
 		float m = (rand() % 6) / 10.f + 1.7; // min [1.7, 2.2]
 		cc_state->pcc_mi_duration = m * cc_state->rtt;
 
-		u32 initial_rate = umin32((u32) (MSS / cc_state->rtt), max_rate_limit);
+		// initial rate should be per-receiver fair
+		u32 initial_rate = umin32((u32) (MSS / cc_state->rtt), max_rate_limit / num_paths / 2);
 
-		cc_state->state = pcc_startup;
+		cc_state->state = pcc_adjust;
 		cc_state->prev_rate = initial_rate;
 		cc_state->curr_rate = initial_rate;
 		cc_state->eps = EPS_MIN;
@@ -36,6 +37,15 @@ struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 tota
 		cc_state->mi_tx_npkts = 0;
 	}
 	return cc_states;
+}
+
+void terminate_ccontrol(struct ccontrol_state *cc_state) {
+	cc_state->state = pcc_terminated;
+	cc_state->curr_rate = 0;
+}
+
+void kick_ccontrol(struct ccontrol_state *cc_state) {
+	cc_state->state = pcc_startup;
 }
 
 void destroy_ccontrol_state(struct ccontrol_state *cc_states, size_t num_paths) {
@@ -180,6 +190,10 @@ static u32 pcc_control_adjust(struct ccontrol_state *cc_state, float utility)
 
 u32 pcc_control(struct ccontrol_state *cc_state, float throughput, float loss)
 {
+	if (cc_state->state == pcc_terminated) {
+		return 0;
+	}
+
 	cc_state->prev_rate = cc_state->curr_rate;
 
 	float utility = pcc_utility(throughput, loss);
@@ -201,7 +215,7 @@ u32 pcc_control(struct ccontrol_state *cc_state, float throughput, float loss)
 			cc_state->state = pcc_startup;
 	}
 
-	new_rate = umin32(new_rate, cc_state->max_rate_limit);
+	new_rate = umin32(umax32(1, new_rate), cc_state->max_rate_limit);
 
 	cc_state->prev_utility = utility;
 	cc_state->curr_rate = new_rate;

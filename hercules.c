@@ -1111,6 +1111,25 @@ void iterate_paths()
 	}
 }
 
+static void terminate_cc(const struct sender_state_per_receiver *receiver)
+{
+	for(u32 i = 0; i < receiver->num_paths; i++) {
+		terminate_ccontrol(&receiver->cc_states[i]);
+	}
+}
+
+static void kick_cc(const bool *finished)
+{
+	for(u32 r = 0; r < tx_state->num_receivers; r++) {
+		if(finished[r]) {
+			continue;
+		}
+		for(u32 p = 0; p < tx_state->receiver[r].num_paths; p++) {
+			kick_ccontrol(&tx_state->receiver[r].cc_states[p]);
+		}
+	}
+}
+
 /**
  * Transmit and retransmit chunks that have not been ACKed.
  * For each retransmit chunk, wait (at least) one round trip time for the ACK to arrive.
@@ -1206,6 +1225,10 @@ static void tx_only(struct xsk_socket_info *xsk)
 					finished[r] = true;
 					finished_count++;
 					total_chunks -= max_chunks_per_rcvr[r] - num_chunks_per_rcvr[r]; // account for unused available bandwidth
+					if (tx_state->receiver[0].cc_states) {
+						terminate_cc(&tx_state->receiver[r]);
+						kick_cc(finished);
+					}
 					continue;
 				}
 
