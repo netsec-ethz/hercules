@@ -1698,7 +1698,7 @@ hercules_tx(const char* filename, const struct hercules_app_addr *destinations, 
 
 	u32 chunklen = paths_per_dest[0].payloadlen - rbudp_headerlen;
 	for (int r = 0; r < num_dests; r++) {
-		for (int i = 1; i < num_paths[r]; i++) {
+		for (int i = 0; i < num_paths[r]; i++) {
 			chunklen = umin32(chunklen, paths_per_dest[r * max_paths + i].payloadlen - rbudp_headerlen);
 		}
 	}
