@@ -1701,7 +1701,7 @@ hercules_tx(const char* filename, const struct hercules_app_addr *destinations, 
 					num_paths[i]
 			);
 			debug_printf("handshake_rtt (receiver %d): %fs, MI: %fs",
-					i, receiver->handshake_rtt / 1e9, receiver->cc_states[0].pcc_mi_duration);
+					i, receiver->handshake_rtt / 1e9, receiver->cc_states[i].pcc_mi_duration);
 		}
 	}
 
