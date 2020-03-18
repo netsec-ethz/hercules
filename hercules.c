@@ -7,13 +7,9 @@
 #pragma GCC diagnostic warning "-Wextra"
 
 #include "hercules.h"
-#include <arpa/inet.h>
 #include <assert.h>
-#include <stdatomic.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <getopt.h>
-#include <libgen.h>
 #include <limits.h>
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
@@ -25,10 +21,7 @@
 #include <net/if.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
-#include <poll.h>
 #include <pthread.h>
-#include <sched.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1569,6 +1562,159 @@ static int load_xsk_nop_passthrough()
 	return 0;
 }
 
+// XXX: taken and adapted from https://github.com/torvalds/linux/blob/master/tools/lib/bpf/xsk.c
+static int xsk_lookup_current_xsks_map_fd(void)
+{
+	__u32 i, *map_ids, num_maps, info_len = sizeof(struct bpf_prog_info);
+	__u32 map_len = sizeof(struct bpf_map_info);
+	struct bpf_prog_info prog_info = {};
+	struct bpf_map_info map_info;
+	int fd, err;
+
+	int prog_fd = bpf_prog_get_fd_by_id(prog_id);
+	if (prog_fd < 0)
+		return -prog_fd;
+
+	err = bpf_obj_get_info_by_fd(prog_fd, &prog_info, &info_len);
+	if (err)
+		return err;
+
+	num_maps = prog_info.nr_map_ids;
+
+	map_ids = calloc(prog_info.nr_map_ids, sizeof(*map_ids));
+	if (!map_ids)
+		return -ENOMEM;
+
+	memset(&prog_info, 0, info_len);
+	prog_info.nr_map_ids = num_maps;
+	prog_info.map_ids = (__u64)(unsigned long)map_ids;
+
+	err = bpf_obj_get_info_by_fd(prog_fd, &prog_info, &info_len);
+	if (err)
+		goto out_map_ids;
+
+	int ret = -1;
+	for (i = 0; i < prog_info.nr_map_ids; i++) {
+		fd = bpf_map_get_fd_by_id(map_ids[i]);
+		if (fd < 0)
+			continue;
+
+		err = bpf_obj_get_info_by_fd(fd, &map_info, &map_len);
+		if (err) {
+			close(fd);
+			continue;
+		}
+
+		if (!strcmp(map_info.name, "xsks_map")) {
+			ret = fd;
+			continue;
+		}
+
+		close(fd);
+	}
+
+	if (ret == -1)
+		ret = -ENOENT;
+
+out_map_ids:
+	free(map_ids);
+	return ret;
+}
+
+/*
+ * Replace the default program provided by the kernel with a program only redirecting IP
+ * traffic to the XSK.
+ */
+static void load_xsk_redirect_userspace(void)
+{
+	static const int log_buf_size = 16 * 1024;
+	char log_buf[log_buf_size];
+	int err, prog_fd;
+
+	int xsks_map_fd = xsk_lookup_current_xsks_map_fd();
+	if (xsks_map_fd < 0) {
+		exit_with_error(xsks_map_fd);
+	}
+
+	/* This is the C-program:
+	 * SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
+	 * {
+	 *	   void *data = (void *)(long)ctx->data;
+	 *	   void *data_end = (void *)(long)ctx->data_end;
+	 *
+	 * 	   if(data + sizeof(struct ether_header) + sizeof(struct iphdr) > data_end) {
+	 *         return XDP_PASS; // too short
+	 *     }
+	 *     const struct ether_header *eh = (const struct ether_header *)data;
+	 *     if(eh->ether_type != htons(ETHERTYPE_IP)) {
+	 *         return XDP_PASS; // not IP
+	 *     }
+	 *
+	 *	   return bpf_redirect_map(&xsks_map, 0, 0);
+     * }
+	 */
+	struct bpf_insn prog[] = {
+			/* r0 = XDP_PASS */
+			BPF_MOV64_IMM(BPF_REG_0, 2),
+			/* r3 = *(u32 *)(r1 + 4) */
+			BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1, 4),
+			/* r2 = *(u32 *)(r1 + 0) */
+			BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_1, 0),
+			/* r4 = r2 */
+			BPF_MOV64_REG(BPF_REG_4, BPF_REG_2),
+			/* r4 += 34 */
+			BPF_ALU64_IMM(BPF_ADD, BPF_REG_4, 34),
+			/* if r4 > r3 goto pc+20 */
+			BPF_JMP_REG(BPF_JGT, BPF_REG_4, BPF_REG_3, 13),
+			/* r3 = *(u8 *)(r2 + 12) */
+			BPF_LDX_MEM(BPF_B, BPF_REG_3, BPF_REG_2, 12),
+			/* r2 = *(u8 *)(r2 + 13) */
+			BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_2, 13),
+			/* r2 <<= 8 */
+			BPF_ALU64_IMM(BPF_LSH, BPF_REG_2, 8),
+			/* r2 |= r3 */
+			BPF_ALU64_REG(BPF_OR, BPF_REG_2, BPF_REG_3),
+			/* if r2 != htons(ETHERTYPE_IP) goto pc+15 */
+			BPF_JMP_IMM(BPF_JNE, BPF_REG_2, htons(ETHERTYPE_IP), 8),
+			/* r1 = r0 */
+			BPF_MOV64_REG(BPF_REG_1, BPF_REG_0),
+			/* r0 = XPF_PASS */
+			BPF_MOV64_IMM(BPF_REG_0, 2),
+			/* if r1 == 0 goto pc+5 */
+			BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 5),
+			/* r2 = *(u32 *)(r10 - 4) */
+			BPF_MOV64_IMM(BPF_REG_2, opt_queue),
+			/* r1 = xskmap[] */
+			BPF_LD_MAP_FD(BPF_REG_1, xsks_map_fd),
+			/* r3 = 0 */
+			BPF_MOV64_IMM(BPF_REG_3, 0),
+			/* call bpf_map_lookup_elem */
+			BPF_EMIT_CALL(BPF_FUNC_redirect_map),
+			/* The jumps are to this instruction */
+			BPF_EXIT_INSN(),
+	};
+	size_t insns_cnt = sizeof(prog) / sizeof(struct bpf_insn);
+
+	prog_fd = bpf_load_program(BPF_PROG_TYPE_XDP, prog, insns_cnt,
+							   "LGPL-2.1 or BSD-2-Clause", 0, log_buf,
+							   log_buf_size);
+	if (prog_fd < 0) {
+		printf("BPF log buffer:\n%s", log_buf);
+		exit_with_error(-prog_fd);
+	}
+
+	// swap the programs
+	remove_xdp_program();
+	err = bpf_set_link_xdp_fd(opt_ifindex, prog_fd, opt_xdp_flags);
+	if (err) {
+		exit_with_error(-err);
+	}
+	err = bpf_get_link_xdp_id(opt_ifindex, &prog_id, opt_xdp_flags);
+	if (err) {
+		exit_with_error(-err);
+	}
+}
+
 static void *tx_p(void *arg)
 {
 	int xdp_mode = *(int *)arg;
@@ -1780,7 +1926,10 @@ hercules_rx(const char *filename, int xdp_mode)
 	rx_state->mem = rx_mmap(filename, rx_state->filesize);
 	printf(" OK\n");
 
+	// attempt to load the default BPF program redirecting all traffic to the XSK
 	struct xsk_socket_info *xsk = create_xsk_with_umem(0, xdp_mode);
+	// swap the program while keeping the xsks_map
+	load_xsk_redirect_userspace();
 
 	rx_state->start_time = get_nsecs();
 	running = true;
