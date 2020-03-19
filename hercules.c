@@ -1170,7 +1170,7 @@ static void tx_only(struct xsk_socket_info *xsk)
 	memset(finished, false, sizeof(finished));
 	u32 finished_count = 0;
 
-	debug_printf("Start transmit round for all receivers\n");
+	debug_printf("Start transmit round for all receivers");
 
 #ifndef NDEBUG
 	u32 round[tx_state->num_receivers];
@@ -1214,7 +1214,7 @@ static void tx_only(struct xsk_socket_info *xsk)
 			chunk_idx_per_rcvr[r] = bitset__scan_neg(&tx_state->receiver[r].acked_chunks, chunk_idx_per_rcvr[r]);
 			if(chunk_idx_per_rcvr[r] == tx_state->total_chunks) {
 				if(prev_chunk_idx == 0) { // this receiver has finished
-					debug_printf("receiver %d has finished\n", r);
+					debug_printf("receiver %d has finished", r);
 					finished[r] = true;
 					finished_count++;
 					total_chunks -= max_chunks_per_rcvr[r] - num_chunks_per_rcvr[r]; // account for unused available bandwidth
@@ -1226,7 +1226,7 @@ static void tx_only(struct xsk_socket_info *xsk)
 				}
 
 				// switch round for this receiver:
-				debug_printf("Receiver %d enters retransmit round %u\n", r, round[r]++);
+				debug_printf("Receiver %d enters retransmit round %u", r, round[r]++);
 
 				chunk_idx_per_rcvr[r] = 0;
 				prev_round_start[r] = prev_round_end[r];
@@ -1378,7 +1378,7 @@ static bool rx_get_reply_path(struct hercules_path *path)
 	// XXX: race reading from shared mem.
 	// Try to make a quick copy to at least limit the carnage.
 	if (!rx_state) {
-		debug_printf("ERROR: invalid rx_state\n");
+		debug_printf("ERROR: invalid rx_state");
 		return false;
 	}
 	int rx_sample_len = rx_state->rx_sample_len;
