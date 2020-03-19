@@ -1065,10 +1065,10 @@ u32 compute_max_chunks_per_rcvr(u32 *max_chunks_per_rcvr)
 }
 
 // exclude receivers that have completed the current iteration
-u32 exclude_completed_receivers(u32 *max_chunks_per_rcvr, const u32 *chunk_idx_per_rcvr, u32 total_chunks)
+u32 exclude_finished_receivers(u32 *max_chunks_per_rcvr, const bool *finished, u32 total_chunks)
 {
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		if(chunk_idx_per_rcvr[r] == tx_state->total_chunks) {
+		if(finished[r]) {
 			total_chunks -= max_chunks_per_rcvr[r];
 			max_chunks_per_rcvr[r] = 0;
 		}
@@ -1190,7 +1190,7 @@ static void tx_only(struct xsk_socket_info *xsk)
 
 		// path rate limits
 		u32 total_chunks = compute_max_chunks_per_rcvr(max_chunks_per_rcvr);
-		total_chunks = exclude_completed_receivers(max_chunks_per_rcvr, chunk_idx_per_rcvr, total_chunks);
+		total_chunks = exclude_finished_receivers(max_chunks_per_rcvr, finished, total_chunks);
 
 		if(total_chunks == 0) { // we hit the rate limits on every path
 			iterate_paths();
