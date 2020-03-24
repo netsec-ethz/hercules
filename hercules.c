@@ -7,6 +7,7 @@
 #pragma GCC diagnostic warning "-Wextra"
 
 #include "hercules.h"
+#include <stdatomic.h>
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -190,6 +191,13 @@ struct sender_state {
 
 	u32 num_receivers;
 	struct sender_state_per_receiver *receiver;
+	u32 max_paths_per_rcvr;
+
+	// shared with Go
+	const struct hercules_path *shd_paths;
+	const int *shd_num_paths;
+
+	atomic_bool has_new_paths;
 };
 
 // XXX: cleanup naming: these things are called `opt_XXX` because they corresponded to options in the example application.
@@ -991,6 +999,27 @@ static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, const char *data, siz
 
 
 
+void push_hercules_tx_paths()
+{
+	debug_printf("Got new paths!");
+	if(tx_state != NULL) {
+		tx_state->has_new_paths = true;
+	}
+}
+
+static void update_hercules_tx_paths(void)
+{
+	// TODO acquire lock
+	tx_state->has_new_paths = false;
+	for(u32 r = 0; r < tx_state->num_receivers; r++) {
+		struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
+		receiver->num_paths = tx_state->shd_num_paths[r];
+		memcpy(receiver->paths, &tx_state->shd_paths[r * tx_state->max_paths_per_rcvr],
+			   receiver->num_paths * sizeof(struct hercules_path));
+	}
+	// TODO release lock
+}
+
 /*!
  * @function	produce_frame
  * @abstract	Fill an entry in the sender transmission ring with frame frame_nb and
@@ -1293,19 +1322,24 @@ static void init_tx_state(size_t filesize, int chunklen, int max_rate_limit, cha
 	tx_state->end_time = 0;
 	tx_state->num_receivers = num_dests;
 	tx_state->receiver = calloc(num_dests, sizeof(*tx_state->receiver));
+	tx_state->max_paths_per_rcvr = max_paths_per_dest;
+	tx_state->shd_paths = paths;
+	tx_state->shd_num_paths = num_paths;
+	tx_state->has_new_paths = false;
 
 	for (u32 d = 0; d < num_dests; d++) {
+		debug_printf("r[%d] has %d paths", d, num_paths[d]);
 		struct sender_state_per_receiver *receiver = &tx_state->receiver[d];
 		bitset__create(&receiver->acked_chunks, tx_state->total_chunks);
 		receiver->path_map = calloc(tx_state->total_chunks, sizeof(size_t));
 		receiver->path_index = 0;
 		receiver->handshake_rtt = 0;
 		receiver->num_paths = num_paths[d];
-		receiver->paths = calloc(receiver->num_paths, sizeof(struct hercules_path));
+		receiver->paths = calloc(tx_state->max_paths_per_rcvr, sizeof(struct hercules_path));
 		receiver->addr = dests[d];
 		receiver->cts_received = false;
-		memcpy(receiver->paths, &paths[d * max_paths_per_dest], receiver->num_paths * sizeof(struct hercules_path));
 	}
+	update_hercules_tx_paths();
 }
 
 static void destroy_tx_state() {

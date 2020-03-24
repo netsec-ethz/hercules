@@ -31,6 +31,7 @@ struct hercules_path {
 	int framelen;	//!< length of ethernet frame; headerlen + payloadlen
 	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
 	u16  checksum;	//SCION L4 checksum over header with 0 payload
+	bool enabled; // If this path is enabled (e.g. when a path has been revoked and no replacement is available, this will be set to false) */
 };
 
 // Connection information
@@ -66,6 +67,8 @@ struct hercules_stats {
 // Get the current stats of a running transfer.
 // Returns stats with `start_time==0` if no transfer is active.
 struct hercules_stats hercules_get_stats();
+
+void push_hercules_tx_paths(void);
 
 // Initiate transfer of file over the given path.
 // Synchronous; returns when the transfer has been completed or if it has failed.

@@ -24,6 +24,7 @@ package main
 // #include <string.h>
 import "C"
 import (
+	"github.com/scionproto/scion/go/lib/pathmgr"
 	"unsafe"
 )
 
@@ -190,44 +191,28 @@ func realMain() error {
 }
 
 func mainTx(filename string, src *snet.Addr, dsts []*snet.Addr, iface *net.Interface, queue int, maxRateLimit int, enablePCC bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
-	var pathsPerDestination [][]HerculesPath
-	for _, dst := range dsts {
-		var txPaths []TxPath
-		txPaths, err = resolvePaths(src, dst, numPaths)
-		if err != nil {
-			fmt.Printf("Unable to resolve SCION path to %s.\n", dst)
-			return err
-		}
+	pm, err := initNewPathManager(numPaths, iface, dsts, src)
+	if err != nil {
+		return err
+	}
 
-		var paths []HerculesPath
-		for _, txPath := range txPaths {
-			curDst := dst.Copy()
-			curDst.NextHop, curDst.Path = txPath.overlayAddr, txPath.path
-			path, err := prepareSCIONPacketHeader(src, curDst, iface)
-			if err != nil {
-				return err
-			}
-			paths = append(paths, *path)
-		}
-		pathsPerDestination = append(pathsPerDestination, paths)
+	_, err = pm.choosePaths()
+	if err != nil {
+		return err
 	}
 
 	herculesInit(iface, src, queue)
+	err = pm.pushPaths()
+	if err != nil{
+		return err
+	}
+
+	go pm.syncPathsToC()
 	go statsDumper(true, dumpInterval)
 	go cleanupOnSignal()
-	stats := herculesTx(filename, dsts, pathsPerDestination, maxRateLimit, enablePCC, xdpMode)
+	stats := herculesTx(filename, dsts, pm, maxRateLimit, enablePCC, xdpMode)
 	printSummary(stats)
 	return nil
-	//ticker := time.NewTicker(500 * time.Millisecond)
-	//go func() {
-	//	for t := range ticker.C {
-	//		// ... fetch scion paths ...
-	//		for path := range paths {
-	//			headers = append(headers, prepareSCIONPacketHeader(path ...))
-	//		}
-	//		hercules_set_paths(headers)
-	//	}
-	//}()
 }
 
 func mainRx(filename string, local *snet.Addr, iface *net.Interface, queue int, xdpMode int, dumpInterval time.Duration) error {
@@ -433,33 +418,15 @@ func herculesInit(iface *net.Interface, local *snet.Addr, queue int) {
 	activeInterface = iface
 }
 
-func herculesTx(filename string, destinations []*snet.Addr, pathsPerDestination [][]HerculesPath, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
+func herculesTx(filename string, destinations []*snet.Addr, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
 	cfilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cfilename))
 
-	numDsts := len(pathsPerDestination)
-	maxPaths := 0
-	cnumPathsPerDest := make([]C.int, numDsts)
-	for i, pathsPerDst := range pathsPerDestination {
-		curLen := len(pathsPerDst)
-		cnumPathsPerDest[i] = C.int(curLen)
-		if curLen > maxPaths {
-			maxPaths = curLen
-		}
-	}
-
-	cpathsPerDest := make([]C.struct_hercules_path, numDsts * maxPaths)
-	for d, pathsPerDest := range pathsPerDestination {
-		for p, path := range pathsPerDest {
-			toCPath(path, &cpathsPerDest[d * maxPaths + p])
-		}
-	}
-
-	cdests := make([]C.struct_hercules_app_addr, numDsts)
+	cdests := make([]C.struct_hercules_app_addr, len(destinations))
 	for d, dest := range destinations {
 		cdests[d] = toCAddr(dest)
 	}
-	return C.hercules_tx(cfilename, &cdests[0], &cpathsPerDest[0], C.int(numDsts), &cnumPathsPerDest[0], C.int(maxPaths), C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
+	return C.hercules_tx(cfilename, &cdests[0], &pm.cPathsPerDest[0], C.int(len(destinations)), &pm.cNumPathsPerDst[0], C.int(pm.numPathsPerDst), C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
 }
 
 // HerculesGetReplyPath creates a reply path header for the packet header in headerPtr with given length.
@@ -848,53 +815,170 @@ func getSCIONDPath(ia *addr.IA) string {
 	return sciond.GetDefaultSCIONDPath(ia)
 }
 
-func resolvePaths(src, dst *snet.Addr, numPaths int) ([]TxPath, error) {
 
-	if src.IA == dst.IA {
-		hop, err := overlay.NewOverlayAddr(dst.Host.L3, addr.NewL4UDPInfo(overlay.EndhostPort))
-		return []TxPath{{hop, nil}}, err
-	}
-	return resolveRemotePaths(src.IA, dst.IA, numPaths)
+type PathPool struct {
+	addr       *snet.Addr
+	sp         *pathmgr.SyncPaths
+	paths      []*TxPath
+	pathKeys   []spathmeta.PathKey
+	modifyTime time.Time
 }
 
-func resolveRemotePaths(srcIA, dstIA addr.IA, numPaths int) ([]TxPath, error) {
+type PathManager struct {
+	numPathsPerDst  int
+	iface           *net.Interface
+	dsts            []*PathPool
+	src             *snet.Addr
+	cNumPathsPerDst []C.int
+	cPathsPerDest	[]C.struct_hercules_path
+	syncTime		time.Time
+}
+
+func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.Addr, src *snet.Addr) (*PathManager, error) {
+	var dstStates = make([]*PathPool, 0, numPathsPerDst)
 	resolver := snet.DefNetwork.PathResolver()
-
-	availablePaths := resolver.Query(context.Background(), srcIA, dstIA, sciond.PathReqFlags{})
-
-	selectedPaths := make([]*spathmeta.AppPath, 0, numPaths)
-	if len(availablePaths) == 0 {
-		return nil, errors.New("No path")
+	for _, dst := range dsts {
+		var dstState *PathPool
+		if src.IA == dst.IA {
+			// use static empty path
+			hop, err := overlay.NewOverlayAddr(dst.Host.L3, addr.NewL4UDPInfo(overlay.EndhostPort))
+			if err != nil {
+				return nil, err
+			}
+			dstState = &PathPool{
+				addr:       dst,
+				sp:         nil,
+				paths:      []*TxPath{{hop, nil}},
+				modifyTime: time.Now(),
+			}
+		} else {
+			// monitor path changes
+			sp, err := resolver.Watch(context.Background(), src.IA, dst.IA)
+			if err != nil {
+				return nil, err
+			}
+			dstState = &PathPool{
+				addr:       dst,
+				sp:         sp,
+				pathKeys:   make([]spathmeta.PathKey, numPathsPerDst),
+				modifyTime: time.Unix(0, 0),
+			}
+		}
+		dstStates = append(dstStates, dstState)
 	}
 
-	// TODO choose paths more cleverly
-	for _, p := range availablePaths {
-		selectedPaths = append(selectedPaths, p)
-		if len(selectedPaths) >= numPaths {
-			break
+	return &PathManager{
+		numPathsPerDst:  numPathsPerDst,
+		iface:           iface,
+		dsts:            dstStates,
+		src:             src,
+		syncTime:		 time.Unix(0, 0),
+
+		// allocate memory to pass paths to C
+		cNumPathsPerDst: make([]C.int, len(dsts)),
+		cPathsPerDest:   make([]C.struct_hercules_path, len(dsts)*numPathsPerDst),
+	}, nil
+}
+
+func (pm *PathManager) pushPaths() error {
+	// TODO C mutex
+
+	// prepare and copy headers to C
+	for d, dst := range pm.dsts {
+		if pm.syncTime.After(dst.modifyTime) {
+			continue
+		}
+
+		fmt.Printf("r[%d] has %d paths\n", d, len(dst.paths))
+		pm.cNumPathsPerDst[d] = C.int(len(dst.paths))
+		for p, txPath := range dst.paths {
+			// prepare SCION header
+			curDst := dst.addr.Copy()
+			curDst.NextHop, curDst.Path = txPath.overlayAddr, txPath.path
+			path, err := prepareSCIONPacketHeader(pm.src, curDst, pm.iface)
+			if err != nil {
+				return err
+			}
+
+			// copy SCION header
+			toCPath(*path, &pm.cPathsPerDest[d* pm.numPathsPerDst + p])
 		}
 	}
-	if len(selectedPaths) == 1 {
-		fmt.Printf("Using 1 path to %s:\n", dstIA)
-		fmt.Printf("\t%s\n", selectedPaths[0].Entry.Path)
-	} else {
-		fmt.Printf( "Using %d paths to %s:\n", len(selectedPaths), dstIA)
+	pm.syncTime = time.Now()
+
+	C.push_hercules_tx_paths()
+	return nil
+}
+
+func (pm *PathManager) choosePaths() (bool, error) {
+	updated := false
+	for _, dst := range pm.dsts {
+		if dst.sp == nil {
+			continue
+		}
+
+		pathData := dst.sp.Load()
+		if dst.modifyTime.After(pathData.ModifyTime) {
+			continue
+		}
+		updated = true
+
+		availablePaths := pathData.APS
+		selectedPaths := make([]*spathmeta.AppPath, 0, pm.numPathsPerDst)
+		if len(availablePaths) == 0 {
+			return updated, errors.New(fmt.Sprintf("No paths to destination %s", dst.addr.String()))
+		}
+
+		// TODO choose paths more cleverly
+		for _, p := range availablePaths {
+			selectedPaths = append(selectedPaths, p)
+			if len(selectedPaths) >= pm.numPathsPerDst {
+				break
+			}
+		}
+		if len(selectedPaths) == 1 {
+			fmt.Printf("Using 1 path to %s:\n", dst.addr.IA)
+			fmt.Printf("\t%s\n", selectedPaths[0].Entry.Path)
+		} else {
+			fmt.Printf( "Using %d paths to %s:\n", len(selectedPaths), dst.addr.IA)
+			for _, p := range selectedPaths {
+				fmt.Printf("\t%s\n", p.Entry.Path)
+			}
+		}
+
+		paths := make([]*TxPath, 0, len(selectedPaths))
 		for _, p := range selectedPaths {
-			fmt.Printf("\t%s\n", p.Entry.Path)
+			path := &spath.Path{Raw: p.Entry.Path.FwdPath}
+			if err := path.InitOffsets(); err != nil {
+				return updated, err
+			}
+			overlayAddr, err := p.Entry.HostInfo.Overlay()
+			if err != nil {
+				return updated, err
+			}
+			paths = append(paths, &TxPath{overlayAddr, path})
 		}
+		dst.paths = paths
 	}
+	return updated, nil
+}
 
-	paths := make([]TxPath, 0, len(selectedPaths))
-	for _, p := range selectedPaths {
-		path := &spath.Path{Raw: p.Entry.Path.FwdPath}
-		if err := path.InitOffsets(); err != nil {
-			return nil, err
-		}
-		overlayAddr, err := p.Entry.HostInfo.Overlay()
+func (pm *PathManager) syncPathsToC() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	for _ = range ticker.C {
+		updated, err := pm.choosePaths()
 		if err != nil {
-			return nil, err
+			fmt.Printf("Error while choosing paths: %s", err)
+			continue
 		}
-		paths = append(paths, TxPath{overlayAddr, path})
+		if !updated {
+			// same paths as before
+			continue
+		}
+
+		err = pm.pushPaths()
+		if err != nil {
+			fmt.Printf("Error while pushing paths: %s", err)
+		}
 	}
-	return paths, nil
 }
