@@ -17,6 +17,7 @@
 
 #include <stdbool.h>
 #include <linux/types.h>
+#include <stdatomic.h>
 
 typedef __u64 u64;
 typedef __u32 u32;
@@ -31,7 +32,8 @@ struct hercules_path {
 	int framelen;	//!< length of ethernet frame; headerlen + payloadlen
 	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
 	u16  checksum;	//SCION L4 checksum over header with 0 payload
-	bool enabled; // If this path is enabled (e.g. when a path has been revoked and no replacement is available, this will be set to false) */
+	atomic_bool enabled; // e.g. when a path has been revoked and no replacement is available, this will be set to false
+	atomic_bool replaced;
 };
 
 // Connection information
@@ -70,11 +72,15 @@ struct hercules_stats hercules_get_stats();
 
 void push_hercules_tx_paths(void);
 
+// locks for working with the shared path memory
+void acquire_path_lock(void);
+void free_path_lock(void);
+
 // Initiate transfer of file over the given path.
 // Synchronous; returns when the transfer has been completed or if it has failed.
 // Does not take ownership of `paths`.
 // Retur
-struct hercules_stats hercules_tx(const char *filename, const struct hercules_app_addr *destinations, const struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode);
+struct hercules_stats hercules_tx(const char *filename, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode);
 
 // Initiate receiver, waiting for a transmitter to initiate the file transfer.
 struct hercules_stats hercules_rx(const char *filename, int xdp_mode);

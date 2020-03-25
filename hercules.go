@@ -60,14 +60,11 @@ import (
 type HerculesPath struct {
 	Header          []byte //!< C.HERCULES_MAX_HEADERLEN bytes
 	PartialChecksum uint16 //SCION L4 checksum over header with 0 payload
+	NeedsSync       bool
+	Enabled         bool
 }
 
 type herculesStats = C.struct_hercules_stats
-
-type TxPath struct {
-	overlayAddr *overlay.OverlayAddr
-	path        *spath.Path
-}
 
 const (
 	etherLen    int = 1500
@@ -526,6 +523,8 @@ func toCPath(from HerculesPath, to *C.struct_hercules_path) {
 		unsafe.Pointer(&from.Header[0]),
 		C.ulong(len(from.Header)))
 	to.checksum = C.ushort(from.PartialChecksum)
+	to.replaced = C.atomic_bool(from.NeedsSync)
+	to.enabled = C.atomic_bool(from.Enabled)
 }
 
 func toCAddr(in *snet.Addr) C.struct_hercules_app_addr {
@@ -819,7 +818,7 @@ func getSCIONDPath(ia *addr.IA) string {
 type PathPool struct {
 	addr       *snet.Addr
 	sp         *pathmgr.SyncPaths
-	paths      []*TxPath
+	paths      []*HerculesPath
 	pathKeys   []spathmeta.PathKey
 	modifyTime time.Time
 }
@@ -845,10 +844,21 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.A
 			if err != nil {
 				return nil, err
 			}
+
+			path := dst.Copy()
+			path.Path = nil
+			path.NextHop = hop
+			herculesPath, err := prepareSCIONPacketHeader(src, path, iface)
+			if err != nil {
+				return nil, err
+			}
+			herculesPath.NeedsSync = true
+			herculesPath.Enabled = true
+
 			dstState = &PathPool{
 				addr:       dst,
 				sp:         nil,
-				paths:      []*TxPath{{hop, nil}},
+				paths:      []*HerculesPath{herculesPath},
 				modifyTime: time.Now(),
 			}
 		} else {
@@ -860,6 +870,7 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.A
 			dstState = &PathPool{
 				addr:       dst,
 				sp:         sp,
+				paths:		make([]*HerculesPath, numPathsPerDst),
 				pathKeys:   make([]spathmeta.PathKey, numPathsPerDst),
 				modifyTime: time.Unix(0, 0),
 			}
@@ -881,7 +892,8 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.A
 }
 
 func (pm *PathManager) pushPaths() error {
-	// TODO C mutex
+	C.acquire_path_lock()
+	defer C.free_path_lock()
 
 	// prepare and copy headers to C
 	for d, dst := range pm.dsts {
@@ -889,25 +901,46 @@ func (pm *PathManager) pushPaths() error {
 			continue
 		}
 
-		fmt.Printf("r[%d] has %d paths\n", d, len(dst.paths))
-		pm.cNumPathsPerDst[d] = C.int(len(dst.paths))
-		for p, txPath := range dst.paths {
-			// prepare SCION header
-			curDst := dst.addr.Copy()
-			curDst.NextHop, curDst.Path = txPath.overlayAddr, txPath.path
-			path, err := prepareSCIONPacketHeader(pm.src, curDst, pm.iface)
-			if err != nil {
-				return err
+		n := 0
+		for p, path := range dst.paths {
+			if path.NeedsSync || path.Enabled {
+				n = p
 			}
-
-			// copy SCION header
-			toCPath(*path, &pm.cPathsPerDest[d* pm.numPathsPerDst + p])
+			if path.NeedsSync {
+				toCPath(*path, &pm.cPathsPerDest[d*pm.numPathsPerDst+p])
+				path.NeedsSync = false
+			} else {
+				pm.cPathsPerDest[d*pm.numPathsPerDst+p].enabled = C.atomic_bool(path.Enabled)
+			}
 		}
+		pm.cNumPathsPerDst[d] = C.int(n + 1)
 	}
 	pm.syncTime = time.Now()
 
 	C.push_hercules_tx_paths()
 	return nil
+}
+
+func (pm *PathManager) putPath(dst *PathPool, pathIdx int, p *spathmeta.AppPath, key spathmeta.PathKey) error {
+	var err error
+	curDst := dst.addr.Copy()
+	curDst.Path = &spath.Path{Raw: p.Entry.Path.FwdPath}
+	if err = curDst.Path.InitOffsets(); err != nil {
+		return err
+	}
+
+	curDst.NextHop, err = p.Entry.HostInfo.Overlay()
+	if err != nil {
+		return err
+	}
+
+	dst.paths[pathIdx], err = prepareSCIONPacketHeader(pm.src, curDst, pm.iface)
+	if err == nil {
+		dst.paths[pathIdx].NeedsSync = true
+		dst.paths[pathIdx].Enabled = true
+		dst.pathKeys[pathIdx] = key
+	}
+	return err
 }
 
 func (pm *PathManager) choosePaths() (bool, error) {
@@ -921,44 +954,80 @@ func (pm *PathManager) choosePaths() (bool, error) {
 		if dst.modifyTime.After(pathData.ModifyTime) {
 			continue
 		}
-		updated = true
 
 		availablePaths := pathData.APS
-		selectedPaths := make([]*spathmeta.AppPath, 0, pm.numPathsPerDst)
 		if len(availablePaths) == 0 {
 			return updated, errors.New(fmt.Sprintf("No paths to destination %s", dst.addr.String()))
 		}
 
-		// TODO choose paths more cleverly
-		for _, p := range availablePaths {
-			selectedPaths = append(selectedPaths, p)
-			if len(selectedPaths) >= pm.numPathsPerDst {
-				break
-			}
-		}
-		if len(selectedPaths) == 1 {
-			fmt.Printf("Using 1 path to %s:\n", dst.addr.IA)
-			fmt.Printf("\t%s\n", selectedPaths[0].Entry.Path)
-		} else {
-			fmt.Printf( "Using %d paths to %s:\n", len(selectedPaths), dst.addr.IA)
-			for _, p := range selectedPaths {
-				fmt.Printf("\t%s\n", p.Entry.Path)
+		dstModified := false
+		// keep previous paths, if still available
+		pathInUse := make([]bool, pm.numPathsPerDst)
+		for _, path := range availablePaths {
+			curKey := path.Key()
+			for i, prevKey := range dst.pathKeys {
+				if curKey == prevKey {
+					if !dst.paths[i].Enabled {
+						fmt.Printf("[PathPool %s] re-enabling path %d\n", dst.addr.IA, i)
+						dst.paths[i].Enabled = true
+						dstModified = true
+					}
+					pathInUse[i] = true
+					break
+				}
 			}
 		}
 
-		paths := make([]*TxPath, 0, len(selectedPaths))
-		for _, p := range selectedPaths {
-			path := &spath.Path{Raw: p.Entry.Path.FwdPath}
-			if err := path.InitOffsets(); err != nil {
-				return updated, err
+		// check for vanished paths
+		for i, inUse := range pathInUse {
+			if inUse == false && dst.paths[i] != nil && dst.paths[i].Enabled {
+				fmt.Printf("[PathPool %s] disabling path %d\n", dst.addr.IA, i)
+				dst.paths[i].Enabled = false
+				dstModified = true
 			}
-			overlayAddr, err := p.Entry.HostInfo.Overlay()
-			if err != nil {
-				return updated, err
-			}
-			paths = append(paths, &TxPath{overlayAddr, path})
 		}
-		dst.paths = paths
+
+		// Note: we keep the keys of vanished paths, in case they come back before we can replace them
+
+		// fill empty path slots
+		for i, slotInUse := range pathInUse {
+			if slotInUse == false {
+				// TODO choose paths more cleverly
+				for _, path := range availablePaths {
+					// check if the path is already in use
+					curKey := path.Key()
+					inUse := false
+					for _, key := range dst.pathKeys {
+						if key == curKey {
+							inUse = true
+							break
+						}
+					}
+					if inUse {
+						continue
+					}
+
+					// use it from now on
+					fmt.Printf("[PathPool %s] enabling path %d:\n\t%s\n", dst.addr.IA, i, *path)
+					err := pm.putPath(dst, i, path, curKey)
+					if err != nil {
+						if dstModified {
+							dst.modifyTime = time.Now()
+							updated = true
+						}
+						return updated, err
+					}
+					dstModified = true
+					pathInUse[i] = true
+					break
+				}
+			}
+		}
+
+		if dstModified {
+			dst.modifyTime = time.Now()
+			updated = true
+		}
 	}
 	return updated, nil
 }
@@ -968,7 +1037,7 @@ func (pm *PathManager) syncPathsToC() {
 	for _ = range ticker.C {
 		updated, err := pm.choosePaths()
 		if err != nil {
-			fmt.Printf("Error while choosing paths: %s", err)
+			fmt.Printf("Error while choosing paths: %s\n", err)
 			continue
 		}
 		if !updated {
@@ -978,7 +1047,7 @@ func (pm *PathManager) syncPathsToC() {
 
 		err = pm.pushPaths()
 		if err != nil {
-			fmt.Printf("Error while pushing paths: %s", err)
+			fmt.Printf("Error while pushing paths: %s\n", err)
 		}
 	}
 }

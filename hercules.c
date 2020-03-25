@@ -194,7 +194,7 @@ struct sender_state {
 	u32 max_paths_per_rcvr;
 
 	// shared with Go
-	const struct hercules_path *shd_paths;
+	struct hercules_path *shd_paths;
 	const int *shd_num_paths;
 
 	atomic_bool has_new_paths;
@@ -998,26 +998,45 @@ static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, const char *data, siz
 }
 
 
+static pthread_mutex_t path_lock;
+
+void acquire_path_lock()
+{
+	pthread_mutex_lock(&path_lock);
+}
+
+void free_path_lock()
+{
+	pthread_mutex_unlock(&path_lock);
+}
 
 void push_hercules_tx_paths()
 {
-	debug_printf("Got new paths!");
 	if(tx_state != NULL) {
+		debug_printf("Got new paths!");
 		tx_state->has_new_paths = true;
 	}
 }
 
 static void update_hercules_tx_paths(void)
 {
-	// TODO acquire lock
+	acquire_path_lock();
 	tx_state->has_new_paths = false;
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
 		struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
 		receiver->num_paths = tx_state->shd_num_paths[r];
-		memcpy(receiver->paths, &tx_state->shd_paths[r * tx_state->max_paths_per_rcvr],
-			   receiver->num_paths * sizeof(struct hercules_path));
+
+		for(u32 p = 0; p < receiver->num_paths; p++) {
+			if(tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].replaced) {
+				tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].replaced = false;
+				memcpy(&receiver->paths[p], &tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p],
+					   sizeof(struct hercules_path));
+			} else {
+				receiver->paths[p].enabled = tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].enabled;
+			}
+		}
 	}
-	// TODO release lock
+	free_path_lock();
 }
 
 /*!
@@ -1129,7 +1148,10 @@ void prepare_rcvr_paths(const struct hercules_path **rcvr_path)
 void iterate_paths()
 {
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		tx_state->receiver[r].path_index = (tx_state->receiver[r].path_index + 1) % tx_state->receiver[r].num_paths;
+		struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
+		do {
+			receiver->path_index = (receiver->path_index + 1) % receiver->num_paths;
+		} while(!receiver->paths[receiver->path_index].enabled);
 	}
 }
 
@@ -1299,6 +1321,10 @@ static void tx_only(struct xsk_socket_info *xsk)
 			send_batch(xsk, &frame_nb, rcvr_path, chunks, chunk_rcvr, num_chunks);
 			rate_limit_tx();
 		}
+
+		if (tx_state->has_new_paths) {
+			update_hercules_tx_paths();
+		}
 		iterate_paths();
 
 		if(now < chunk_ack_due) {
@@ -1310,7 +1336,7 @@ static void tx_only(struct xsk_socket_info *xsk)
 	}
 }
 
-static void init_tx_state(size_t filesize, int chunklen, int max_rate_limit, char *mem, const struct hercules_app_addr *dests, const struct hercules_path *paths, u32 num_dests, const int *num_paths, u32 max_paths_per_dest)
+static void init_tx_state(size_t filesize, int chunklen, int max_rate_limit, char *mem, const struct hercules_app_addr *dests, struct hercules_path *paths, u32 num_dests, const int *num_paths, u32 max_paths_per_dest)
 {
 	tx_state = calloc(1, sizeof(*tx_state));
 	tx_state->filesize = filesize;
@@ -1328,7 +1354,6 @@ static void init_tx_state(size_t filesize, int chunklen, int max_rate_limit, cha
 	tx_state->has_new_paths = false;
 
 	for (u32 d = 0; d < num_dests; d++) {
-		debug_printf("r[%d] has %d paths", d, num_paths[d]);
 		struct sender_state_per_receiver *receiver = &tx_state->receiver[d];
 		bitset__create(&receiver->acked_chunks, tx_state->total_chunks);
 		receiver->path_map = calloc(tx_state->total_chunks, sizeof(size_t));
@@ -1854,7 +1879,7 @@ static void join_thread(pthread_t pt)
 }
 
 struct hercules_stats
-hercules_tx(const char* filename, const struct hercules_app_addr *destinations, const struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode)
+hercules_tx(const char* filename, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode)
 {
 	// Open mmaped send file
 	int f = open(filename, O_RDONLY);
