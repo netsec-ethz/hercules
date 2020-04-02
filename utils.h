@@ -36,7 +36,7 @@ inline u64 umin64(u64 a, u64 b)
 
 inline u64 umax64(u64 a, u64 b)
 {
-	return (a > b) ? a : b;
+	return (a < b) ? a : b;
 }
 
 

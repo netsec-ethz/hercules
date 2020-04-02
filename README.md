@@ -91,14 +91,8 @@ For data packets (sender to receiver), the index field is the index of the chunk
 
 1. Sender sends initial packet:
 
-        | num entries | filesize | chunksize | timestamp | path index | flags |
-        |     u8      |   u64    |   u32     |    u64    |    u32     |  u8   |
-        
-    Where `num entries` is `UINT8_MAX` to distinguish handshake replies from ACKs.
-    
-    Flags:
-    - 0-th bit: `SET_RETURN_PATH` The receiver should use this path for sending
-    ACKs from now on.
+        | filesize | chunksize | timestamp |
+        |   u64    |   u32     |    u64    |
 
 1. Receiver replies immediately with the same packet.
 
@@ -107,14 +101,6 @@ For data packets (sender to receiver), the index field is the index of the chunk
 	The receiver proceeds to  prepare the file mapping etc.
 
 1. Receiver replies with an empty ACK signaling "Clear to send"
-
-##### Path handshakes
-
-Every time the sender starts using a new path or the receiver starts using a new
-return path, the sender will update the RTT estimate used by PCC.
-In order to achieve this, it sends a handshake (identical to the above) on the
-affected path(s).
-The receiver replies immediately with the same packet (using the current return path).
 
 #### Data transmit
 
@@ -142,7 +128,7 @@ The receiver replies immediately with the same packet (using the current return 
 	  The congestion control naturally solves this too, but is fairly slow to adapt.
 	  Maybe a simple window size would work.
 * [ ] Abort of transmission not handled (if one side is stopped, the other side will wait forever).
-* [ ] Jumbo frames; requires increasing FRAME_SIZE
+* [ ] Jumbo frames; requires increasing FRAME_SIZE (but there are additional limitations, since "XDP doesn't support packets spanning more than one memory page.")
 * [ ] (Huge) Move SCION packet parsing & port dispatching to an XDP program;
       Allows that SCION traffic can go through while hercules is running & allows running multiple instances of hercules on same NIC.
 * [ ] Use multiple paths; some tricky parts may be "load balancing", splitting the congestion control and applying separate rate limits.
