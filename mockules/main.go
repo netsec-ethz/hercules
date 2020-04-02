@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/scionproto/scion/go/lib/addr"
@@ -49,28 +51,46 @@ func main() {
 		log.Fatalln("loss percentage should be in [0, 100]%")
 	}
 
-	err := initSCION(localAddr)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	err = rbudpTxMain(localAddr, remoteAddr, filename, blocks, float32(lossPercentage/100.0))
+	err := rbudpTxMain(localAddr, remoteAddr, filename, blocks, float32(lossPercentage/100.0))
 	if err != nil {
 		log.Fatalln(err)
 	}
 }
 
 func rbudpTxMain(srcAddr, dstAddr, filename string, blocks uint, loss float32) error {
+	src, err := snet.ParseUDPAddr(srcAddr)
+	if err != nil {
+		return err
+	}
+	dst, err := snet.ParseUDPAddr(dstAddr)
+	if err != nil {
+		return err
+	}
 
-	src, err := snet.AddrFromString(srcAddr)
-	if err != nil {
-		return err
+    network, querier, err := initNetwork(src.IA)
+    if err != nil {
+    	return err
 	}
-	dst, err := snet.AddrFromString(dstAddr)
-	if err != nil {
-		return err
+
+
+	if !dst.IA.Equal(src.IA) {
+		ctx, cancelF := context.WithTimeout(context.Background(), 5*time.Second)
+		paths, err := querier.Query(ctx, dst.IA)
+		cancelF()
+		if err != nil {
+			return err
+		}
+		if len(paths) == 0 {
+			return errors.New("No paths to destination found")
+		}
+
+		path := paths[0]
+		log.Printf("Using path:\n\t%s", path)
+		dst.Path = path.Path()
+		dst.NextHop = path.OverlayNextHop()
 	}
-	conn, err := snet.DialSCION("udp4", src, dst)
+
+	conn, err := network.Dial(context.Background(), "udp", src.Host, dst, addr.SvcNone)
 	if err != nil {
 		return err
 	}
@@ -90,18 +110,24 @@ func rbudpTxMain(srcAddr, dstAddr, filename string, blocks uint, loss float32) e
 	numBlocks := uint32((fileSize + blockSize - 1) / blockSize)
 
 	log.Println("Send startup")
-	rbudpSendInitial(conn, fileSize, blockSize)
+	err = rbudpSendInitial(*conn, fileSize, blockSize)
+	if err != nil {
+		return err
+	}
 	log.Println("Wait for ACK..")
-	rbudpRecvAck(conn)
+	err = rbudpRecvAck(*conn)
+	if err != nil {
+		return err
+	}
 
 	nacks := make(chan uint32, numBlocks)
 	ack := make(chan interface{}, 1)
-	go rbudpRecvNacks(conn, nacks, ack)
+	go rbudpRecvNacks(*conn, nacks, ack)
 
 	log.Println("Send file, first round")
 	reader := bufio.NewReader(os.Stdin)
 	for i := uint32(0); i < numBlocks; i++ {
-		err = rbudpSendBlock(conn, file, i, loss)
+		err = rbudpSendBlock(*conn, file, i, loss)
 		if err != nil {
 			return err
 		}
@@ -118,7 +144,7 @@ func rbudpTxMain(srcAddr, dstAddr, filename string, blocks uint, loss float32) e
 		select {
 		case i := <-nacks:
 			numNacks++
-			err = rbudpSendBlock(conn, file, i, loss)
+			err = rbudpSendBlock(*conn, file, i, loss)
 			if err != nil {
 				return err
 			}
@@ -232,26 +258,17 @@ func rbudpRecvNacks(conn snet.Conn, nacks chan uint32, ack chan interface{}) {
 	}
 }
 
-func initSCION(localhost string) error {
-
-	localAddr, err := snet.AddrFromString(localhost)
+func initNetwork(ia addr.IA) (*snet.SCIONNetwork, *sciond.Querier, error) {
+	ds := reliable.NewDispatcher("")
+	sciondConn, err := sciond.NewService(sciond.DefaultSCIONDAddress).Connect(context.Background())
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
-	err = snet.Init(localAddr.IA, getSCIONDPath(&localAddr.IA), reliable.NewDispatcherService(""))
-	if err != nil {
-		return err
+	querier := sciond.Querier{
+		Connector: sciondConn,
+		IA: ia,
 	}
-	return nil
-}
-
-func getSCIONDPath(ia *addr.IA) string {
-
-	// Use default.sock if exists:
-	if _, err := os.Stat(sciond.DefaultSCIONDPath); err == nil {
-		return sciond.DefaultSCIONDPath
-	}
-	// otherwise, use socket with ia name:
-	return sciond.GetDefaultSCIONDPath(ia)
+	network := snet.NewNetworkWithPR(ia, ds, querier, sciond.RevHandler{Connector: sciondConn})
+	return network, &querier, nil
 }

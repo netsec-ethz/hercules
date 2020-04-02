@@ -9,4 +9,4 @@ require (
 	github.com/vishvananda/netlink v1.0.0
 )
 
-replace github.com/scionproto/scion => github.com/netsec-ethz/scion v0.0.0-20191126100951-b45109524c36
+replace github.com/scionproto/scion => github.com/netsec-ethz/scion v0.0.0-20200330122244-e161bd23eca3

@@ -25,6 +25,7 @@ package main
 import "C"
 import (
 	"github.com/scionproto/scion/go/lib/pathmgr"
+	"github.com/scionproto/scion/go/lib/topology"
 	"unsafe"
 )
 
@@ -41,12 +42,8 @@ import (
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/hpkt"
 	"github.com/scionproto/scion/go/lib/l4"
-	"github.com/scionproto/scion/go/lib/overlay"
 	"github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/snet"
-	"github.com/scionproto/scion/go/lib/sock/reliable"
-	"github.com/scionproto/scion/go/lib/spath"
-	"github.com/scionproto/scion/go/lib/spath/spathmeta"
 	"github.com/scionproto/scion/go/lib/spkt"
 	"github.com/vishvananda/netlink"
 	"net"
@@ -148,19 +145,14 @@ func realMain() error {
 	}
 
 	local, err := parseSCIONAddrs(localAddr)
-	if local.Host.L4 == nil {
+	if err != nil {
+		return err
+	}
+	if local.Host.Port == 0 {
 		return errors.New("You must specify a source port")
 	}
-	if err != nil {
-		return err
-	}
 
-	err = checkAssignedIP(iface, local.Host.L3.IP())
-	if err != nil {
-		return err
-	}
-
-	err = initSCION(localAddr)
+	err = checkAssignedIP(iface, local.Host.IP)
 	if err != nil {
 		return err
 	}
@@ -168,13 +160,13 @@ func realMain() error {
 	xdpMode := getXDPMode(mode)
 
 	if transmitFilename != "" {
-		var remotes []*snet.Addr
+		var remotes []*snet.UDPAddr
 		for _, remoteAddr := range(remoteAddrs) {
 			remote, err := parseSCIONAddrs(remoteAddr)
 			if err != nil {
 				return err
 			}
-			if remote.Host.L4 == nil {
+			if remote.Host.Port == 0 {
 				return errors.New("You must specify a destination port")
 			}
 			remotes = append(remotes, remote)
@@ -187,7 +179,7 @@ func realMain() error {
 	return mainRx(outputFilename, local, iface, queue, xdpMode, dumpInterval)
 }
 
-func mainTx(filename string, src *snet.Addr, dsts []*snet.Addr, iface *net.Interface, queue int, maxRateLimit int, enablePCC bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
+func mainTx(filename string, src *snet.UDPAddr, dsts []*snet.UDPAddr, iface *net.Interface, queue int, maxRateLimit int, enablePCC bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
 	pm, err := initNewPathManager(numPaths, iface, dsts, src)
 	if err != nil {
 		return err
@@ -212,7 +204,7 @@ func mainTx(filename string, src *snet.Addr, dsts []*snet.Addr, iface *net.Inter
 	return nil
 }
 
-func mainRx(filename string, local *snet.Addr, iface *net.Interface, queue int, xdpMode int, dumpInterval time.Duration) error {
+func mainRx(filename string, local *snet.UDPAddr, iface *net.Interface, queue int, xdpMode int, dumpInterval time.Duration) error {
 
 	filenamec := C.CString(filename)
 	defer C.free(unsafe.Pointer(filenamec))
@@ -408,14 +400,14 @@ func getXDPMode(m string) (mode int) {
 	return mode
 }
 
-func herculesInit(iface *net.Interface, local *snet.Addr, queue int) {
+func herculesInit(iface *net.Interface, local *snet.UDPAddr, queue int) {
 	local_c := toCAddr(local)
 
 	C.hercules_init(C.int(iface.Index), local_c, C.int(queue))
 	activeInterface = iface
 }
 
-func herculesTx(filename string, destinations []*snet.Addr, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
+func herculesTx(filename string, destinations []*snet.UDPAddr, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
 	cfilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cfilename))
 
@@ -441,8 +433,8 @@ func HerculesGetReplyPath(headerPtr unsafe.Pointer, length C.int, replyPathStruc
 	return 0
 }
 
-func parseSCIONAddrs(scionAddr string) (*snet.Addr, error) {
-	return snet.AddrFromString(scionAddr)
+func parseSCIONAddrs(scionAddr string) (*snet.UDPAddr, error) {
+	return snet.ParseUDPAddr(scionAddr)
 }
 
 func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPath, error) {
@@ -527,13 +519,13 @@ func toCPath(from HerculesPath, to *C.struct_hercules_path) {
 	to.enabled = C.atomic_bool(from.Enabled)
 }
 
-func toCAddr(in *snet.Addr) C.struct_hercules_app_addr {
+func toCAddr(in *snet.UDPAddr) C.struct_hercules_app_addr {
 
 	bufIA := make([]byte, 8)
 	in.IA.Write(bufIA)
-	bufIP := in.Host.L3.IP().To4()
+	bufIP := in.Host.IP.To4()
 	bufPort := make([]byte, 2)
-	binary.BigEndian.PutUint16(bufPort, in.Host.L4.Port())
+	binary.BigEndian.PutUint16(bufPort, uint16(in.Host.Port))
 
 	out := C.struct_hercules_app_addr{}
 	C.memcpy(unsafe.Pointer(&out.ia), unsafe.Pointer(&bufIA[0]), 8)
@@ -542,9 +534,9 @@ func toCAddr(in *snet.Addr) C.struct_hercules_app_addr {
 	return out
 }
 
-func prepareSCIONPacketHeader(src, dst *snet.Addr, iface *net.Interface) (*HerculesPath, error) {
+func prepareSCIONPacketHeader(src, dst *snet.UDPAddr, iface *net.Interface) (*HerculesPath, error) {
 
-	overlayHeader, err := prepareOverlayPacketHeader(src.Host.L3.IP(), dst.NextHop.L3().IP(), dst.NextHop.L4().Port(), iface)
+	overlayHeader, err := prepareOverlayPacketHeader(src.Host.IP, dst.NextHop.IP, uint16(dst.NextHop.Port), iface)
 	if err != nil {
 		return nil, err
 	}
@@ -552,12 +544,12 @@ func prepareSCIONPacketHeader(src, dst *snet.Addr, iface *net.Interface) (*Hercu
 	scionPkt := &spkt.ScnPkt{
 		DstIA:   dst.IA,
 		SrcIA:   src.IA,
-		DstHost: dst.Host.L3,
-		SrcHost: src.Host.L3,
+		DstHost: addr.HostFromIP(dst.Host.IP),
+		SrcHost: addr.HostFromIP(src.Host.IP),
 		Path:    dst.Path,
 		L4: &l4.UDP{
-			SrcPort: src.Host.L4.Port(),
-			DstPort: dst.Host.L4.Port(),
+			SrcPort: uint16(src.Host.Port),
+			DstPort: uint16(dst.Host.Port),
 		},
 	}
 	scionHeaderLen := scionPkt.HdrLen() + l4.UDPLen
@@ -611,7 +603,7 @@ func prepareOverlayPacketHeader(srcIP, dstIP net.IP, dstPort uint16, iface *net.
 		Options: nil,
 	}
 
-	srcPort := uint16(overlay.EndhostPort)
+	srcPort := uint16(topology.EndhostPort)
 	udp := layers.UDP{
 		SrcPort:  layers.UDPPort(srcPort),
 		DstPort:  layers.UDPPort(dstPort),
@@ -787,39 +779,12 @@ func checkAssignedIP(iface *net.Interface, localAddr net.IP) (err error) {
 	return errors.New("Interface does not have the specified IPv4 address")
 }
 
-// XXX scion utils
-// Replace with using scion-apps/lib!?
-
-func initSCION(localhost string) error {
-
-	localAddr, err := snet.AddrFromString(localhost)
-	if err != nil {
-		return err
-	}
-
-	err = snet.Init(localAddr.IA, getSCIONDPath(&localAddr.IA), reliable.NewDispatcherService(""))
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func getSCIONDPath(ia *addr.IA) string {
-
-	// Use default.sock if exists:
-	if _, err := os.Stat(sciond.DefaultSCIONDPath); err == nil {
-		return sciond.DefaultSCIONDPath
-	}
-	// otherwise, use socket with ia name:
-	return sciond.GetDefaultSCIONDPath(ia)
-}
-
 
 type PathPool struct {
-	addr       *snet.Addr
+	addr       *snet.UDPAddr
 	sp         *pathmgr.SyncPaths
 	paths      []*HerculesPath
-	pathKeys   []spathmeta.PathKey
+	pathKeys   []snet.PathFingerprint
 	modifyTime time.Time
 }
 
@@ -827,27 +792,31 @@ type PathManager struct {
 	numPathsPerDst  int
 	iface           *net.Interface
 	dsts            []*PathPool
-	src             *snet.Addr
+	src             *snet.UDPAddr
 	cNumPathsPerDst []C.int
 	cPathsPerDest	[]C.struct_hercules_path
 	syncTime		time.Time
 }
 
-func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.Addr, src *snet.Addr) (*PathManager, error) {
+func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.UDPAddr, src *snet.UDPAddr) (*PathManager, error) {
 	var dstStates = make([]*PathPool, 0, numPathsPerDst)
-	resolver := snet.DefNetwork.PathResolver()
+	sciondConn, err := sciond.NewService(sciond.DefaultSCIONDAddress).Connect(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	resolver := pathmgr.New(sciondConn, pathmgr.Timers{}, uint16(numPathsPerDst))
 	for _, dst := range dsts {
 		var dstState *PathPool
 		if src.IA == dst.IA {
 			// use static empty path
-			hop, err := overlay.NewOverlayAddr(dst.Host.L3, addr.NewL4UDPInfo(overlay.EndhostPort))
-			if err != nil {
-				return nil, err
+			hop := net.UDPAddr{
+				IP: dst.Host.IP,
+				Port: topology.EndhostPort,
 			}
 
 			path := dst.Copy()
 			path.Path = nil
-			path.NextHop = hop
+			path.NextHop = &hop
 			herculesPath, err := prepareSCIONPacketHeader(src, path, iface)
 			if err != nil {
 				return nil, err
@@ -871,7 +840,7 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.A
 				addr:       dst,
 				sp:         sp,
 				paths:		make([]*HerculesPath, numPathsPerDst),
-				pathKeys:   make([]spathmeta.PathKey, numPathsPerDst),
+				pathKeys:   make([]snet.PathFingerprint, numPathsPerDst),
 				modifyTime: time.Unix(0, 0),
 			}
 		}
@@ -921,18 +890,15 @@ func (pm *PathManager) pushPaths() error {
 	return nil
 }
 
-func (pm *PathManager) putPath(dst *PathPool, pathIdx int, p *spathmeta.AppPath, key spathmeta.PathKey) error {
+func (pm *PathManager) putPath(dst *PathPool, pathIdx int, p *snet.Path, key snet.PathFingerprint) error {
 	var err error
 	curDst := dst.addr.Copy()
-	curDst.Path = &spath.Path{Raw: p.Entry.Path.FwdPath}
+	curDst.Path = (*p).Path()
 	if err = curDst.Path.InitOffsets(); err != nil {
 		return err
 	}
 
-	curDst.NextHop, err = p.Entry.HostInfo.Overlay()
-	if err != nil {
-		return err
-	}
+	curDst.NextHop = (*p).OverlayNextHop()
 
 	dst.paths[pathIdx], err = prepareSCIONPacketHeader(pm.src, curDst, pm.iface)
 	if err == nil {
@@ -964,7 +930,7 @@ func (pm *PathManager) choosePaths() (bool, error) {
 		// keep previous paths, if still available
 		pathInUse := make([]bool, pm.numPathsPerDst)
 		for _, path := range availablePaths {
-			curKey := path.Key()
+			curKey := path.Fingerprint()
 			for i, prevKey := range dst.pathKeys {
 				if curKey == prevKey {
 					if !dst.paths[i].Enabled {
@@ -995,7 +961,7 @@ func (pm *PathManager) choosePaths() (bool, error) {
 				// TODO choose paths more cleverly
 				for _, path := range availablePaths {
 					// check if the path is already in use
-					curKey := path.Key()
+					curKey := path.Fingerprint()
 					inUse := false
 					for _, key := range dst.pathKeys {
 						if key == curKey {
@@ -1008,8 +974,8 @@ func (pm *PathManager) choosePaths() (bool, error) {
 					}
 
 					// use it from now on
-					fmt.Printf("[PathPool %s] enabling path %d:\n\t%s\n", dst.addr.IA, i, *path)
-					err := pm.putPath(dst, i, path, curKey)
+					fmt.Printf("[PathPool %s] enabling path %d:\n\t%s\n", dst.addr.IA, i, path)
+					err := pm.putPath(dst, i, &path, curKey)
 					if err != nil {
 						if dstModified {
 							dst.modifyTime = time.Now()
