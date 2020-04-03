@@ -117,7 +117,7 @@ func realMain() error {
 	flag.Var(&remoteAddrs, "d", "destination host address(es)")
 	flag.StringVar(&transmitFilename, "t", "", "transmit file (sender)")
 	flag.StringVar(&outputFilename, "o", "", "output file (receiver)")
-	flag.StringVar(&verbose, "v", "", "verbose output (from v to vvv)")
+	flag.StringVar(&verbose, "v", "", "verbose output (from '' to vv)")
 	flag.IntVar(&numPaths, "np", 1, "Maximum number of different paths per destination to use at the same time")
 	flag.Parse()
 
@@ -132,8 +132,11 @@ func realMain() error {
 		log.Root().SetHandler(log.LvlFilterHandler(log.LvlDebug, h))
 	} else if verbose == "v" {
 		log.Root().SetHandler(log.LvlFilterHandler(log.LvlInfo, h))
-	} else {
+	} else if verbose == "" {
 		log.Root().SetHandler(log.LvlFilterHandler(log.LvlError, h))
+	} else {
+		fmt.Println("-v can only be vv, v or empty")
+		os.Exit(1)
 	}
 
 	iface, err := net.InterfaceByName(ifname)
