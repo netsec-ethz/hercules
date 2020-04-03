@@ -872,6 +872,9 @@ func (pm *PathManager) pushPaths() error {
 
 		n := 0
 		for p, path := range dst.paths {
+			if path == nil {
+				continue
+			}
 			if path.NeedsSync || path.Enabled {
 				n = p
 			}
