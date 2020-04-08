@@ -59,8 +59,9 @@ type HerculesPath struct {
 type herculesStats = C.struct_hercules_stats
 
 const (
-	etherLen    int = 1500
-	defaultNUMA int = 0
+	etherLen        int = 1500
+	defaultNUMA     int = 0
+	defaultUDP4Port int = 10000
 )
 
 var (
@@ -93,7 +94,7 @@ func realMain() error {
 	flag.DurationVar(&dumpInterval, "n", time.Second, "Print stats at given interval")
 	flag.BoolVar(&enablePCC, "pcc", true, "Enable performance-oriented congestion control (PCC)")
 	flag.StringVar(&ifname, "i", "", "interface")
-	flag.StringVar(&localAddr, "l", "", "local address")
+	flag.StringVar(&localAddr, "b", "", "bind to local address")
 	flag.IntVar(&maxRateLimit, "p", 3333333, "Maximum allowed send rate in Packets per Second (default: 3'333'333, ~40Gbps)")
 	flag.StringVar(&mode, "m", "", "XDP socket bind mode (Zero copy: z; Copy mode: c)")
 	flag.IntVar(&queue, "q", 0, "Use queue n")
@@ -126,14 +127,35 @@ func realMain() error {
 		return errors.New("Interface is not up")
 	}
 
-	local, err := snet.ParseUDPAddr(localAddr)
-	if err != nil {
-		return err
+	var sciondConn sciond.Connector
+	if localAddr == "" || transmitFilename != "" { // connect to sciond only if needed
+		sciondConn, err = sciond.NewService(sciond.DefaultSCIONDAddress).Connect(context.Background())
+		if err != nil {
+			return err
+		}
 	}
 
-	err = checkAssignedIP(iface, local.Host.IP)
-	if err != nil {
-		return err
+	var local *snet.UDPAddr
+	if localAddr == "" {
+		local, err = guessLocalAddress(sciondConn, iface, local)
+		if err != nil {
+			return err
+		}
+	} else {
+		local, err = snet.ParseUDPAddr(localAddr)
+		if err != nil {
+			return err
+		}
+
+		err = checkAssignedIP(iface, local.Host.IP)
+		if err != nil {
+			return err
+		}
+	}
+
+	if local.Host.Port == 0 {
+		local.Host.Port = defaultUDP4Port
+		fmt.Printf("Binding to default port %d\n", defaultUDP4Port)
 	}
 
 	xdpMode := getXDPMode(mode)
@@ -143,13 +165,13 @@ func realMain() error {
 		if err != nil {
 			return err
 		}
-		return mainTx(transmitFilename, local, remote, iface, queue, maxRateLimit, enablePCC, xdpMode, dumpInterval)
+		return mainTx(transmitFilename, &sciondConn, local, remote, iface, queue, maxRateLimit, enablePCC, xdpMode, dumpInterval)
 	}
 	return mainRx(outputFilename, local, iface, queue, xdpMode, dumpInterval)
 }
 
-func mainTx(filename string, src, dst *snet.UDPAddr, iface *net.Interface, queue int, maxRateLimit int, enablePCC bool, xdpMode int, dumpInterval time.Duration) (err error) {
-	querier, err := initPathResolver(src.IA)
+func mainTx(filename string, sciondConn *sciond.Connector, src, dst *snet.UDPAddr, iface *net.Interface, queue int, maxRateLimit int, enablePCC bool, xdpMode int, dumpInterval time.Duration) (err error) {
+	querier, err := initPathResolver(sciondConn, src.IA)
 	if err != nil {
 		return err
 	}
@@ -734,6 +756,40 @@ func sendICMP(iface *net.Interface, srcIP net.IP, dstIP net.IP) (err error) {
 	return nil
 }
 
+func guessLocalAddress(sciondConn sciond.Connector, iface *net.Interface, local *snet.UDPAddr) (*snet.UDPAddr, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ia, err := sciondConn.LocalIA(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ip, err := getLocalIPOnInterface(iface)
+	if err != nil {
+		return nil, err
+	}
+
+	local = &snet.UDPAddr{
+		IA:   ia,
+		Host: &net.UDPAddr{IP: ip},
+	}
+	return local, nil
+}
+
+func getLocalIPOnInterface(iface *net.Interface) (to4 net.IP, err error) {
+	interfaceAddrs, err :=iface.Addrs()
+	if err != nil {
+		return nil, err
+	}
+	for _, addr := range interfaceAddrs {
+		ip, ok := addr.(*net.IPNet)
+		if ok && ip.IP.To4() != nil {
+			return ip.IP.To4(), nil
+		}
+	}
+	return nil, errors.New(fmt.Sprintf("Could not find an IPv4 address on interface %s", iface.Name))
+}
+
 func checkAssignedIP(iface *net.Interface, localAddr net.IP) (err error) {
 	// Determine src IP matches information on Interface
 	interfaceAddrs, err := iface.Addrs()
@@ -751,14 +807,9 @@ func checkAssignedIP(iface *net.Interface, localAddr net.IP) (err error) {
 
 // XXX scion utils
 // Replace with using scion-apps/lib!?
-func initPathResolver(ia addr.IA) (*sciond.Querier, error) {
-	sciondConn, err := sciond.NewService(sciond.DefaultSCIONDAddress).Connect(context.Background())
-	if err != nil {
-		return nil, err
-	}
-
+func initPathResolver(sciondConn *sciond.Connector, ia addr.IA) (*sciond.Querier, error) {
 	querier := sciond.Querier{
-		Connector: sciondConn,
+		Connector: *sciondConn,
 		IA: ia,
 	}
 	return &querier, nil
