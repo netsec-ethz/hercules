@@ -30,6 +30,7 @@ struct hercules_path {
 	int headerlen;
 	int payloadlen;
 	int framelen;	//!< length of ethernet frame; headerlen + payloadlen
+	u64 max_bps;    // bandwidth limit on that path, 0 = no limit
 	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
 	u16  checksum;	//SCION L4 checksum over header with 0 payload
 	atomic_bool enabled; // e.g. when a path has been revoked and no replacement is available, this will be set to false

@@ -24,12 +24,6 @@ package main
 // #include <string.h>
 import "C"
 import (
-	"github.com/scionproto/scion/go/lib/pathmgr"
-	"github.com/scionproto/scion/go/lib/topology"
-	"unsafe"
-)
-
-import (
 	"context"
 	"encoding/binary"
 	"errors"
@@ -42,16 +36,20 @@ import (
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/hpkt"
 	"github.com/scionproto/scion/go/lib/l4"
+	"github.com/scionproto/scion/go/lib/pathmgr"
 	"github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/snet"
 	"github.com/scionproto/scion/go/lib/spkt"
+	"github.com/scionproto/scion/go/lib/topology"
 	"github.com/vishvananda/netlink"
+	"hercules/mock_sibra/resvmgr" // TODO replace this with real API once it becomes available
 	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 type HerculesPath struct {
@@ -59,6 +57,12 @@ type HerculesPath struct {
 	PartialChecksum uint16 //SCION L4 checksum over header with 0 payload
 	NeedsSync       bool
 	Enabled         bool
+}
+
+type SibraHerculesPath struct {
+	*HerculesPath
+	ws				*resvmgr.WatchState
+	MaxBps			uint64
 }
 
 type herculesStats = C.struct_hercules_stats
@@ -95,6 +99,8 @@ func realMain() error {
 	var (
 		dumpInterval     time.Duration
 		enablePCC        bool
+		enableBestEffort bool
+		enableSibra		 bool
 		ifname           string
 		localAddr        string
 		maxRateLimit     int
@@ -119,10 +125,17 @@ func realMain() error {
 	flag.StringVar(&outputFilename, "o", "", "output file (receiver)")
 	flag.StringVar(&verbose, "v", "", "verbose output (from '' to vv)")
 	flag.IntVar(&numPaths, "np", 1, "Maximum number of different paths per destination to use at the same time")
+	flag.BoolVar(&enableBestEffort, "be", true, "Enable best-effort traffic")
+	flag.BoolVar(&enableSibra, "resv", false, "Enable COLIBRI bandwidth reservations")
 	flag.Parse()
 
 	if (transmitFilename == "") == (outputFilename == "") {
 		fmt.Println("Exactly one of -t or -o needs to be specified")
+		os.Exit(1)
+	}
+
+	if !enableBestEffort && !enableSibra {
+		fmt.Println("Best-effort traffic and COLIBRI bandwidth reservations both disabled, don't know how to send data ...");
 		os.Exit(1)
 	}
 
@@ -177,13 +190,13 @@ func realMain() error {
 		if len(remotes) == 0 {
 			return errors.New("You must specify at least one destination")
 		}
-		return mainTx(transmitFilename, local, remotes, iface, queue, maxRateLimit, enablePCC, xdpMode, dumpInterval, numPaths)
+		return mainTx(transmitFilename, local, remotes, iface, queue, maxRateLimit, enablePCC, enableBestEffort, enableSibra, xdpMode, dumpInterval, numPaths)
 	}
 	return mainRx(outputFilename, local, iface, queue, xdpMode, dumpInterval)
 }
 
-func mainTx(filename string, src *snet.UDPAddr, dsts []*snet.UDPAddr, iface *net.Interface, queue int, maxRateLimit int, enablePCC bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
-	pm, err := initNewPathManager(numPaths, iface, dsts, src)
+func mainTx(filename string, src *snet.UDPAddr, dsts []*snet.UDPAddr, iface *net.Interface, queue int, maxRateLimit int, enablePCC, enableBestEffort, enableSibra bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
+	pm, err := initNewPathManager(numPaths, iface, dsts, src, enableBestEffort, enableSibra)
 	if err != nil {
 		return err
 	}
@@ -418,7 +431,7 @@ func herculesTx(filename string, destinations []*snet.UDPAddr, pm *PathManager, 
 	for d, dest := range destinations {
 		cdests[d] = toCAddr(dest)
 	}
-	return C.hercules_tx(cfilename, &cdests[0], &pm.cPathsPerDest[0], C.int(len(destinations)), &pm.cNumPathsPerDst[0], C.int(pm.numPathsPerDst), C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
+	return C.hercules_tx(cfilename, &cdests[0], &pm.cPathsPerDest[0], C.int(len(destinations)), &pm.cNumPathsPerDst[0], pm.cMaxNumPathsPerDst, C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
 }
 
 // HerculesGetReplyPath creates a reply path header for the packet header in headerPtr with given length.
@@ -520,6 +533,12 @@ func toCPath(from HerculesPath, to *C.struct_hercules_path) {
 	to.checksum = C.ushort(from.PartialChecksum)
 	to.replaced = C.atomic_bool(from.NeedsSync)
 	to.enabled = C.atomic_bool(from.Enabled)
+	to.max_bps = 0
+}
+
+func toCPathWithSibra(from SibraHerculesPath, to *C.struct_hercules_path) {
+	toCPath(*from.HerculesPath, to)
+	to.max_bps = C.u64(from.MaxBps)
 }
 
 func toCAddr(in *snet.UDPAddr) C.struct_hercules_app_addr {
@@ -786,22 +805,55 @@ func checkAssignedIP(iface *net.Interface, localAddr net.IP) (err error) {
 type PathPool struct {
 	addr       *snet.UDPAddr
 	sp         *pathmgr.SyncPaths
-	paths      []*HerculesPath
-	pathKeys   []snet.PathFingerprint
 	modifyTime time.Time
+
+	// we use np paths, on each path we may use best-effort traffic and bandwidth reservations
+	bePaths  []*HerculesPath // path information for best-effort traffic
+	sbrPaths []*SibraHerculesPath // path information for bandwidth reservations
+	pathKeys []snet.PathFingerprint
+}
+
+func (pp PathPool) watchSibra(p int) {
+	path := pp.sbrPaths[p]
+	for event := range path.ws.Events {
+		switch event.Code {
+		case resvmgr.Quit:
+			log.Debug(fmt.Sprintf("[PathPool %s] Sibra resolver #%d quit", pp.addr.IA, p))
+			path.Enabled = false
+			pp.modifyTime = time.Now()
+			return
+		case resvmgr.Error:
+			log.Error(fmt.Sprintf("[PathPool %s] Sibra resolver on path #%d: %s", pp.addr.IA, p, event.Error))
+		case resvmgr.ExtnExpired, resvmgr.ExtnCleaned:
+			log.Debug(fmt.Sprintf("[PathPool %s] Sibra resolver #%d: expired or cleaned", pp.addr.IA, p))
+			path.Enabled = false
+			pp.modifyTime = time.Now()
+		case resvmgr.ExtnUpdated:
+			log.Debug(fmt.Sprintf("[PathPool %s] Sibra resolver %d updated path", pp.addr.IA, p))
+			sbrData := path.ws.SyncResv.Load()
+			// TODO(sibra) put ws into path.SibraResv
+			path.Enabled = true
+			path.NeedsSync = true
+			path.MaxBps = uint64(sbrData.Ephemeral.BwCls.Bps())
+			pp.modifyTime = time.Now()
+		}
+	}
 }
 
 type PathManager struct {
-	numPathsPerDst  int
-	iface           *net.Interface
-	dsts            []*PathPool
-	src             *snet.UDPAddr
-	cNumPathsPerDst []C.int
-	cPathsPerDest	[]C.struct_hercules_path
-	syncTime		time.Time
+	numPathsPerDst     int
+	iface              *net.Interface
+	dsts               []*PathPool
+	src                *snet.UDPAddr
+	cNumPathsPerDst    []C.int
+	cMaxNumPathsPerDst C.int
+	cPathsPerDest      []C.struct_hercules_path
+	syncTime           time.Time
+	sibraMgr           *resvmgr.Mgr
+	useBestEffort      bool
 }
 
-func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.UDPAddr, src *snet.UDPAddr) (*PathManager, error) {
+func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.UDPAddr, src *snet.UDPAddr, enableBestEffort, enableSibra bool) (*PathManager, error) {
 	var dstStates = make([]*PathPool, 0, numPathsPerDst)
 	sciondConn, err := sciond.NewService(sciond.DefaultSCIONDAddress).Connect(context.Background())
 	if err != nil {
@@ -811,6 +863,13 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.U
 	for _, dst := range dsts {
 		var dstState *PathPool
 		if src.IA == dst.IA {
+			if !enableBestEffort {
+				return nil, errors.New(fmt.Sprintf("Can only use best-effort traffic to destination %s", dst))
+			}
+			if enableSibra {
+				log.Warn("Can not use bandwidth reservation to destination %s", dst)
+			}
+
 			// use static empty path
 			hop := net.UDPAddr{
 				IP: dst.Host.IP,
@@ -830,7 +889,8 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.U
 			dstState = &PathPool{
 				addr:       dst,
 				sp:         nil,
-				paths:      []*HerculesPath{herculesPath},
+				bePaths:    []*HerculesPath{herculesPath},
+				sbrPaths:	nil,
 				modifyTime: time.Now(),
 			}
 		} else {
@@ -842,7 +902,8 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.U
 			dstState = &PathPool{
 				addr:       dst,
 				sp:         sp,
-				paths:		make([]*HerculesPath, numPathsPerDst),
+				bePaths:    make([]*HerculesPath, numPathsPerDst),
+				sbrPaths:   make([]*SibraHerculesPath, numPathsPerDst),
 				pathKeys:   make([]snet.PathFingerprint, numPathsPerDst),
 				modifyTime: time.Unix(0, 0),
 			}
@@ -850,16 +911,34 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.U
 		dstStates = append(dstStates, dstState)
 	}
 
+	var sibraMgr *resvmgr.Mgr
+	if enableSibra {
+		// TODO(sibra) make connection
+		// TODO(sibra) make store
+		mgr, err := resvmgr.New(nil, nil, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		sibraMgr = mgr
+	}
+
+	slotFactor := 1
+	if enableSibra && enableBestEffort {
+		slotFactor = 2
+	}
 	return &PathManager{
-		numPathsPerDst:  numPathsPerDst,
-		iface:           iface,
-		dsts:            dstStates,
-		src:             src,
-		syncTime:		 time.Unix(0, 0),
+		numPathsPerDst: numPathsPerDst,
+		iface:          iface,
+		dsts:           dstStates,
+		src:            src,
+		syncTime:       time.Unix(0, 0),
+		useBestEffort:  enableBestEffort,
+		sibraMgr:       sibraMgr,
 
 		// allocate memory to pass paths to C
 		cNumPathsPerDst: make([]C.int, len(dsts)),
-		cPathsPerDest:   make([]C.struct_hercules_path, len(dsts)*numPathsPerDst),
+		cMaxNumPathsPerDst: C.int(numPathsPerDst*slotFactor),
+		cPathsPerDest:   make([]C.struct_hercules_path, len(dsts)*numPathsPerDst*slotFactor),
 	}, nil
 }
 
@@ -874,18 +953,40 @@ func (pm *PathManager) pushPaths() error {
 		}
 
 		n := 0
-		for p, path := range dst.paths {
-			if path == nil {
-				continue
-			}
-			if path.NeedsSync || path.Enabled {
-				n = p
-			}
-			if path.NeedsSync {
-				toCPath(*path, &pm.cPathsPerDest[d*pm.numPathsPerDst+p])
-				path.NeedsSync = false
-			} else {
-				pm.cPathsPerDest[d*pm.numPathsPerDst+p].enabled = C.atomic_bool(path.Enabled)
+		slot := 0
+		if pm.useBestEffort {
+			for p := 0; p < pm.numPathsPerDst; p++ {
+				if pm.useBestEffort {
+					path := dst.bePaths[p]
+					if path != nil {
+						if path.NeedsSync || path.Enabled {
+							n = slot
+						}
+						if path.NeedsSync {
+							toCPath(*path, &pm.cPathsPerDest[d*pm.numPathsPerDst+slot])
+							path.NeedsSync = false
+						} else {
+							pm.cPathsPerDest[d*pm.numPathsPerDst+slot].enabled = C.atomic_bool(path.Enabled)
+						}
+					}
+					slot += 1
+				}
+
+				if pm.sibraMgr != nil && dst.sbrPaths != nil {
+					path := dst.sbrPaths[p]
+					if path != nil {
+						if path.NeedsSync || path.Enabled {
+							n = slot
+						}
+						if path.NeedsSync {
+							toCPathWithSibra(*path, &pm.cPathsPerDest[d*pm.numPathsPerDst+slot])
+							path.NeedsSync = false
+						} else {
+							pm.cPathsPerDest[d*pm.numPathsPerDst+slot].enabled = C.atomic_bool(path.Enabled)
+						}
+					}
+					slot += 1
+				}
 			}
 		}
 		pm.cNumPathsPerDst[d] = C.int(n + 1)
@@ -896,23 +997,49 @@ func (pm *PathManager) pushPaths() error {
 	return nil
 }
 
-func (pm *PathManager) putPath(dst *PathPool, pathIdx int, p *snet.Path, key snet.PathFingerprint) error {
+func preparePath(dst *PathPool, p *snet.Path, pm *PathManager) (*HerculesPath, error) {
 	var err error
 	curDst := dst.addr.Copy()
 	curDst.Path = (*p).Path()
 	if err = curDst.Path.InitOffsets(); err != nil {
-		return err
+		return nil, err
 	}
 
 	curDst.NextHop = (*p).OverlayNextHop()
 
-	dst.paths[pathIdx], err = prepareSCIONPacketHeader(pm.src, curDst, pm.iface)
-	if err == nil {
-		dst.paths[pathIdx].NeedsSync = true
-		dst.paths[pathIdx].Enabled = true
-		dst.pathKeys[pathIdx] = key
+	path, err := prepareSCIONPacketHeader(pm.src, curDst, pm.iface)
+	if err != nil {
+		return nil, err
 	}
-	return err
+
+	path.NeedsSync = true
+	path.Enabled = true
+	return path, nil
+}
+
+func (pm *PathManager) putBePath(dst *PathPool, pathIdx int, p *snet.Path, key snet.PathFingerprint) error {
+	path, err := preparePath(dst, p, pm)
+	if err != nil {
+		return err
+	}
+
+	dst.bePaths[pathIdx] = path
+	dst.pathKeys[pathIdx] = key
+	return nil
+}
+
+func (pm *PathManager) putSbrPath(dst *PathPool, pathIdx int, p *snet.Path, key snet.PathFingerprint, ws *resvmgr.WatchState) error {
+	path, err := preparePath(dst, p, pm)
+	if err != nil {
+		return err
+	}
+
+	sbrData := ws.SyncResv.Load()
+	// TODO(sibra) put ws into path.SibraResv
+	sbrPath := SibraHerculesPath{path, ws, uint64(sbrData.Ephemeral.BwCls.Bps())}
+	dst.sbrPaths[pathIdx] = &sbrPath
+	dst.pathKeys[pathIdx] = key
+	return nil
 }
 
 func (pm *PathManager) choosePaths() (bool, error) {
@@ -939,10 +1066,24 @@ func (pm *PathManager) choosePaths() (bool, error) {
 			curKey := path.Fingerprint()
 			for i, prevKey := range dst.pathKeys {
 				if curKey == prevKey {
-					if !dst.paths[i].Enabled {
+					if !dst.bePaths[i].Enabled {
 						fmt.Printf("[PathPool %s] re-enabling path %d\n", dst.addr.IA, i)
-						dst.paths[i].Enabled = true
-						dstModified = true
+						if pm.useBestEffort {
+							dst.bePaths[i].Enabled = true
+							dstModified = true
+						}
+
+						if pm.sibraMgr != nil {
+							err := pm.initSibraPath(dst, curKey, i, path)
+							if err != nil {
+								if dstModified {
+									dst.modifyTime = time.Now()
+									updated = true
+								}
+								return updated, err
+							}
+							dstModified = true
+						}
 					}
 					pathInUse[i] = true
 					break
@@ -952,9 +1093,18 @@ func (pm *PathManager) choosePaths() (bool, error) {
 
 		// check for vanished paths
 		for i, inUse := range pathInUse {
-			if inUse == false && dst.paths[i] != nil && dst.paths[i].Enabled {
+			if inUse == false && dst.bePaths[i] != nil && dst.bePaths[i].Enabled {
 				fmt.Printf("[PathPool %s] disabling path %d\n", dst.addr.IA, i)
-				dst.paths[i].Enabled = false
+				if pm.useBestEffort {
+					dst.bePaths[i].Enabled = false
+				}
+				if pm.sibraMgr != nil && dst.sbrPaths != nil {
+					err := pm.sibraMgr.Unwatch(dst.sbrPaths[i].ws)
+					if err != nil {
+						log.Error(err.Error())
+					}
+					dst.sbrPaths[i].Enabled = false
+				}
 				dstModified = true
 			}
 		}
@@ -981,16 +1131,31 @@ func (pm *PathManager) choosePaths() (bool, error) {
 
 					// use it from now on
 					fmt.Printf("[PathPool %s] enabling path %d:\n\t%s\n", dst.addr.IA, i, path)
-					err := pm.putPath(dst, i, &path, curKey)
-					if err != nil {
-						if dstModified {
-							dst.modifyTime = time.Now()
-							updated = true
+					if pm.useBestEffort {
+						err := pm.putBePath(dst, i, &path, curKey)
+						if err != nil {
+							if dstModified {
+								dst.modifyTime = time.Now()
+								updated = true
+							}
+							return updated, err
 						}
-						return updated, err
+						dstModified = true
+						pathInUse[i] = true
 					}
-					dstModified = true
-					pathInUse[i] = true
+
+					if pm.sibraMgr != nil {
+						err := pm.initSibraPath(dst, curKey, i, path)
+						if err != nil {
+							if dstModified {
+								dst.modifyTime = time.Now()
+								updated = true
+							}
+							return updated, err
+						}
+						dstModified = true
+						pathInUse[i] = true
+					}
 					break
 				}
 			}
@@ -1002,6 +1167,30 @@ func (pm *PathManager) choosePaths() (bool, error) {
 		}
 	}
 	return updated, nil
+}
+
+func (pm *PathManager) initSibraPath(dst *PathPool, pathFingerprint snet.PathFingerprint, p int, path snet.Path) error {
+	ctx, cancelTimeout := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelTimeout()
+	ws, err := pm.sibraMgr.WatchEphem(ctx, &resvmgr.EphemConf{
+		PathConf: &resvmgr.PathConf{
+			Paths: dst.sp,
+			Key:   pathFingerprint,
+		},
+		Destination: nil, // TODO(sibra) pass correct address for dst.addr
+		MinBWCls:    0,
+		MaxBWCls:    5,
+	})
+	if err != nil {
+		return err
+	}
+
+	err = pm.putSbrPath(dst, p, &path, pathFingerprint, ws)
+	if err != nil {
+		return err
+	}
+	go dst.watchSibra(p)
+	return nil
 }
 
 func (pm *PathManager) syncPathsToC() {
