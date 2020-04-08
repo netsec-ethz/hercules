@@ -24,13 +24,6 @@ package main
 // #include <string.h>
 import "C"
 import (
-	"github.com/scionproto/scion/go/lib/spath"
-	"github.com/scionproto/scion/go/lib/topology"
-	"github.com/scionproto/scion/go/lib/topology/overlay"
-	"unsafe"
-)
-
-import (
 	"context"
 	"encoding/binary"
 	"errors"
@@ -45,13 +38,17 @@ import (
 	"github.com/scionproto/scion/go/lib/l4"
 	"github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/snet"
+	"github.com/scionproto/scion/go/lib/spath"
 	"github.com/scionproto/scion/go/lib/spkt"
+	"github.com/scionproto/scion/go/lib/topology"
+	"github.com/scionproto/scion/go/lib/topology/overlay"
 	"github.com/vishvananda/netlink"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 type HerculesPath struct {
@@ -129,7 +126,7 @@ func realMain() error {
 		return errors.New("Interface is not up")
 	}
 
-	local, err := parseSCIONAddrs(localAddr)
+	local, err := snet.ParseUDPAddr(localAddr)
 	if err != nil {
 		return err
 	}
@@ -142,7 +139,7 @@ func realMain() error {
 	xdpMode := getXDPMode(mode)
 
 	if transmitFilename != "" {
-		remote, err := parseSCIONAddrs(remoteAddr)
+		remote, err := snet.ParseUDPAddr(remoteAddr)
 		if err != nil {
 			return err
 		}
@@ -410,10 +407,6 @@ func HerculesGetReplyPath(headerPtr unsafe.Pointer, length C.int, replyPathStruc
 	}
 	toCPath(*replyPath, replyPathStruct)
 	return 0
-}
-
-func parseSCIONAddrs(scionAddr string) (*snet.UDPAddr, error) {
-	return snet.ParseUDPAddr(scionAddr)
 }
 
 func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPath, error) {
