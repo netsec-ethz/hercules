@@ -1105,9 +1105,17 @@ static void send_batch(struct xsk_socket_info *xsk, u32 *frame_nb, const struct 
 u32 compute_max_chunks_per_rcvr(u32 *max_chunks_per_rcvr)
 {
 	u32 total_chunks = 0;
-	for (u32 r = 0; r < tx_state->num_receivers; r++) {
-		max_chunks_per_rcvr[r] = umin64(BATCH_SIZE, path_can_send_npkts(&tx_state->receiver[r].cc_states[tx_state->receiver[r].path_index]));
-		total_chunks += max_chunks_per_rcvr[r];
+	if (tx_state->receiver[0].cc_states != NULL) { // use PCC
+		for(u32 r = 0; r < tx_state->num_receivers; r++) {
+			max_chunks_per_rcvr[r] = umin64(BATCH_SIZE, path_can_send_npkts(
+					&tx_state->receiver[r].cc_states[tx_state->receiver[r].path_index]));
+			total_chunks += max_chunks_per_rcvr[r];
+		}
+	} else { // no path-based limit
+		for(u32 r = 0; r < tx_state->num_receivers; r++) {
+			max_chunks_per_rcvr[r] = BATCH_SIZE;
+			total_chunks += max_chunks_per_rcvr[r];
+		}
 	}
 	return total_chunks;
 }
