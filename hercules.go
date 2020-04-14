@@ -333,6 +333,7 @@ func statsDumper(tx bool, interval time.Duration) {
 			if stats.end_time > 0 || stats.start_time == 0 { // explicitly finished or already de-initialized
 				return
 			}
+			prevStats = stats
 		}
 	}
 }
