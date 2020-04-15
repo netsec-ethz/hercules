@@ -131,13 +131,11 @@ func realMain() error {
 	flag.Parse()
 
 	if (transmitFilename == "") == (outputFilename == "") {
-		fmt.Println("Exactly one of -t or -o needs to be specified")
-		os.Exit(1)
+		return errors.New("Exactly one of -t or -o needs to be specified")
 	}
 
 	if !enableBestEffort && !enableSibra {
-		fmt.Println("Best-effort traffic and COLIBRI bandwidth reservations both disabled, don't know how to send data ...");
-		os.Exit(1)
+		return errors.New("Best-effort traffic and COLIBRI bandwidth reservations both disabled, don't know how to send data ...")
 	}
 
 	// Setup logger
@@ -149,8 +147,7 @@ func realMain() error {
 	} else if verbose == "" {
 		log.Root().SetHandler(log.LvlFilterHandler(log.LvlError, h))
 	} else {
-		fmt.Println("-v can only be vv, v or empty")
-		os.Exit(1)
+		return errors.New("-v can only be vv, v or empty")
 	}
 
 	iface, err := net.InterfaceByName(ifname)
@@ -1074,7 +1071,7 @@ func (pm *PathManager) choosePaths() (bool, error) {
 			for i, prevKey := range dst.pathKeys {
 				if curKey == prevKey {
 					if !dst.bePaths[i].Enabled {
-						fmt.Printf("[PathPool %s] re-enabling path %d\n", dst.addr.IA, i)
+						log.Info(fmt.Sprintf("[PathPool %s] re-enabling path %d\n", dst.addr.IA, i))
 						if pm.useBestEffort {
 							dst.bePaths[i].Enabled = true
 							dstModified = true
@@ -1101,7 +1098,7 @@ func (pm *PathManager) choosePaths() (bool, error) {
 		// check for vanished paths
 		for i, inUse := range pathInUse {
 			if inUse == false && dst.bePaths[i] != nil && dst.bePaths[i].Enabled {
-				fmt.Printf("[PathPool %s] disabling path %d\n", dst.addr.IA, i)
+				log.Info(fmt.Sprintf("[PathPool %s] disabling path %d\n", dst.addr.IA, i))
 				if pm.useBestEffort {
 					dst.bePaths[i].Enabled = false
 				}
@@ -1137,7 +1134,7 @@ func (pm *PathManager) choosePaths() (bool, error) {
 					}
 
 					// use it from now on
-					fmt.Printf("[PathPool %s] enabling path %d:\n\t%s\n", dst.addr.IA, i, path)
+					log.Info(fmt.Sprintf("[PathPool %s] enabling path %d:\n\t%s\n", dst.addr.IA, i, path))
 					if pm.useBestEffort {
 						err := pm.putBePath(dst, i, &path, curKey)
 						if err != nil {
@@ -1205,7 +1202,7 @@ func (pm *PathManager) syncPathsToC() {
 	for _ = range ticker.C {
 		updated, err := pm.choosePaths()
 		if err != nil {
-			fmt.Printf("Error while choosing paths: %s\n", err)
+			log.Error(fmt.Sprintf("Error while choosing paths: %s\n", err))
 			continue
 		}
 		if !updated {
