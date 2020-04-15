@@ -157,6 +157,12 @@ struct receiver_state {
 	u64 end_time;
 };
 
+struct sibra_state {
+	u64 mi_start;
+	u32 mi_npkts;
+	u32 max_pps;
+};
+
 struct sender_state_per_receiver {
 	/** Map chunk_id to path_id */
 	u32 *path_map;
@@ -170,6 +176,7 @@ struct sender_state_per_receiver {
 	struct hercules_app_addr addr;
 	struct hercules_path *paths;
 	struct ccontrol_state *cc_states;
+	struct sibra_state *sibra_states;
 	bool cts_received;
 };
 
@@ -1033,6 +1040,17 @@ static void update_hercules_tx_paths(void)
 					   sizeof(struct hercules_path));
 			} else {
 				receiver->paths[p].enabled = tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].enabled;
+				receiver->paths[p].max_bps = tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].max_bps;
+			}
+
+			u32 max_pps = receiver->paths[p].max_bps / ETHER_SIZE;
+			if(receiver->sibra_states[p].max_pps != max_pps) {
+				if(receiver->sibra_states[p].max_pps < max_pps) {
+					// We got more bandwidth, start new MI to profit immediately
+					receiver->sibra_states[p].mi_start = get_nsecs();
+					receiver->sibra_states[p].mi_npkts = 0;
+				}
+				receiver->sibra_states[p].max_pps = max_pps;
 			}
 		}
 	}
@@ -1105,17 +1123,40 @@ static void send_batch(struct xsk_socket_info *xsk, u32 *frame_nb, const struct 
 u32 compute_max_chunks_per_rcvr(u32 *max_chunks_per_rcvr)
 {
 	u32 total_chunks = 0;
-	if (tx_state->receiver[0].cc_states != NULL) { // use PCC
-		for(u32 r = 0; r < tx_state->num_receivers; r++) {
+	u64 now = get_nsecs();
+
+	for(u32 r = 0; r < tx_state->num_receivers; r++) {
+		if(!tx_state->receiver[r].paths[tx_state->receiver[r].path_index].enabled) {
+			continue; // if a receiver does not have any enabled paths, we can actually end up here ... :(
+		}
+		if(tx_state->receiver[r].paths[tx_state->receiver[r].path_index].max_bps != 0) { // SIBRA provisioned bandwidth limit
+			struct sibra_state *sibra_state = &tx_state->receiver[r].sibra_states[tx_state->receiver[r].path_index];
+			if(sibra_state->mi_npkts > RATE_LIMIT_CHECK) {
+				u64 dt = sibra_state->mi_npkts * 1000000000. / sibra_state->max_pps;
+				if(now > sibra_state->mi_start + dt) { // TODO why does umax64(now, mock.mi_start + dt) not do the same??
+					sibra_state->mi_start = now;
+				} else {
+					sibra_state->mi_start = sibra_state->mi_start + dt;
+				}
+				sibra_state->mi_npkts = 0;
+			}
+			if(sibra_state->mi_start > now) {
+				// wait until we can send again
+				max_chunks_per_rcvr[r] = 0;
+			} else {
+				if(sibra_state->mi_npkts < sibra_state->max_pps) {
+					max_chunks_per_rcvr[r] = umin32(sibra_state->max_pps - sibra_state->mi_npkts, BATCH_SIZE);
+				} else {
+					max_chunks_per_rcvr[r] = umin32(sibra_state->max_pps, BATCH_SIZE);
+				}
+			}
+		} else if(tx_state->receiver[r].cc_states != NULL) { // use PCC
 			max_chunks_per_rcvr[r] = umin64(BATCH_SIZE, path_can_send_npkts(
 					&tx_state->receiver[r].cc_states[tx_state->receiver[r].path_index]));
-			total_chunks += max_chunks_per_rcvr[r];
-		}
-	} else { // no path-based limit
-		for(u32 r = 0; r < tx_state->num_receivers; r++) {
+		} else { // no path-based limit
 			max_chunks_per_rcvr[r] = BATCH_SIZE;
-			total_chunks += max_chunks_per_rcvr[r];
 		}
+		total_chunks += max_chunks_per_rcvr[r];
 	}
 	return total_chunks;
 }
@@ -1157,9 +1198,10 @@ void iterate_paths()
 {
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
 		struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
+		u32 prev_path_index = receiver->path_index; // we need this to break the loop if all paths are disabled
 		do {
 			receiver->path_index = (receiver->path_index + 1) % receiver->num_paths;
-		} while(!receiver->paths[receiver->path_index].enabled);
+		} while(!receiver->paths[receiver->path_index].enabled && receiver->path_index != prev_path_index);
 	}
 }
 
@@ -1252,6 +1294,9 @@ static void tx_only(struct xsk_socket_info *xsk)
 		total_chunks = exclude_finished_receivers(max_chunks_per_rcvr, finished, total_chunks);
 
 		if(total_chunks == 0) { // we hit the rate limits on every path
+			if (tx_state->has_new_paths) {
+				update_hercules_tx_paths();
+			}
 			iterate_paths();
 			continue;
 		}
@@ -1328,6 +1373,10 @@ static void tx_only(struct xsk_socket_info *xsk)
 			prepare_rcvr_paths(rcvr_path);
 			send_batch(xsk, &frame_nb, rcvr_path, chunks, chunk_rcvr, num_chunks);
 			rate_limit_tx();
+
+			for(u32 r = 0; r < tx_state->num_receivers; r++) {
+				tx_state->receiver[r].sibra_states[tx_state->receiver[r].path_index].mi_npkts += num_chunks_per_rcvr[r];
+			}
 		}
 
 		if (tx_state->has_new_paths) {
@@ -1371,6 +1420,7 @@ static void init_tx_state(size_t filesize, int chunklen, int max_rate_limit, cha
 		receiver->paths = calloc(tx_state->max_paths_per_rcvr, sizeof(struct hercules_path));
 		receiver->addr = dests[d];
 		receiver->cts_received = false;
+		receiver->sibra_states = calloc(tx_state->max_paths_per_rcvr, sizeof(struct sibra_state));
 	}
 	update_hercules_tx_paths();
 }
@@ -1381,6 +1431,7 @@ static void destroy_tx_state() {
 		bitset__destroy(&receiver->acked_chunks);
 		free(receiver->path_map);
 		free(receiver->paths);
+		free(receiver->sibra_states);
 	}
 	free(tx_state);
 }
