@@ -43,6 +43,7 @@ import (
 	"github.com/scionproto/scion/go/lib/topology"
 	"github.com/vishvananda/netlink"
 	"go.uber.org/atomic"
+	"hercules/mock_sibra/lib/sibra"
 	"hercules/mock_sibra/resvmgr" // TODO replace this with real API once it becomes available
 	"net"
 	"os"
@@ -194,7 +195,7 @@ func realMain() error {
 }
 
 func mainTx(filename string, src *snet.UDPAddr, dsts []*snet.UDPAddr, iface *net.Interface, queue int, maxRateLimit int, enablePCC, enableBestEffort, enableSibra bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
-	pm, err := initNewPathManager(numPaths, iface, dsts, src, enableBestEffort, enableSibra)
+	pm, err := initNewPathManager(numPaths, iface, dsts, src, enableBestEffort, enableSibra, uint64(maxRateLimit) * uint64(C.ETHER_SIZE))
 	if err != nil {
 		return err
 	}
@@ -852,9 +853,10 @@ type PathManager struct {
 	syncTime           time.Time
 	sibraMgr           *resvmgr.Mgr
 	useBestEffort      bool
+	maxBps			   uint64
 }
 
-func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.UDPAddr, src *snet.UDPAddr, enableBestEffort, enableSibra bool) (*PathManager, error) {
+func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.UDPAddr, src *snet.UDPAddr, enableBestEffort, enableSibra bool, maxBps uint64) (*PathManager, error) {
 	var dstStates = make([]*PathPool, 0, numPathsPerDst)
 	sciondConn, err := sciond.NewService(sciond.DefaultSCIONDAddress).Connect(context.Background())
 	if err != nil {
@@ -935,6 +937,7 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.U
 		syncTime:       time.Unix(0, 0),
 		useBestEffort:  enableBestEffort,
 		sibraMgr:       sibraMgr,
+		maxBps:         maxBps,
 
 		// allocate memory to pass paths to C
 		cNumPathsPerDst: make([]C.int, len(dsts)),
@@ -1183,7 +1186,7 @@ func (pm *PathManager) initSibraPath(dst *PathPool, pathFingerprint snet.PathFin
 		},
 		Destination: nil, // TODO(sibra) pass correct address for dst.addr
 		MinBWCls:    0,
-		MaxBWCls:    5,
+		MaxBWCls:    sibra.Bps(pm.maxBps).ToBwCls(false),
 	})
 	if err != nil {
 		return err

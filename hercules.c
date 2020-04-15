@@ -61,7 +61,6 @@
 #define BATCH_SIZE 64
 
 
-#define ETHER_SIZE 1500
 #define RATE_LIMIT_CHECK 1000 // check rate limit every X packets
 						// Maximum burst above target pps allowed
 

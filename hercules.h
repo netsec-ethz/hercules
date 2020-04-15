@@ -24,6 +24,7 @@ typedef __u32 u32;
 typedef __u16 u16;
 typedef __u8 u8;
 
+#define ETHER_SIZE 1500
 #define HERCULES_MAX_HEADERLEN 256
 // Path are specified as ETH/IP/UDP/SCION/UDP headers.
 struct hercules_path {
