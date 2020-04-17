@@ -20,33 +20,24 @@ import (
 	"hercules/mock_sibra/resvmgr" // TODO replace this with real API once it becomes available
 )
 
-func (pp *PathPool) watchSibra(p int) {
-	path := pp.sbrPaths[p]
-	for event := range path.ws.Events {
+func (pwd *PathsToDestination) watchSibra(path *PathMeta, idx int) {
+	for event := range path.sbrWs.Events {
 		switch event.Code {
 		case resvmgr.Quit:
-			log.Debug(fmt.Sprintf("[PathPool %s] Sibra resolver #%d quit", pp.addr.IA, p))
-			path.Enabled = false
-			pp.ExtnUpdated.Swap(true)
+			log.Debug(fmt.Sprintf("[Destination %s] Sibra resolver #%d quit", pwd.addr.IA, idx))
+			path.sbrEnabled.Store(false)
+			pwd.ExtnUpdated.Store(true)
 			return
 		case resvmgr.Error:
-			log.Error(fmt.Sprintf("[PathPool %s] Sibra resolver on path #%d: %s", pp.addr.IA, p, event.Error))
+			log.Error(fmt.Sprintf("[Destination %s] Sibra resolver on path #%d: %s", pwd.addr.IA, idx, event.Error))
 		case resvmgr.ExtnExpired, resvmgr.ExtnCleaned:
-			log.Debug(fmt.Sprintf("[PathPool %s] Sibra resolver #%d: expired or cleaned", pp.addr.IA, p))
-			path.Enabled = false
-			pp.ExtnUpdated.Swap(false)
+			log.Debug(fmt.Sprintf("[Destination %s] Sibra resolver #%d: expired or cleaned", pwd.addr.IA, idx))
+			path.sbrEnabled.Store(false)
+			pwd.ExtnUpdated.Store(true)
 		case resvmgr.ExtnUpdated:
-			log.Debug(fmt.Sprintf("[PathPool %s] Sibra resolver %d updated path", pp.addr.IA, p))
-			sbrData := path.ws.SyncResv.Load()
-			// TODO(sibra) put ws into path.SibraResv
-			path.MaxBps = uint64(sbrData.Ephemeral.BwCls.Bps())
-			if path.MaxBps == 0 {
-				path.Enabled = false
-			} else {
-				path.Enabled = true
-			}
-			path.NeedsSync = true
-			pp.ExtnUpdated.Swap(true)
+			log.Debug(fmt.Sprintf("[Destination %s] Sibra resolver %d updated path", pwd.addr.IA, idx))
+			path.sbrUpdated.Store(true)
+			pwd.ExtnUpdated.Store(true)
 		}
 	}
 }

@@ -55,7 +55,7 @@ func HerculesGetReplyPath(headerPtr unsafe.Pointer, length C.int, replyPathStruc
 		log.Debug("HerculesGetReplyPath", "err", err)
 		return 1
 	}
-	toCPath(*replyPath, replyPathStruct)
+	toCPath(*replyPath, replyPathStruct, false, false)
 	return 0
 }
 
@@ -125,7 +125,7 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPath, error)
 	return &herculesPath, nil
 }
 
-func toCPath(from HerculesPath, to *C.struct_hercules_path) {
+func toCPath(from HerculesPath, to *C.struct_hercules_path, replaced, enabled bool) {
 	if len(from.Header) > C.HERCULES_MAX_HEADERLEN {
 		panic(fmt.Sprintf("Header too long (%d), can't invoke hercules C API.", len(from.Header)))
 	}
@@ -137,14 +137,9 @@ func toCPath(from HerculesPath, to *C.struct_hercules_path) {
 		unsafe.Pointer(&from.Header[0]),
 		C.ulong(len(from.Header)))
 	to.checksum = C.ushort(from.PartialChecksum)
-	to.replaced = C.atomic_bool(from.NeedsSync)
-	to.enabled = C.atomic_bool(from.Enabled)
+	to.replaced = C.atomic_bool(replaced)
+	to.enabled = C.atomic_bool(enabled)
 	to.max_bps = 0
-}
-
-func toCPathWithSibra(from SibraHerculesPath, to *C.struct_hercules_path) {
-	toCPath(*from.HerculesPath, to)
-	to.max_bps = C.u64(from.MaxBps)
 }
 
 func toCAddr(in *snet.UDPAddr) C.struct_hercules_app_addr {

@@ -38,8 +38,6 @@ type arrayFlags []string
 type HerculesPath struct {
 	Header          []byte //!< C.HERCULES_MAX_HEADERLEN bytes
 	PartialChecksum uint16 //SCION L4 checksum over header with 0 payload
-	NeedsSync       bool
-	Enabled         bool
 }
 
 type SibraHerculesPath struct {
@@ -58,7 +56,7 @@ type layerWithOpts struct {
 type PathManager struct {
 	numPathsPerDst     int
 	iface              *net.Interface
-	dsts               []*PathPool
+	dsts               []*PathsToDestination
 	src                *snet.UDPAddr
 	cNumPathsPerDst    []C.int
 	cMaxNumPathsPerDst C.int
@@ -69,14 +67,22 @@ type PathManager struct {
 	maxBps             uint64
 }
 
-type PathPool struct {
+type PathMeta struct {
+	path        snet.Path
+	fingerprint snet.PathFingerprint
+	enabled     bool // Indicates whether this path can be used at the moment
+	updated     bool // Indicates whether this path needs to be synced to the C path
+
+	// SIBRA related
+	sbrWs      *resvmgr.WatchState
+	sbrEnabled atomic.Bool // Indicates whether the SIBRA extension can be used at the moment (i.e. SIBRA resolver is running)
+	sbrUpdated atomic.Bool // Indicates whether the SIBRA status needs to be synced to the C part
+}
+
+type PathsToDestination struct {
 	addr        *snet.UDPAddr
 	sp          *pathmgr.SyncPaths
 	modifyTime  time.Time
 	ExtnUpdated atomic.Bool
-
-	// we use np paths, on each path we may use best-effort traffic and bandwidth reservations
-	bePaths  []*HerculesPath      // path information for best-effort traffic
-	sbrPaths []*SibraHerculesPath // path information for bandwidth reservations
-	pathKeys []snet.PathFingerprint
+	paths       []PathMeta
 }
