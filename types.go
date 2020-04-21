@@ -40,12 +40,6 @@ type HerculesPath struct {
 	PartialChecksum uint16 //SCION L4 checksum over header with 0 payload
 }
 
-type SibraHerculesPath struct {
-	*HerculesPath
-	ws     *resvmgr.WatchState
-	MaxBps uint64
-}
-
 type herculesStats = C.struct_hercules_stats
 
 type layerWithOpts struct {
@@ -62,6 +56,7 @@ type PathManager struct {
 	cMaxNumPathsPerDst C.int
 	cPathsPerDest      []C.struct_hercules_path
 	syncTime           time.Time
+	pathResolver       pathmgr.Resolver
 	sibraMgr           *resvmgr.Mgr
 	useBestEffort      bool
 	maxBps             uint64
@@ -80,6 +75,7 @@ type PathMeta struct {
 }
 
 type PathsToDestination struct {
+	pm          *PathManager
 	addr        *snet.UDPAddr
 	sp          *pathmgr.SyncPaths
 	modifyTime  time.Time
