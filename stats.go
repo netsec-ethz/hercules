@@ -62,7 +62,7 @@ func statsDumper(tx bool, interval time.Duration) {
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for _ = range ticker.C {
+	for range ticker.C {
 		select {
 		default:
 			stats := C.hercules_get_stats()

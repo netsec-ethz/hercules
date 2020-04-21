@@ -27,9 +27,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	log "github.com/inconshreveable/log15"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	log "github.com/inconshreveable/log15"
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/hpkt"
@@ -62,29 +62,29 @@ func HerculesGetReplyPath(headerPtr unsafe.Pointer, length C.int, replyPathStruc
 func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPath, error) {
 	packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
 	if err := packet.ErrorLayer(); err != nil {
-		return nil, fmt.Errorf("Error decoding some part of the packet: %v", err)
+		return nil, fmt.Errorf("error decoding some part of the packet: %v", err)
 	}
 	ip4 := packet.Layer(layers.LayerTypeIPv4)
 	if ip4 == nil {
-		return nil, errors.New("Error decoding IPv4 layer")
+		return nil, errors.New("error decoding IPv4 layer")
 	}
 	dstIP, srcIP := ip4.(*layers.IPv4).SrcIP, ip4.(*layers.IPv4).DstIP
 
 	udp := packet.Layer(layers.LayerTypeUDP)
 	if udp == nil {
-		return nil, errors.New("Error decoding IPv4/UDP layer")
+		return nil, errors.New("error decoding IPv4/UDP layer")
 	}
 	udpPayload := udp.(*layers.UDP).Payload
 	udpDstPort, _ := udp.(*layers.UDP).SrcPort, udp.(*layers.UDP).DstPort
 
 	if len(udpPayload) < 8 { // Guard against bug in ParseScnPkt
-		return nil, errors.New("Error decoding SCION packet: payload too small")
+		return nil, errors.New("error decoding SCION packet: payload too small")
 	}
 
 	var scionPkt spkt.ScnPkt
 	// XXX: ignore checksum errors. No API to parse without payload validation
 	if err := hpkt.ParseScnPkt(&scionPkt, udpPayload); err != nil {
-		return nil, fmt.Errorf("Error decoding SCION packet: %v", err)
+		return nil, fmt.Errorf("error decoding SCION packet: %v", err)
 	}
 
 	scionPkt.DstIA, scionPkt.SrcIA = scionPkt.SrcIA, scionPkt.DstIA
@@ -92,7 +92,7 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPath, error)
 
 	if scionPkt.Path != nil {
 		if err := scionPkt.Path.Reverse(); err != nil {
-			return nil, fmt.Errorf("Failed to reverse SCION path: %v", err)
+			return nil, fmt.Errorf("failed to reverse SCION path: %v", err)
 		}
 		log.Debug("getReplyPathHeader", "path", scionPkt.Path)
 	} else {
@@ -100,7 +100,7 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPath, error)
 	}
 
 	if scionPkt.L4 == nil {
-		return nil, errors.New("Error decoding SCION/UDP")
+		return nil, errors.New("error decoding SCION/UDP")
 	}
 	scionPkt.L4.Reverse()
 
@@ -293,7 +293,7 @@ func getAddrs(iface *net.Interface, destination net.IP) (dstMAC, srcMAC net.Hard
 		}
 	}
 	if route.LinkIndex != iface.Index {
-		err = errors.New("No route found to destination on specified interface")
+		err = errors.New("no route found to destination on specified interface")
 	}
 
 	dstIP := destination
@@ -337,7 +337,7 @@ func getNeighborMAC(n *netlink.Handle, linkIndex int, ip net.IP) (net.HardwareAd
 			return neigh.HardwareAddr, nil
 		}
 	}
-	return nil, errors.New("Missing ARP entry")
+	return nil, errors.New("missing ARP entry")
 }
 
 func sendICMP(iface *net.Interface, srcIP net.IP, dstIP net.IP) (err error) {

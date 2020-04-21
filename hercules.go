@@ -39,7 +39,6 @@ import (
 
 const (
 	etherLen    int = 1500
-	defaultNUMA int = 0
 )
 
 var (
@@ -98,11 +97,11 @@ func realMain() error {
 	flag.Parse()
 
 	if (transmitFilename == "") == (outputFilename == "") {
-		return errors.New("Exactly one of -t or -o needs to be specified")
+		return errors.New("exactly one of -t or -o needs to be specified")
 	}
 
 	if !enableBestEffort && !enableSibra {
-		return errors.New("Best-effort traffic and COLIBRI bandwidth reservations both disabled, don't know how to send data ...")
+		return errors.New("best-effort traffic and COLIBRI bandwidth reservations both disabled, don't know how to send data")
 	}
 
 	// Setup logger
@@ -122,7 +121,7 @@ func realMain() error {
 		return err
 	}
 	if iface.Flags&net.FlagUp == 0 {
-		return errors.New("Interface is not up")
+		return errors.New("interface is not up")
 	}
 
 	local, err := snet.ParseUDPAddr(localAddr)
@@ -130,7 +129,7 @@ func realMain() error {
 		return err
 	}
 	if local.Host.Port == 0 {
-		return errors.New("You must specify a source port")
+		return errors.New("you must specify a source port")
 	}
 
 	err = checkAssignedIP(iface, local.Host.IP)
@@ -148,12 +147,12 @@ func realMain() error {
 				return err
 			}
 			if remote.Host.Port == 0 {
-				return errors.New("You must specify a destination port")
+				return errors.New("you must specify a destination port")
 			}
 			remotes = append(remotes, remote)
 		}
 		if len(remotes) == 0 {
-			return errors.New("You must specify at least one destination")
+			return errors.New("you must specify at least one destination")
 		}
 		return mainTx(transmitFilename, local, remotes, iface, queue, maxRateLimit, enablePCC, enableBestEffort, enableSibra, xdpMode, dumpInterval, numPaths)
 	}
@@ -217,21 +216,21 @@ func getXDPMode(m string) (mode int) {
 }
 
 func herculesInit(iface *net.Interface, local *snet.UDPAddr, queue int) {
-	local_c := toCAddr(local)
+	localC := toCAddr(local)
 
-	C.hercules_init(C.int(iface.Index), local_c, C.int(queue))
+	C.hercules_init(C.int(iface.Index), localC, C.int(queue))
 	activeInterface = iface
 }
 
 func herculesTx(filename string, destinations []*snet.UDPAddr, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
-	cfilename := C.CString(filename)
-	defer C.free(unsafe.Pointer(cfilename))
+	cFilename := C.CString(filename)
+	defer C.free(unsafe.Pointer(cFilename))
 
-	cdests := make([]C.struct_hercules_app_addr, len(destinations))
+	cDests := make([]C.struct_hercules_app_addr, len(destinations))
 	for d, dest := range destinations {
-		cdests[d] = toCAddr(dest)
+		cDests[d] = toCAddr(dest)
 	}
-	return C.hercules_tx(cfilename, &cdests[0], &pm.cPathsPerDest[0], C.int(len(destinations)), &pm.cNumPathsPerDst[0], pm.cMaxNumPathsPerDst, C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
+	return C.hercules_tx(cFilename, &cDests[0], &pm.cPathsPerDest[0], C.int(len(destinations)), &pm.cNumPathsPerDst[0], pm.cMaxNumPathsPerDst, C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
 }
 
 func checkAssignedIP(iface *net.Interface, localAddr net.IP) (err error) {
@@ -246,5 +245,5 @@ func checkAssignedIP(iface *net.Interface, localAddr net.IP) (err error) {
 			return nil
 		}
 	}
-	return errors.New("Interface does not have the specified IPv4 address")
+	return errors.New("interface does not have the specified IPv4 address")
 }
