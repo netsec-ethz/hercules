@@ -216,11 +216,19 @@ func readLines(conn net.Conn, events chan *Event, stop chan struct{}, sresvs *sy
 					}
 				}
 			case "EXPIRE":
+				close(stop)
 				events <- &Event{Code: ExtnExpired}
+				goto Quit
 			case "CLEAN":
+				close(stop)
 				events <- &Event{Code: ExtnCleaned}
+				goto Quit
 			case "DROP":
 				close(stop)
+				events <- &Event{
+					Code: Quit,
+					Error: err,
+				}
 				goto Quit
 			case "ERROR":
 				events <- &Event{
@@ -237,10 +245,6 @@ func readLines(conn net.Conn, events chan *Event, stop chan struct{}, sresvs *sy
 	}
 
 Quit:
-	events <- &Event{
-		Code: Quit,
-		Error: err,
-	}
 	close(events)
 }
 
