@@ -25,7 +25,6 @@ package main
 import "C"
 import (
 	"context"
-	"errors"
 	"fmt"
 	log "github.com/inconshreveable/log15"
 	"github.com/scionproto/scion/go/lib/snet"
@@ -133,53 +132,45 @@ func (pwd *PathsToDestination) pushSibraPath(path *PathMeta, slot int) {
 	}
 }
 
-func (pwd *PathsToDestination) choosePaths() (bool, error) {
+func (pwd *PathsToDestination) choosePaths() bool {
 	if pwd.sp == nil {
-		return false, nil
+		return false
 	}
 
 	pathData := pwd.sp.Load()
 	if pwd.modifyTime.After(pathData.ModifyTime) {
 		if pwd.ExtnUpdated.Swap(false) {
 			pwd.modifyTime = time.Now()
-			return true, nil
+			return true
 		}
-		return false, nil
+		return false
 	}
 
 	availablePaths := pathData.APS
 	if len(availablePaths) == 0 {
-		return false, errors.New(fmt.Sprintf("no paths to destination %s", pwd.addr.String()))
+		log.Error(fmt.Sprintf("no paths to destination %s", pwd.addr.String()))
 	}
 
 	previousPathAvailable := make([]bool, pwd.pm.numPathsPerDst)
-	updated, err := pwd.choosePreviousPaths(&previousPathAvailable, &availablePaths)
-	if err != nil {
-		return updated, err
-	}
+	updated := pwd.choosePreviousPaths(&previousPathAvailable, &availablePaths)
 
 	if pwd.disableVanishedPaths(&previousPathAvailable) {
 		updated = true
 	}
-
 	// Note: we keep vanished paths around until they can be replaced or re-enabled
 
-	newPathChosen, err := pwd.chooseNewPaths(&previousPathAvailable, &availablePaths)
-	if newPathChosen {
+	if pwd.chooseNewPaths(&previousPathAvailable, &availablePaths) {
 		updated = true
-	}
-	if err != nil {
-		return updated, err
 	}
 
 	if pwd.ExtnUpdated.Swap(false) || updated {
 		pwd.modifyTime = time.Now()
-		return true, nil
+		return true
 	}
-	return false, nil
+	return false
 }
 
-func (pwd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool, availablePaths *spathmeta.AppPathSet) (bool, error) {
+func (pwd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool, availablePaths *spathmeta.AppPathSet) bool {
 	updated := false
 	for _, newPath := range *availablePaths {
 		newFingerprint := newPath.Fingerprint()
@@ -193,8 +184,9 @@ func (pwd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool
 					if pwd.pm.sibraMgr != nil {
 						err := pwd.initSibraPath(&pathMeta, i)
 						if err != nil {
+							log.Error("Could not initialize SIBRA: " + err.Error())
 							pwd.modifyTime = time.Now()
-							return true, err
+							return updated
 						}
 					}
 				}
@@ -203,7 +195,7 @@ func (pwd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool
 			}
 		}
 	}
-	return updated, nil
+	return updated
 }
 
 func (pwd *PathsToDestination) disableVanishedPaths(previousPathAvailable *[]bool) bool {
@@ -227,7 +219,7 @@ func (pwd *PathsToDestination) disableVanishedPaths(previousPathAvailable *[]boo
 	return updated
 }
 
-func (pwd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, availablePaths *spathmeta.AppPathSet) (bool, error){
+func (pwd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, availablePaths *spathmeta.AppPathSet) bool {
 	updated := false
 	for i, slotInUse := range *previousPathAvailable {
 		if slotInUse == false {
@@ -258,15 +250,16 @@ func (pwd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, ava
 				if pwd.pm.sibraMgr != nil {
 					err := pwd.initSibraPath(&pwd.paths[i], i)
 					if err != nil {
+						log.Error("Could not initialize SIBRA: " + err.Error())
 						pwd.modifyTime = time.Now()
-						return true, err
+						return updated
 					}
 				}
 				break
 			}
 		}
 	}
-	return updated, nil
+	return updated
 }
 
 func (pwd *PathsToDestination) preparePath(p *snet.Path) (*HerculesPath, error) {

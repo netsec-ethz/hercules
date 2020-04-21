@@ -111,33 +111,21 @@ func (pm *PathManager) pushPaths() {
 	C.push_hercules_tx_paths()
 }
 
-func (pm *PathManager) choosePaths() (bool, error) {
+func (pm *PathManager) choosePaths() bool {
 	updated := false
 	for _, dst := range pm.dsts {
-		dstUpdated, err := dst.choosePaths()
-		if err != nil {
-			return updated || dstUpdated, err
-		}
-		if dstUpdated {
+		if dst.choosePaths() {
 			updated = true
 		}
 	}
-	return updated, nil
+	return updated
 }
 
 func (pm *PathManager) syncPathsToC() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	for range ticker.C {
-		updated, err := pm.choosePaths()
-		if err != nil {
-			log.Error(fmt.Sprintf("Error while choosing paths: %s\n", err))
-			continue
+		if pm.choosePaths() {
+			pm.pushPaths()
 		}
-		if !updated {
-			// same paths as before
-			continue
-		}
-
-		pm.pushPaths()
 	}
 }
