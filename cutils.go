@@ -256,7 +256,10 @@ func prepareOverlayPacketHeader(srcIP, dstIP net.IP, dstPort uint16, iface *net.
 }
 
 func serializeLayersWOpts(w gopacket.SerializeBuffer, layersWOpts ...layerWithOpts) error {
-	w.Clear()
+	err := w.Clear()
+	if err != nil {
+		return err
+	}
 	for i := len(layersWOpts) - 1; i >= 0; i-- {
 		layerWOpt := layersWOpts[i]
 		err := layerWOpt.Layer.SerializeTo(w, layerWOpt.Opts)
@@ -354,7 +357,10 @@ func sendICMP(iface *net.Interface, srcIP net.IP, dstIP net.IP) (err error) {
 		FixLengths:       true,
 		ComputeChecksums: true,
 	}
-	gopacket.SerializeLayers(buf, serializeOpts, &ip, &icmp)
+	err = gopacket.SerializeLayers(buf, serializeOpts, &ip, &icmp)
+	if err != nil {
+		return err
+	}
 
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
 	if err != nil {
