@@ -69,6 +69,15 @@ func initNewPathsToDestination(pm *PathManager, src, dst *snet.UDPAddr, numPaths
 	}, nil
 }
 
+func (pwd *PathsToDestination) hasUsablePaths() bool {
+	for _, path := range pwd.paths {
+		if path.enabled {
+			return true
+		}
+	}
+	return false
+}
+
 func (pwd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
 	n := 0
 	slot := 0

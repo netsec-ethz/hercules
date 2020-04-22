@@ -165,8 +165,9 @@ func mainTx(filename string, src *snet.UDPAddr, dsts []*snet.UDPAddr, iface *net
 		return err
 	}
 
-	if !pm.choosePaths() {
-		return errors.New("no paths available")
+	pm.choosePaths()
+	if !pm.canSendToAllDests() {
+		return errors.New("some destinations are unreachable, abort")
 	}
 
 	herculesInit(iface, src, queue)

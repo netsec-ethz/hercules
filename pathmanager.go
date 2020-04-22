@@ -60,7 +60,7 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.U
 				return nil, errors.New(fmt.Sprintf("Can only use best-effort traffic to destination %s", dst))
 			}
 			if enableSibra {
-				log.Warn("Can not use bandwidth reservation to destination %s", dst)
+				log.Warn(fmt.Sprintf("Can not use bandwidth reservation to destination %s", dst))
 			}
 			dstState = initNewPathsToDestinationWithEmptyPath(pm, dst)
 		} else {
@@ -91,6 +91,15 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.U
 	pm.cMaxNumPathsPerDst = C.int(numPathsPerDst * slotFactor)
 	pm.cPathsPerDest = make([]C.struct_hercules_path, len(dsts)*numPathsPerDst*slotFactor)
 	return pm, nil
+}
+
+func (pm *PathManager) canSendToAllDests() bool {
+	for _, dst := range pm.dsts {
+		if !dst.hasUsablePaths() {
+			return false
+		}
+	}
+	return true
 }
 
 func (pm *PathManager) pushPaths() {
