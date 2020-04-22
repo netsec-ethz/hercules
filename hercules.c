@@ -1197,7 +1197,13 @@ void iterate_paths()
 {
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
 		struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
+		if (receiver->num_paths == 0) {
+			continue;
+		}
 		u32 prev_path_index = receiver->path_index; // we need this to break the loop if all paths are disabled
+		if (prev_path_index >= receiver->num_paths) {
+			prev_path_index = 0;
+		}
 		do {
 			receiver->path_index = (receiver->path_index + 1) % receiver->num_paths;
 		} while(!receiver->paths[receiver->path_index].enabled && receiver->path_index != prev_path_index);
