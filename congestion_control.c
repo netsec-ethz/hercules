@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <float.h>
 
 #include "hercules.h"
 #include "congestion_control.h"
@@ -18,25 +19,24 @@ struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 tota
 	for (size_t i = 0; i < num_paths; i++) {
 		struct ccontrol_state *cc_state = &cc_states[i];
 		cc_state->max_rate_limit = max_rate_limit;
-		cc_state->rtt = rtt / 1e9;
 		bitset__create(&cc_state->mi_acked_chunks, total_chunks);
 
-		float m = (rand() % 6) / 10.f + 1.7; // min [1.7, 2.2]
-		cc_state->pcc_mi_duration = m * cc_state->rtt;
+		continue_ccontrol(cc_state);
+		ccontrol_update_rtt(cc_state, rtt); // TODO use per-path rtt
 
 		// initial rate should be per-receiver fair
 		u32 initial_rate = umin32((u32) (MSS / cc_state->rtt), max_rate_limit / num_paths / 2);
-
-		cc_state->state = pcc_adjust;
-		cc_state->prev_rate = initial_rate;
 		cc_state->curr_rate = initial_rate;
-		cc_state->eps = EPS_MIN;
-		cc_state->sign = 1;
-		cc_state->mi_start = get_nsecs();
-		cc_state->rcts_iter = -1;
-		cc_state->mi_tx_npkts = 0;
+		cc_state->prev_rate = initial_rate;
 	}
 	return cc_states;
+}
+
+void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt) {
+	cc_state->rtt = rtt / 1e9;
+
+	float m = (rand() % 6) / 10.f + 1.7; // min [1.7, 2.2]
+	cc_state->pcc_mi_duration = m * cc_state->rtt;
 }
 
 void terminate_ccontrol(struct ccontrol_state *cc_state) {
@@ -44,7 +44,20 @@ void terminate_ccontrol(struct ccontrol_state *cc_state) {
 	cc_state->curr_rate = 0;
 }
 
+void continue_ccontrol(struct ccontrol_state *cc_state) {
+	cc_state->prev_rate = cc_state->curr_rate;
+	cc_state->state = pcc_startup;
+	cc_state->eps = EPS_MIN;
+	cc_state->sign = 1;
+	cc_state->mi_start = get_nsecs();
+	cc_state->rcts_iter = -1;
+	cc_state->mi_tx_npkts = 0;
+	cc_state->pcc_mi_duration = DBL_MAX;
+	cc_state->rtt = DBL_MAX;
+}
+
 void kick_ccontrol(struct ccontrol_state *cc_state) {
+	// TODO maybe use lower startup factor
 	cc_state->state = pcc_startup;
 }
 

@@ -984,7 +984,7 @@ static u32 path_can_send_npkts(struct ccontrol_state *cc_state)
 	u64 now = get_nsecs();
 	u64 dt = now - cc_state->mi_start;
 
-	dt = umin64(dt, 1);
+	dt = umax64(dt, 1);
 	u32 tx_pps = cc_state->mi_tx_npkts * 1000000000. / dt;
 
 	if (tx_pps > cc_state->curr_rate) {
@@ -1033,18 +1033,41 @@ static void update_hercules_tx_paths(void)
 		receiver->num_paths = tx_state->shd_num_paths[r];
 
 		for(u32 p = 0; p < receiver->num_paths; p++) {
-			if(tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].replaced) {
-				tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].replaced = false;
+			struct hercules_path *shd_path = &tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p];
+			if(shd_path->replaced) {
+				shd_path->replaced = false;
 				// assert that chunk length fits into packet with new header
-				if(tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].payloadlen < (int)tx_state->chunklen + rbudp_headerlen) {
+				if(shd_path->payloadlen < (int)tx_state->chunklen + rbudp_headerlen) {
 					fprintf(stderr, "cannot use path %d for receiver %d: header too big, chunk does not fit into payload\n", p, r);
 					continue;
 				}
-				memcpy(&receiver->paths[p], &tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p],
-					   sizeof(struct hercules_path));
+				memcpy(&receiver->paths[p], shd_path, sizeof(struct hercules_path));
+
+				if(shd_path->max_bps == 0) { // reset PCC state
+					if(receiver->cc_states != NULL) {
+						continue_ccontrol(&receiver->cc_states[p]);
+						// TODO make sure that RTT is updated, maybe set curr_rate
+					}
+				} else { // reset SIBRA state
+					receiver->sibra_states[p].max_pps = 0; // triggers reset below if necessary
+				}
 			} else {
-				receiver->paths[p].enabled = tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].enabled;
-				receiver->paths[p].max_bps = tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].max_bps;
+				if(receiver->cc_states != NULL && shd_path->max_bps == 0 && receiver->paths[p].enabled != shd_path->enabled) {
+					if(shd_path->enabled) { // reactivate PCC
+						if(receiver->cc_states != NULL) {
+							double rtt = receiver->cc_states[p].rtt;
+							double mi_duration = receiver->cc_states[p].pcc_mi_duration;
+							continue_ccontrol(&receiver->cc_states[p]);
+							receiver->cc_states[p].rtt = rtt;
+							receiver->cc_states[p].pcc_mi_duration = mi_duration;
+						}
+					} else { // deactivate PCC
+						receiver->cc_states[p].state = pcc_terminated;
+					}
+					// Note: when a path with SIBRA reappears, we always get a new header, hence we can ignore that case here
+				}
+				receiver->paths[p].enabled = shd_path->enabled;
+				receiver->paths[p].max_bps = shd_path->max_bps;
 			}
 
 			u32 max_pps = receiver->paths[p].max_bps / ETHER_SIZE;
@@ -1385,7 +1408,13 @@ static void tx_only(struct xsk_socket_info *xsk)
 			rate_limit_tx();
 
 			for(u32 r = 0; r < tx_state->num_receivers; r++) {
-				tx_state->receiver[r].sibra_states[tx_state->receiver[r].path_index].mi_npkts += num_chunks_per_rcvr[r];
+				struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
+				u32 path_idx = tx_state->receiver[r].path_index;
+				if(receiver->sibra_states[path_idx].max_pps > 0) {
+					receiver->sibra_states[path_idx].mi_npkts += num_chunks_per_rcvr[r];
+				} else if(receiver->cc_states != NULL) {
+					receiver->cc_states[path_idx].mi_tx_npkts += num_chunks_per_rcvr[r];
+				}
 			}
 		}
 
