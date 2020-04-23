@@ -83,13 +83,13 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.U
 	}
 
 	// allocate memory to pass paths to C
-	slotFactor := 1
+	pm.numSlotsPerPath = 1
 	if enableSibra && enableBestEffort {
-		slotFactor = 2
+		pm.numSlotsPerPath = 2
 	}
 	pm.cNumPathsPerDst = make([]C.int, len(dsts))
-	pm.cMaxNumPathsPerDst = C.int(numPathsPerDst * slotFactor)
-	pm.cPathsPerDest = make([]C.struct_hercules_path, len(dsts)*numPathsPerDst*slotFactor)
+	pm.cMaxNumPathsPerDst = C.int(numPathsPerDst * pm.numSlotsPerPath)
+	pm.cPathsPerDest = make([]C.struct_hercules_path, len(dsts)*numPathsPerDst*pm.numSlotsPerPath)
 	return pm, nil
 }
 
@@ -113,7 +113,7 @@ func (pm *PathManager) pushPaths() {
 			continue
 		}
 
-		dst.pushPaths(d, d*pm.numPathsPerDst)
+		dst.pushPaths(d, d*pm.numPathsPerDst*pm.numSlotsPerPath)
 	}
 
 	pm.syncTime = syncTime

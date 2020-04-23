@@ -49,6 +49,7 @@ type layerWithOpts struct {
 
 type PathManager struct {
 	numPathsPerDst     int
+	numSlotsPerPath    int
 	iface              *net.Interface
 	dsts               []*PathsToDestination
 	src                *snet.UDPAddr
