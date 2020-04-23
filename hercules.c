@@ -1035,6 +1035,11 @@ static void update_hercules_tx_paths(void)
 		for(u32 p = 0; p < receiver->num_paths; p++) {
 			if(tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].replaced) {
 				tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].replaced = false;
+				// assert that chunk length fits into packet with new header
+				if(tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p].payloadlen < (int)tx_state->chunklen + rbudp_headerlen) {
+					fprintf(stderr, "cannot use path %d for receiver %d: header too big, chunk does not fit into payload\n", p, r);
+					continue;
+				}
 				memcpy(&receiver->paths[p], &tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p],
 					   sizeof(struct hercules_path));
 			} else {
