@@ -20,8 +20,9 @@ enum rcts_result{increase, decrease, inconclusive};
 struct ccontrol_state {
 	// Cons
 	u32 max_rate_limit; // Max sending rate that the CC algorithm should not exceed
-	double pcc_mi_duration;
-	double rtt; // Round-trip time in seconds
+	u32 total_num_paths;
+	_Atomic double pcc_mi_duration;
+	_Atomic double rtt; // Round-trip time in seconds
 
 	// Monitoring interval values
 	u32 ack_start;
@@ -46,12 +47,11 @@ struct ccontrol_state {
 /*!
  * @function	init_ccontrol_state
  * @abstract	Initialize the congestion control state and return it.
- * @param	rtt		u64, Round-trip time in nanoseconds
  * @param	total_chunks	the total number of chunks, needed for the rolling ACK accounting
  * @result	A ccontrol_state struct
 */
 // Initialize congestion control state
-struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 total_chunks, size_t num_paths);
+struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, size_t num_paths, size_t total_num_paths);
 void terminate_ccontrol(struct ccontrol_state *cc_state);
 void continue_ccontrol(struct ccontrol_state *cc_state);
 void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt);

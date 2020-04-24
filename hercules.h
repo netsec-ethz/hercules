@@ -28,6 +28,7 @@ typedef __u8 u8;
 #define HERCULES_MAX_HEADERLEN 256
 // Path are specified as ETH/IP/UDP/SCION/UDP headers.
 struct hercules_path {
+	u64 next_handshake_at;
 	int headerlen;
 	int payloadlen;
 	int framelen;	//!< length of ethernet frame; headerlen + payloadlen

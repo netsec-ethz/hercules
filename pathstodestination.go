@@ -82,12 +82,13 @@ func (pwd *PathsToDestination) hasUsablePaths() bool {
 func (pwd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
 	n := 0
 	slot := 0
-	for _, path := range pwd.paths {
+	for p := range pwd.paths {
+		path := &pwd.paths[p]
 		if pwd.pm.useBestEffort {
 			if path.updated || path.enabled {
 				n = slot
 			}
-			pwd.pushBestEffortPath(&path, firstSlot+slot)
+			pwd.pushBestEffortPath(path, firstSlot+slot)
 			slot += 1
 		}
 
@@ -95,7 +96,7 @@ func (pwd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
 			if path.updated || path.sbrUpdated.Load() || path.sbrWs != nil {
 				n = slot
 			}
-			pwd.pushSibraPath(&path, firstSlot+slot)
+			pwd.pushSibraPath(path, firstSlot+slot)
 			slot += 1
 		}
 		path.updated = false

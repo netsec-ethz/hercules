@@ -60,6 +60,7 @@ func HerculesGetReplyPath(headerPtr unsafe.Pointer, length C.int, replyPathStruc
 }
 
 func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPath, error) {
+	// TODO(sibra) remove sibra extension header: use the reverse path without a reservation
 	packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
 	if err := packet.ErrorLayer(); err != nil {
 		return nil, fmt.Errorf("error decoding some part of the packet: %v", err)

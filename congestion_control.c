@@ -13,21 +13,16 @@
 
 #define MSS 1460
 
-struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u64 rtt, u32 total_chunks, size_t num_paths)
+struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, size_t num_paths, size_t total_num_paths)
 {
 	struct ccontrol_state *cc_states = calloc(num_paths, sizeof(struct ccontrol_state));
 	for (size_t i = 0; i < num_paths; i++) {
 		struct ccontrol_state *cc_state = &cc_states[i];
 		cc_state->max_rate_limit = max_rate_limit;
+		cc_state->total_num_paths = total_num_paths;
 		bitset__create(&cc_state->mi_acked_chunks, total_chunks);
 
 		continue_ccontrol(cc_state);
-		ccontrol_update_rtt(cc_state, rtt); // TODO use per-path rtt
-
-		// initial rate should be per-receiver fair
-		u32 initial_rate = umin32((u32) (MSS / cc_state->rtt), max_rate_limit / num_paths / 2);
-		cc_state->curr_rate = initial_rate;
-		cc_state->prev_rate = initial_rate;
 	}
 	return cc_states;
 }
@@ -37,6 +32,18 @@ void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt) {
 
 	float m = (rand() % 6) / 10.f + 1.7; // min [1.7, 2.2]
 	cc_state->pcc_mi_duration = m * cc_state->rtt;
+
+	if(!cc_state->curr_rate) {
+		// initial rate should be per-receiver fair
+		u32 initial_rate = umin32((u32) (MSS / cc_state->rtt), cc_state->max_rate_limit / cc_state->total_num_paths / 2);
+		cc_state->curr_rate = initial_rate;
+		cc_state->prev_rate = initial_rate;
+	}
+
+	// restart current MI
+	cc_state->mi_start = get_nsecs();
+	cc_state->mi_tx_npkts = 0;
+	bitset__reset(&cc_state->mi_acked_chunks);
 }
 
 void terminate_ccontrol(struct ccontrol_state *cc_state) {
