@@ -1528,10 +1528,17 @@ static void tx_only(struct xsk_socket_info *xsk)
 static void init_tx_state(size_t filesize, int chunklen, int max_rate_limit, char *mem, const struct hercules_app_addr *dests,
 			  struct hercules_path *paths, u32 num_dests, const int *num_paths, u32 max_paths_per_dest, int control_socket_fd)
 {
+	u64 total_chunks = (filesize + chunklen - 1) / chunklen;
+	if(total_chunks >= UINT_MAX) {
+		fprintf(stderr, "File too big, not enough chunks available (chunks needed: %llu, chunks available: %u)\n",
+				total_chunks, UINT_MAX - 1);
+		exit(1);
+	}
+
 	tx_state = calloc(1, sizeof(*tx_state));
 	tx_state->filesize = filesize;
 	tx_state->chunklen = chunklen;
-	tx_state->total_chunks = (filesize + chunklen - 1)/chunklen;
+	tx_state->total_chunks = total_chunks;
 	tx_state->mem = mem;
 	tx_state->control_socket_fd = control_socket_fd;
 	tx_state->rate_limit = max_rate_limit;
