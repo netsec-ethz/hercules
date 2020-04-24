@@ -63,6 +63,7 @@
 
 #define RATE_LIMIT_CHECK 1000 // check rate limit every X packets
 						// Maximum burst above target pps allowed
+#define SIBRA_MI_MS 10 // check rate limit of SIBRA paths every X ms
 
 #define ACK_RATE_TIME_MS 100 // send ACKS after at most X milliseconds
 
@@ -979,9 +980,26 @@ static void rate_limit_tx(void)
 	prev_tx_npkts = tx_npkts;
 }
 
-static u32 path_can_send_npkts(struct ccontrol_state *cc_state)
+static u32 path_can_send_npkts_sibra(struct sibra_state *sibra_state, u64 now) {
+	if(sibra_state->mi_start + SIBRA_MI_MS * 1000000 < now) {
+		u64 dt = sibra_state->mi_npkts * 1000000000. / sibra_state->max_pps;
+		sibra_state->mi_start = umax64(now, sibra_state->mi_start + dt);
+		sibra_state->mi_npkts = 0;
+	}
+	if(sibra_state->mi_start > now) {
+		// wait until we can send again
+		return 0;
+	} else {
+		if(sibra_state->mi_npkts * 1000 / SIBRA_MI_MS < sibra_state->max_pps) {
+			return sibra_state->max_pps - sibra_state->mi_npkts * 1000 / SIBRA_MI_MS;
+		} else {
+			return 0;
+		}
+	}
+}
+
+static u32 path_can_send_npkts_best_effort(struct ccontrol_state *cc_state, u64 now)
 {
-	u64 now = get_nsecs();
 	u64 dt = now - cc_state->mi_start;
 
 	dt = umax64(dt, 1);
@@ -1158,28 +1176,10 @@ u32 compute_max_chunks_per_rcvr(u32 *max_chunks_per_rcvr)
 		}
 		if(tx_state->receiver[r].paths[tx_state->receiver[r].path_index].max_bps != 0) { // SIBRA provisioned bandwidth limit
 			struct sibra_state *sibra_state = &tx_state->receiver[r].sibra_states[tx_state->receiver[r].path_index];
-			if(sibra_state->mi_npkts > RATE_LIMIT_CHECK) {
-				u64 dt = sibra_state->mi_npkts * 1000000000. / sibra_state->max_pps;
-				if(now > sibra_state->mi_start + dt) { // TODO why does umax64(now, mock.mi_start + dt) not do the same??
-					sibra_state->mi_start = now;
-				} else {
-					sibra_state->mi_start = sibra_state->mi_start + dt;
-				}
-				sibra_state->mi_npkts = 0;
-			}
-			if(sibra_state->mi_start > now) {
-				// wait until we can send again
-				max_chunks_per_rcvr[r] = 0;
-			} else {
-				if(sibra_state->mi_npkts < sibra_state->max_pps) {
-					max_chunks_per_rcvr[r] = umin32(sibra_state->max_pps - sibra_state->mi_npkts, BATCH_SIZE);
-				} else {
-					max_chunks_per_rcvr[r] = umin32(sibra_state->max_pps, BATCH_SIZE);
-				}
-			}
+			max_chunks_per_rcvr[r] = umin32(BATCH_SIZE, path_can_send_npkts_sibra(sibra_state, now));
 		} else if(tx_state->receiver[r].cc_states != NULL) { // use PCC
-			max_chunks_per_rcvr[r] = umin64(BATCH_SIZE, path_can_send_npkts(
-					&tx_state->receiver[r].cc_states[tx_state->receiver[r].path_index]));
+			struct ccontrol_state *cc_state = &tx_state->receiver[r].cc_states[tx_state->receiver[r].path_index];
+			max_chunks_per_rcvr[r] = umin32(BATCH_SIZE, path_can_send_npkts_best_effort(cc_state, now));
 		} else { // no path-based limit
 			max_chunks_per_rcvr[r] = BATCH_SIZE;
 		}
