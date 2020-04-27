@@ -1132,6 +1132,7 @@ static void update_hercules_tx_paths(void)
 				// assert that chunk length fits into packet with new header
 				if(shd_path->payloadlen < (int) tx_state->chunklen + rbudp_headerlen) {
 					fprintf(stderr, "cannot use path %d for receiver %d: header too big, chunk does not fit into payload\n", p, r);
+					receiver->paths[p].enabled = false;
 					continue;
 				}
 				memcpy(&receiver->paths[p], shd_path, sizeof(struct hercules_path));
