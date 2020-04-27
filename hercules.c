@@ -692,7 +692,7 @@ static void send_eth_frame(int sockfd, void *buf, size_t len)
 	}
 }
 
-static void tx_register_acks(const struct rbudp_ack_pkt *ack, u32 rcvr)
+static void tx_register_acks(const struct rbudp_ack_pkt *ack, struct sender_state_per_receiver *rcvr)
 {
 	for(uint16_t e = 0; e < ack->num_acks; ++e) {
 		const u32 begin = ack->acks[e].begin;
@@ -701,17 +701,16 @@ static void tx_register_acks(const struct rbudp_ack_pkt *ack, u32 rcvr)
 			return; // Abort
 		}
 		for(u32 i = begin; i < end; ++i) { // XXX: this can *obviously* be optimized
-			bitset__set(&tx_state->receiver[rcvr].acked_chunks, i);
+			bitset__set(&rcvr->acked_chunks, i);
 		}
-		if(tx_state->receiver[rcvr].cc_states) {
+		if(rcvr->cc_states) {
 			// Counts ACKed packets from the range that was sent during the MI.
 			// ack_start is the packet with the lowest index sent during the MI,
 			// ack_end the packet with the highest index that could have been sent during the MI
 			// TODO: Improve the granularity of the accounting of the ACKed packets during a MI
 			// if required by the CC algorithm.
 			for(u32 i = begin; i < end; ++i) {
-				bitset__set(&tx_state->receiver[rcvr].cc_states[tx_state->receiver[rcvr].path_map[i]].mi_acked_chunks,
-							i);
+				bitset__set(&rcvr->cc_states[rcvr->path_map[i]].mi_acked_chunks, i);
 			}
 		}
 	}
@@ -763,6 +762,35 @@ static void pcc_monitor()
 	}
 }
 
+bool tx_handle_handshake_reply(const struct rbudp_initial_pkt *initial, struct sender_state_per_receiver *rcvr)
+{
+	bool updated = false;
+	if(initial->path_index < rcvr->num_paths) {
+		u64 rtt_estimate = get_nsecs() - initial->timestamp;
+		if(atomic_load(&rcvr->paths[initial->path_index].next_handshake_at) != UINT64_MAX) {
+			atomic_store(&rcvr->paths[initial->path_index].next_handshake_at, UINT64_MAX);
+			if(rcvr->cc_states != NULL && rcvr->cc_states[initial->path_index].rtt == DBL_MAX) {
+				ccontrol_update_rtt(&rcvr->cc_states[initial->path_index], rtt_estimate);
+				updated = true;
+			}
+			if(initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
+				rcvr->handshake_rtt = rtt_estimate;
+				if(rcvr->cc_states != NULL) {
+					u64 now = get_nsecs();
+					for(u32 p = 0; p < rcvr->num_paths; p++) {
+						if(p != initial->path_index && rcvr->paths[p].enabled && rcvr->paths[p].max_bps == 0) {
+							rcvr->paths[p].next_handshake_at = now;
+							rcvr->cc_states[p].pcc_mi_duration = DBL_MAX;
+							rcvr->cc_states[p].rtt = DBL_MAX;
+						}
+					}
+				}
+			}
+		}
+	}
+	return updated;
+}
+
 static void tx_recv_acks(int sockfd)
 {
 	struct timeval to = { .tv_sec = 0, .tv_usec = 100 };
@@ -778,34 +806,17 @@ static void tx_recv_acks(int sockfd)
 			const struct rbudp_ack_pkt *ack = (const struct rbudp_ack_pkt *) payload;
 			if(ack->num_acks != UINT8_MAX) { // received an ACK
 				if((u32) payloadlen >= ack__len(ack)) {
-					tx_register_acks(ack, rcvr_by_src_address(scionaddrhdr, udphdr));
+					tx_register_acks(ack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
 				}
-			} else { // it's not an ACK, it's a handshake reply
+			} else { // received a handshake reply
 				if((uint)payloadlen >= sizeof(struct rbudp_initial_pkt)) {
+					int rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
+					struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
 					const struct rbudp_initial_pkt *initial = (const struct rbudp_initial_pkt *) payload;
-					struct sender_state_per_receiver *rcvr = &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)];
-					if(initial->path_index < rcvr->num_paths) {
-						u64 rtt_estimate = get_nsecs() - initial->timestamp;
-						if(atomic_load(&rcvr->paths[initial->path_index].next_handshake_at) != UINT64_MAX) {
-							atomic_store(&rcvr->paths[initial->path_index].next_handshake_at, UINT64_MAX);
-							if(rcvr->cc_states != NULL && rcvr->cc_states[initial->path_index].rtt == DBL_MAX) {
-								ccontrol_update_rtt(&rcvr->cc_states[initial->path_index], rtt_estimate);
-							}
-							if(initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
-								rcvr->handshake_rtt = rtt_estimate;
-								if(rcvr->cc_states != NULL) {
-									u64 now = get_nsecs();
-									for(u32 p = 0; p < rcvr->num_paths; p++) {
-										if(p != initial->path_index && rcvr->paths[p].enabled &&
-										   rcvr->paths[p].max_bps == 0) {
-											rcvr->paths[p].next_handshake_at = now;
-											rcvr->cc_states[p].pcc_mi_duration = DBL_MAX;
-											rcvr->cc_states[p].rtt = DBL_MAX;
-										}
-									}
-								}
-							}
-						}
+					if(tx_handle_handshake_reply(initial, receiver)) {
+						debug_printf("[receiver %d] [path %d] handshake_rtt: %fs, MI: %fs", rcvr_idx,
+									 initial->path_index, receiver->cc_states[initial->path_index].rtt,
+									 receiver->cc_states[initial->path_index].pcc_mi_duration);
 					}
 				}
 			}
@@ -2129,6 +2140,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	}
 
 	if(enable_pcc) {
+		u64 now = get_nsecs();
 		for(int i = 0; i < num_dests; i++) {
 			struct sender_state_per_receiver *receiver = &tx_state->receiver[i];
 			receiver->cc_states = init_ccontrol_state(
@@ -2138,8 +2150,15 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 					max_paths * num_dests
 			);
 			ccontrol_update_rtt(&receiver->cc_states[0], receiver->handshake_rtt);
-			debug_printf("handshake_rtt (receiver %d): %fs, MI: %fs",
+			debug_printf("[receiver %d] [path 0] handshake_rtt: %fs, MI: %fs",
 						 i, receiver->handshake_rtt / 1e9, receiver->cc_states[0].pcc_mi_duration);
+
+			// make sure tx_only() performs RTT estimation on every best-effort enabled path
+			for(u32 p = 1; p < receiver->num_paths; p++) {
+				if(receiver->paths[p].max_bps == 0) {
+					receiver->paths[p].next_handshake_at = now;
+				}
+			}
 		}
 	}
 
