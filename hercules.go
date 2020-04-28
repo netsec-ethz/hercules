@@ -73,6 +73,7 @@ func realMain() error {
 		maxRateLimit     int
 		mode             string
 		numPaths         int
+		numSendThreads   int
 		queue            int
 		remoteAddrs      arrayFlags
 		transmitFilename string
@@ -94,6 +95,7 @@ func realMain() error {
 	flag.IntVar(&numPaths, "np", 1, "Maximum number of different paths per destination to use at the same time")
 	flag.BoolVar(&enableBestEffort, "be", true, "Enable best-effort traffic")
 	flag.BoolVar(&enableSibra, "resv", false, "Enable COLIBRI bandwidth reservations")
+	flag.IntVar(&numSendThreads, "nt", 4, "Number of threads dedicated to send data")
 	flag.Parse()
 
 	if (transmitFilename == "") == (outputFilename == "") {
@@ -154,12 +156,12 @@ func realMain() error {
 		if len(remotes) == 0 {
 			return errors.New("you must specify at least one destination")
 		}
-		return mainTx(transmitFilename, local, remotes, iface, queue, maxRateLimit, enablePCC, enableBestEffort, enableSibra, xdpMode, dumpInterval, numPaths)
+		return mainTx(transmitFilename, local, remotes, iface, queue, maxRateLimit, enablePCC, enableBestEffort, enableSibra, xdpMode, dumpInterval, numPaths, numSendThreads)
 	}
 	return mainRx(outputFilename, local, iface, queue, xdpMode, dumpInterval)
 }
 
-func mainTx(filename string, src *snet.UDPAddr, dsts []*snet.UDPAddr, iface *net.Interface, queue int, maxRateLimit int, enablePCC, enableBestEffort, enableSibra bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
+func mainTx(filename string, src *snet.UDPAddr, dsts []*snet.UDPAddr, iface *net.Interface, queue int, maxRateLimit int, enablePCC, enableBestEffort, enableSibra bool, xdpMode int, dumpInterval time.Duration, numPaths int, numSendThreads int) (err error) {
 	pm, err := initNewPathManager(numPaths, iface, dsts, src, enableBestEffort, enableSibra, uint64(maxRateLimit)*uint64(C.ETHER_SIZE))
 	if err != nil {
 		return err
@@ -176,7 +178,7 @@ func mainTx(filename string, src *snet.UDPAddr, dsts []*snet.UDPAddr, iface *net
 	go pm.syncPathsToC()
 	go statsDumper(true, dumpInterval)
 	go cleanupOnSignal()
-	stats := herculesTx(filename, dsts, pm, maxRateLimit, enablePCC, xdpMode)
+	stats := herculesTx(filename, dsts, pm, maxRateLimit, enablePCC, xdpMode, numSendThreads)
 	printSummary(stats)
 	return nil
 }
@@ -222,7 +224,7 @@ func herculesInit(iface *net.Interface, local *snet.UDPAddr, queue int) {
 	activeInterface = iface
 }
 
-func herculesTx(filename string, destinations []*snet.UDPAddr, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
+func herculesTx(filename string, destinations []*snet.UDPAddr, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int, numSendThreads int) herculesStats {
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
 
@@ -230,7 +232,7 @@ func herculesTx(filename string, destinations []*snet.UDPAddr, pm *PathManager, 
 	for d, dest := range destinations {
 		cDests[d] = toCAddr(dest)
 	}
-	return C.hercules_tx(cFilename, &cDests[0], &pm.cPathsPerDest[0], C.int(len(destinations)), &pm.cNumPathsPerDst[0], pm.cMaxNumPathsPerDst, C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
+	return C.hercules_tx(cFilename, &cDests[0], &pm.cPathsPerDest[0], C.int(len(destinations)), &pm.cNumPathsPerDst[0], pm.cMaxNumPathsPerDst, C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode), C.int(numSendThreads))
 }
 
 func checkAssignedIP(iface *net.Interface, localAddr net.IP) (err error) {

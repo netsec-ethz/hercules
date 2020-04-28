@@ -18,11 +18,18 @@
 #include <stdbool.h>
 #include <linux/types.h>
 #include <stdatomic.h>
+#include <stdio.h>
 
 typedef __u64 u64;
 typedef __u32 u32;
 typedef __u16 u16;
 typedef __u8 u8;
+
+#ifndef NDEBUG
+#define debug_printf(fmt, ...) printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
+#else
+#define debug_printf(...) ;
+#endif
 
 #define ETHER_SIZE 1500
 #define HERCULES_MAX_HEADERLEN 256
@@ -83,7 +90,10 @@ void free_path_lock(void);
 // Synchronous; returns when the transfer has been completed or if it has failed.
 // Does not take ownership of `paths`.
 // Retur
-struct hercules_stats hercules_tx(const char *filename, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode);
+struct hercules_stats
+hercules_tx(const char *filename, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest,
+			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode,
+			int num_senders);
 
 // Initiate receiver, waiting for a transmitter to initiate the file transfer.
 struct hercules_stats hercules_rx(const char *filename, int xdp_mode);

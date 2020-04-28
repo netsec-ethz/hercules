@@ -44,13 +44,8 @@
 #include "libscion_checksum.h"
 #include "congestion_control.h"
 #include "utils.h"
+#include "send_queue.h"
 
-
-#ifndef NDEBUG
-#define debug_printf(fmt, ...) printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
-#else
-#define debug_printf(...) ;
-#endif
 
 #define SCION_ENDHOST_PORT 30041 // aka SCION_UDP_EH_DATA_PORT
 
@@ -225,6 +220,7 @@ static u32 prog_id;
 
 static struct receiver_state *rx_state;
 static struct sender_state *tx_state;
+static struct send_queue send_queue;
 
 // State for transmit rate control
 static size_t tx_npkts;
@@ -793,7 +789,7 @@ bool tx_handle_handshake_reply(const struct rbudp_initial_pkt *initial, struct s
 
 static void tx_recv_acks(int sockfd)
 {
-	struct timeval to = { .tv_sec = 0, .tv_usec = 100 };
+	struct timeval to = {.tv_sec = 0, .tv_usec = 100};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
 	char buf[ETHER_SIZE];
@@ -809,7 +805,7 @@ static void tx_recv_acks(int sockfd)
 					tx_register_acks(ack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
 				}
 			} else { // received a handshake reply
-				if((uint)payloadlen >= sizeof(struct rbudp_initial_pkt)) {
+				if((uint) payloadlen >= sizeof(struct rbudp_initial_pkt)) {
 					int rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
 					struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
 					const struct rbudp_initial_pkt *initial = (const struct rbudp_initial_pkt *) payload;
@@ -983,7 +979,8 @@ static void stitch_checksum(const struct hercules_path *path, char *pkt)
 	mempcpy(payload - 2, &pkt_checksum, sizeof(pkt_checksum));
 }
 
-static void rx_handle_initial(int sockfd, struct rbudp_initial_pkt *initial, const char *buf, const char *payload, int payloadlen);
+static void
+rx_handle_initial(int sockfd, struct rbudp_initial_pkt *initial, const char *buf, const char *payload, int payloadlen);
 
 static void rx_receive_batch(struct xsk_socket_info *xsk)
 {
@@ -1011,7 +1008,8 @@ static void rx_receive_batch(struct xsk_socket_info *xsk)
 			if(!handle_rbudp_data_pkt(rbudp_pkt, len - (rbudp_pkt - pkt))) {
 				struct rbudp_initial_pkt initial;
 				if(rbudp_parse_initial(rbudp_pkt + rbudp_headerlen, len, &initial)) {
-					rx_handle_initial(rx_state->control_sock_fd, &initial, pkt, rbudp_pkt, (int)len - (int)(rbudp_pkt - pkt));
+					rx_handle_initial(rx_state->control_sock_fd, &initial, pkt, rbudp_pkt,
+									  (int) len - (int) (rbudp_pkt - pkt));
 				} else {
 					ignored++;
 				}
@@ -1238,9 +1236,21 @@ static void submit_batch(struct xsk_socket_info *xsk, u32 *frame_nb, u32 i)
 	pop_completion_ring(xsk);
 }
 
+static inline void tx_handle_send_queue_unit(struct send_queue_unit *unit) {
+	for(u32 i = 0; i < unit->num_chunks; i++) {
+		const u32 chunk_idx = unit->chunk_idx[i];
+		const size_t chunk_start = (size_t) chunk_idx * tx_state->chunklen;
+		const size_t len = umin64(tx_state->chunklen, tx_state->filesize - chunk_start);
+
+		void *rbudp_pkt = mempcpy(unit->pkts[i], unit->paths[i]->header, unit->paths[i]->headerlen);
+		fill_rbudp_pkt(rbudp_pkt, chunk_idx, tx_state->mem + chunk_start, len, unit->paths[i]->payloadlen);
+		stitch_checksum(unit->paths[i], unit->pkts[i]);
+	}
+}
+
 static void
-send_batch(struct xsk_socket_info *xsk, u32 *frame_nb, const struct hercules_path *path_by_rcvr[], const u32 chunks[],
-		   const u32 rcvr_by_chunk[], u32 num_chunks)
+send_batch(struct xsk_socket_info *xsk, u32 *frame_nb, const struct hercules_path **path_by_rcvr, const u32 *chunks,
+		   const u32 *rcvr_by_chunk, u32 num_chunks)
 {
 	// reserve TX producer ring
 	u32 idx;
@@ -1253,20 +1263,56 @@ send_batch(struct xsk_socket_info *xsk, u32 *frame_nb, const struct hercules_pat
 	}
 
 	u32 chk;
-	for(chk = 0; chk < num_chunks; ++chk) {
-		void *pkt = produce_frame(xsk, *frame_nb + chk, idx + chk, path_by_rcvr[rcvr_by_chunk[chk]]->framelen);
+	u32 num_units = 0; // having this as a local variable avoids false sharing
+	struct send_queue_unit *unit = NULL;
+	atomic_store(&send_queue.complete_count, 0);
+	for(chk = 0; chk < num_chunks; chk++) {
+		if(unit == NULL) {
+			unit = send_queue_reserve(&send_queue);
+			if(unit == NULL) {
+				debug_printf("producer blocked: queue is full");
+				continue;
+			}
+		}
 
-		const u32 chunk_idx = chunks[chk];
-		const size_t chunk_start = (size_t) chunk_idx * tx_state->chunklen;
-		const size_t len = umin64(tx_state->chunklen, tx_state->filesize - chunk_start);
+		unit->pkts[unit->num_chunks] = produce_frame(xsk, *frame_nb + chk, idx + chk, path_by_rcvr[rcvr_by_chunk[chk]]->framelen);
+		unit->paths[unit->num_chunks] = path_by_rcvr[rcvr_by_chunk[chk]];
+		unit->chunk_idx[unit->num_chunks] = chunks[chk];
 
-		void *rbudp_pkt = mempcpy(pkt, path_by_rcvr[rcvr_by_chunk[chk]]->header,
-								  path_by_rcvr[rcvr_by_chunk[chk]]->headerlen);
-		fill_rbudp_pkt(rbudp_pkt, chunk_idx, tx_state->mem + chunk_start, len,
-					   path_by_rcvr[rcvr_by_chunk[chk]]->payloadlen);
-		stitch_checksum(path_by_rcvr[rcvr_by_chunk[chk]], pkt);
+		unit->num_chunks++;
+		if(unit->num_chunks == SEND_QUEUE_ENTRIES_PER_UNIT || chk == num_chunks-1) {
+			send_queue_push(&send_queue);
+			num_units++;
+			unit = NULL;
+		}
 	}
+
+	// wait until ready
+	while(atomic_load(&send_queue.complete_count) < num_units) {
+		// in the meantime: help with moving the data
+		struct send_queue_unit send_unit;
+		if(send_queue_pop(&send_queue, &send_unit)) {
+			tx_handle_send_queue_unit(&send_unit);
+			num_units--;
+		}
+	}
+
 	submit_batch(xsk, frame_nb, chk);
+}
+
+static void tx_send_p(__attribute__((unused)) void *tid) {
+	struct send_queue_unit unit;
+	send_queue_pop_wait(&send_queue, &unit);
+	u32 sent_units = 0;
+	while(true) {
+		tx_handle_send_queue_unit(&unit);
+		sent_units++;
+		if(!send_queue_pop(&send_queue, &unit)) { // queue currently empty
+			atomic_fetch_add(&send_queue.complete_count, sent_units);
+			sent_units = 0;
+			send_queue_pop_wait(&send_queue, &unit);
+		}
+	}
 }
 
 // Collect path rate limits
@@ -1537,8 +1583,10 @@ static void tx_only(struct xsk_socket_info *xsk)
 	}
 }
 
-static void init_tx_state(size_t filesize, int chunklen, int max_rate_limit, char *mem, const struct hercules_app_addr *dests,
-			  struct hercules_path *paths, u32 num_dests, const int *num_paths, u32 max_paths_per_dest, int control_socket_fd)
+static void
+init_tx_state(size_t filesize, int chunklen, int max_rate_limit, char *mem, const struct hercules_app_addr *dests,
+			  struct hercules_path *paths, u32 num_dests, const int *num_paths, u32 max_paths_per_dest,
+			  int control_socket_fd)
 {
 	u64 total_chunks = (filesize + chunklen - 1) / chunklen;
 	if(total_chunks >= UINT_MAX) {
@@ -1636,7 +1684,7 @@ static char *rx_mmap(const char *pathname, size_t filesize)
 
 static bool rbudp_parse_initial(const char *pkt, size_t len, struct rbudp_initial_pkt *parsed_pkt)
 {
-	if(len < sizeof(*parsed_pkt) || ((struct rbudp_initial_pkt *)pkt)->u8_max != UINT8_MAX) {
+	if(len < sizeof(*parsed_pkt) || ((struct rbudp_initial_pkt *) pkt)->u8_max != UINT8_MAX) {
 		return false;
 	}
 	memcpy(parsed_pkt, pkt, sizeof(*parsed_pkt));
@@ -1684,8 +1732,10 @@ static void rx_send_rtt_ack(int sockfd, struct rbudp_initial_pkt *pld)
 	tx_npkts++;
 }
 
-static void rx_handle_initial(int sockfd, struct rbudp_initial_pkt *initial, const char *buf, const char *payload, int payloadlen) {
-	const int headerlen = (int)(payload - buf);
+static void
+rx_handle_initial(int sockfd, struct rbudp_initial_pkt *initial, const char *buf, const char *payload, int payloadlen)
+{
+	const int headerlen = (int) (payload - buf);
 	if(initial->flags & HANDSHAKE_FLAG_SET_RETURN_PATH) {
 		set_rx_sample(rx_state, buf, headerlen + payloadlen);
 	}
@@ -2098,9 +2148,15 @@ static void join_thread(pthread_t pt)
 	}
 }
 
+static void stop_thread(pthread_t pt)
+{
+	pthread_cancel(pt);
+}
+
 struct hercules_stats
 hercules_tx(const char *filename, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest,
-			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode)
+			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode,
+			const int num_senders)
 {
 	// Open mmaped send file
 	int f = open(filename, O_RDONLY);
@@ -2172,6 +2228,13 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	}
 	printf(" OK\n");
 
+	init_send_queue(&send_queue, BATCH_SIZE);
+
+	pthread_t senders[num_senders];
+	for(int s = 0; s < num_senders; s++) {
+		senders[s] = start_thread(tx_send_p, (void *)(size_t)s);
+	}
+
 	tx_state->start_time = get_nsecs();
 	running = true;
 	pthread_t worker = start_thread(tx_p, &xdp_mode);
@@ -2181,6 +2244,11 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	tx_state->end_time = get_nsecs();
 	running = false;
 	join_thread(worker);
+
+	for(int s = 0; s < num_senders; s++) {
+		stop_thread(senders[s]);
+	}
+	destroy_send_queue(&send_queue);
 
 	struct hercules_stats stats = tx_stats(tx_state);
 
