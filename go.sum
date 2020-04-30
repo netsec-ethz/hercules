@@ -12,7 +12,9 @@ github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/buildkite/go-buildkite v2.2.1-0.20190413010238-568b6651b687+incompatible/go.mod h1:WTV0aX5KnQ9ofsKMg2CLUBLJNsQ0RwOEKPhrXXZWPcE=
 github.com/cenkalti/backoff v2.2.1+incompatible/go.mod h1:90ReRw6GdpyfrHakVjL/QHaoyV4aDUVVkXQJJJ3NXXM=
+github.com/cheekybits/genny v0.0.0-20170328200008-9127e812e1e9 h1:a1zrFsLFac2xoM6zG1u72DWJwZG3ayttYLfmLbxVETk=
 github.com/cheekybits/genny v0.0.0-20170328200008-9127e812e1e9/go.mod h1:+tQajlRqAUrPI7DOSpB0XAqZYtQakVtB7wXkRAgjxjQ=
+github.com/cloudflare/sidh v0.0.0-20181111220428-fc8e6378752b h1:pqwbJdj1rgMkE38tDSNnP97wdMYHzV+Lt/aLL2qw2LQ=
 github.com/cloudflare/sidh v0.0.0-20181111220428-fc8e6378752b/go.mod h1:o/DcCuWFr9jFzwO+c3y1hhwqKHHKfJ7HvLhWUwRnqfo=
 github.com/codahale/hdrhistogram v0.0.0-20161010025455-3a0bb77429bd/go.mod h1:sE/e/2PUdi/liOCUjSTXgM1o87ZssimdTWN964YiIeI=
 github.com/davecgh/go-spew v1.1.0 h1:ZDRjVQ15GmhC3fiQ8ni8+OwkZQO4DARzQgrnXU1Liz8=
@@ -72,7 +74,9 @@ github.com/kormat/fmt15 v0.0.0-20181112140556-ee69fecb2656/go.mod h1:8fpYQL5jskF
 github.com/kr/logfmt v0.0.0-20140226030751-b84e30acd515/go.mod h1:+0opPa2QZZtGFBFZlji/RkVcI2GknAs/DXo4wKdlNEc=
 github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
+github.com/lucas-clemente/quic-go v0.7.1-0.20190212114006-fd7246d7ed6e h1:Y07tY5Q2/7WwkwZHxYlQC4mQeD1kM6BQLk/6S64KHY4=
 github.com/lucas-clemente/quic-go v0.7.1-0.20190212114006-fd7246d7ed6e/go.mod h1:wuD+2XqEx8G9jtwx5ou2BEYBsE+whgQmlj0Vz/77PrY=
+github.com/marten-seemann/qtls v0.0.0-20190207043627-591c71538704 h1:7Fx1paF8onfPhcIMlwgznBklz62TrCZjOjoBbUod/3Y=
 github.com/marten-seemann/qtls v0.0.0-20190207043627-591c71538704/go.mod h1:DWDPNN1eWKaT5wsnMz2LR336Zh9hlw/YSRXxqEukrT8=
 github.com/mattn/go-colorable v0.0.7-0.20160930084157-6c903ff4aa50 h1:+lj/MTidgAcsu6wyXg7By2rgbT5kVFT5GFKq/VZZwi4=
 github.com/mattn/go-colorable v0.0.7-0.20160930084157-6c903ff4aa50/go.mod h1:9vuHe8Xs5qXnSaW/c/ABM9alt+Vo+STaOChaDxuIBZU=
@@ -132,8 +136,6 @@ github.com/prometheus/procfs v0.0.0-20181005140218-185b4288413d/go.mod h1:c3At6R
 github.com/prometheus/procfs v0.0.2/go.mod h1:TjEm7ze935MbeOT/UhFTIMYKhuLP4wbCsTZCD3I8kEA=
 github.com/prometheus/procfs v0.0.3 h1:CTwfnzjQ+8dS6MhHHu4YswVAD99sL2wjPqP+VkURmKE=
 github.com/prometheus/procfs v0.0.3/go.mod h1:4A/X28fw3Fc593LaREMrKMqOKvUAntwMDaekg4FpcdQ=
-github.com/scionproto/scion v0.5.0 h1:6IVRRpcsOlWdp8K4ojRufOHlTqfzuEzRFHAOONoJjFw=
-github.com/scionproto/scion v0.5.0/go.mod h1:yayLUQzSt/Lwg+3dA2terZ3tEgXI9r7CX8MKrX5CIdI=
 github.com/sergi/go-diff v1.0.1-0.20180205163309-da645544ed44/go.mod h1:0CfEIISq7TuYL3j771MWULgwwjU+GofnZX9QAmXWZgo=
 github.com/sirupsen/logrus v1.2.0/go.mod h1:LxeOpSwHxABJmUn/MG1IvRgCAasNZTLOkJPxbbu5VWo=
 github.com/smartystreets/assertions v0.0.0-20160707190355-2063fd1cc7c9/go.mod h1:OnSkiWE9lh6wB0YB77sQom3nweQdgAjqCqsofrRNTgc=
@@ -163,6 +165,7 @@ github.com/vishvananda/netlink v1.0.0 h1:bqNY2lgheFIu1meHUFSH3d7vG93AFyqg3oGbJCO
 github.com/vishvananda/netlink v1.0.0/go.mod h1:+SR5DhBJrl6ZM7CoCKvpw5BKroDKQ+PJqOg65H/2ktk=
 github.com/vishvananda/netns v0.0.0-20170219233438-54f0e4339ce7 h1:n630V+sEHbl2OrlWFxLoMoGPnUuniQ9eDvUaEmUdXaY=
 github.com/vishvananda/netns v0.0.0-20170219233438-54f0e4339ce7/go.mod h1:ZjcWmFBXmLKZu9Nxj3WKYEafiSqer2rnvPr0en9UNpI=
+go.uber.org/atomic v1.5.0 h1:OI5t8sDa1Or+q8AeE+yKeB/SDYioSHAgcVljj9JIETY=
 go.uber.org/atomic v1.5.0/go.mod h1:sABNBOSYdrvTF6hTgEIbc7YasKWGhgEQZyfxyTvoXHQ=
 go.uber.org/atomic v1.5.1 h1:rsqfU5vBkVknbhUGbAUwQKR2H4ItV8tjJ+6kJX4cxHM=
 go.uber.org/atomic v1.5.1/go.mod h1:sABNBOSYdrvTF6hTgEIbc7YasKWGhgEQZyfxyTvoXHQ=
