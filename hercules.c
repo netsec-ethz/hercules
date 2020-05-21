@@ -903,8 +903,8 @@ static bool tx_await_rtt_ack(int sockfd, const struct scionaddrhdr_ipv4 **sciona
 	int payloadlen;
 	if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, scionaddrhdr, udphdr)) {
 		struct rbudp_initial_pkt parsed_pkt;
+		u32 rcvr = rcvr_by_src_address(*scionaddrhdr, *udphdr);
 		if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
-			u32 rcvr = rcvr_by_src_address(*scionaddrhdr, *udphdr);
 			if(rcvr < tx_state->num_receivers && tx_state->receiver[rcvr].handshake_rtt == 0) {
 				tx_state->receiver[rcvr].handshake_rtt = (u64) (get_nsecs() - parsed_pkt.timestamp);
 				if(parsed_pkt.filesize != tx_state->filesize ||
@@ -916,10 +916,10 @@ static bool tx_await_rtt_ack(int sockfd, const struct scionaddrhdr_ipv4 **sciona
 								 parsed_pkt.chunklen);
 					return false;
 				}
-			} else {
-				tx_handle_cts(payload, rcvr);
 			}
 			return true;
+		} else {
+			tx_handle_cts(payload, rcvr);
 		}
 	}
 	return false;
