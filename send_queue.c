@@ -23,7 +23,6 @@ void init_send_queue(struct send_queue *queue, u32 num_entries)
 	queue->size = num_entries;
 	queue->head = 0;
 	queue->tail = 0;
-	queue->complete_count = 0;
 }
 
 void destroy_send_queue(struct send_queue *queue)
@@ -41,7 +40,6 @@ struct send_queue_unit *send_queue_reserve(struct send_queue *queue)
 		return NULL; // queue is full
 	}
 
-	queue->units[current_tail].num_chunks = 0;
 	return &queue->units[current_tail];
 }
 

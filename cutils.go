@@ -14,8 +14,8 @@
 
 package main
 
-// #cgo CFLAGS: -std=c11 -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
-// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread
+// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
+// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread -lz
 // #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
 // #include "hercules.h"
 // #include <linux/if_xdp.h>
@@ -55,11 +55,12 @@ func HerculesGetReplyPath(headerPtr unsafe.Pointer, length C.int, replyPathStruc
 		log.Debug("HerculesGetReplyPath", "err", err)
 		return 1
 	}
-	toCPath(*replyPath, replyPathStruct, false, false)
+	// path header memory is set up by C on the stack, no need to call allocateCPathHeaderMemory() here
+	toCPath([]*HerculesPathHeader{replyPath}, replyPathStruct, false, false)
 	return 0
 }
 
-func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPath, error) {
+func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPathHeader, error) {
 	// TODO(sibra) remove sibra extension header: use the reverse path without a reservation
 	packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
 	if err := packet.ErrorLayer(); err != nil {
@@ -119,46 +120,86 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPath, error)
 	scionHeader = scionHeader[:scionHeaderLen]
 	scionChecksum := binary.LittleEndian.Uint16(scionPkt.L4.GetCSum())
 	headerBuf := append(overlayHeader, scionHeader...)
-	herculesPath := HerculesPath{
+	herculesPath := HerculesPathHeader{
 		Header:          headerBuf,
 		PartialChecksum: scionChecksum,
 	}
 	return &herculesPath, nil
 }
 
-func toCPath(from HerculesPath, to *C.struct_hercules_path, replaced, enabled bool) {
-	if len(from.Header) > C.HERCULES_MAX_HEADERLEN {
-		panic(fmt.Sprintf("Header too long (%d), can't invoke hercules C API.", len(from.Header)))
+func allocateCPathHeaderMemory(from []*HerculesPathHeader, to *C.struct_hercules_path) {
+	C.allocate_path_headers(to, C.int(len(from)))
+}
+
+// Assumes that the path header memory has already been set up; call allocateCPathHeaderMemory before, if needed
+func toCPath(from []*HerculesPathHeader, to *C.struct_hercules_path, replaced, enabled bool) {
+	if len(from) < 1 {
+		panic(fmt.Sprintf("No path versions available, can't invoke hercules C API."))
 	}
-	to.headerlen = C.int(len(from.Header))
-	to.payloadlen = C.int(etherLen - len(from.Header)) // TODO(matzf): take actual MTU into account, also when building header
-	to.framelen = C.int(etherLen)                      // TODO(matzf): "
-	// XXX(matzf): is there a nicer way to do this?
-	C.memcpy(unsafe.Pointer(&to.header[0]),
-		unsafe.Pointer(&from.Header[0]),
-		C.ulong(len(from.Header)))
-	to.checksum = C.ushort(from.PartialChecksum)
+	if len(from) > 255 {
+		panic(fmt.Sprintf("Too many header versions, can't invoke hercules C API."))
+	}
+
+	headerLen := len(from[0].Header)
+	headersC := uintptr(unsafe.Pointer(to.headers))
+	for i, header := range from {
+		if len(header.Header) > C.HERCULES_MAX_HEADERLEN {
+			panic(fmt.Sprintf("Header too long (%d), can't invoke hercules C API.", len(header.Header)))
+		}
+		if headerLen != len(header.Header) {
+			panic(fmt.Sprintf("Header versions not all of equal length, can't invoke hercules C API."))
+		}
+		// XXX(matzf): is there a nicer way to do this?
+		var headerCopy C.struct_hercules_path_header // accessing indices on a C array does not work, so we make a local copy...
+		curHeaderC := headersC + uintptr(i) * unsafe.Sizeof(headerCopy) // ... and implement the index logic ourselves
+		C.memcpy(unsafe.Pointer(&headerCopy.header),
+			unsafe.Pointer(&header.Header[0]),
+			C.ulong(len(header.Header)))
+		headerCopy.checksum = C.ushort(header.PartialChecksum)
+		C.memcpy(unsafe.Pointer(curHeaderC), unsafe.Pointer(&headerCopy), C.ulong(unsafe.Sizeof(headerCopy)))
+	}
+
+	to.headerlen = C.int(headerLen)
+	to.payloadlen = C.int(etherLen - headerLen) // TODO(matzf): take actual MTU into account, also when building header
+	to.framelen = C.int(etherLen)               // TODO(matzf): "
+	to.num_headers = C.u8(len(from))
 	to.replaced = C.atomic_bool(replaced)
 	to.enabled = C.atomic_bool(enabled)
 	to.max_bps = 0
 }
 
-func toCAddr(in *snet.UDPAddr) C.struct_hercules_app_addr {
+func toCLocalAddrs(addrs []*net.UDPAddr) []C.struct_local_addr {
+	out := make([]C.struct_local_addr, len(addrs))
+	for i, in := range addrs {
+		bufIP := in.IP.To4()
+		bufPort := make([]byte, 2)
+		binary.BigEndian.PutUint16(bufPort, uint16(in.Port))
 
-	bufIA := make([]byte, 8)
-	in.IA.Write(bufIA)
-	bufIP := in.Host.IP.To4()
-	bufPort := make([]byte, 2)
-	binary.BigEndian.PutUint16(bufPort, uint16(in.Host.Port))
-
-	out := C.struct_hercules_app_addr{}
-	C.memcpy(unsafe.Pointer(&out.ia), unsafe.Pointer(&bufIA[0]), 8)
-	C.memcpy(unsafe.Pointer(&out.ip), unsafe.Pointer(&bufIP[0]), 4)
-	C.memcpy(unsafe.Pointer(&out.port), unsafe.Pointer(&bufPort[0]), 2)
+		C.memcpy(unsafe.Pointer(&out[i].ip), unsafe.Pointer(&bufIP[0]), 4)
+		C.memcpy(unsafe.Pointer(&out[i].port), unsafe.Pointer(&bufPort[0]), 2)
+	}
 	return out
 }
 
-func prepareSCIONPacketHeader(src, dst *snet.UDPAddr, iface *net.Interface) (*HerculesPath, error) {
+func toCIA(in addr.IA) C.ia {
+	var out C.ia
+	bufIA := make([]byte, 8)
+	in.Write(bufIA)
+	C.memcpy(unsafe.Pointer(&out), unsafe.Pointer(&bufIA[0]), 8)
+	return out
+}
+
+func toCIntArray(in []int) []C.int {
+	print(in)
+	print(len(in))
+	out := make([]C.int, 0, len(in))
+	for _, i := range in {
+		out = append(out, C.int(i))
+	}
+	return out
+}
+
+func prepareSCIONPacketHeader(src, dst *snet.UDPAddr, iface *net.Interface) (*HerculesPathHeader, error) {
 
 	overlayHeader, err := prepareOverlayPacketHeader(src.Host.IP, dst.NextHop.IP, uint16(dst.NextHop.Port), iface)
 	if err != nil {
@@ -188,7 +229,7 @@ func prepareSCIONPacketHeader(src, dst *snet.UDPAddr, iface *net.Interface) (*He
 	scionHeader = scionHeader[:scionHeaderLen]
 	scionChecksum := binary.LittleEndian.Uint16(scionPkt.L4.GetCSum())
 	buf := append(overlayHeader, scionHeader...)
-	herculesPath := HerculesPath{
+	herculesPath := HerculesPathHeader{
 		Header:          buf,
 		PartialChecksum: scionChecksum,
 	}

@@ -14,8 +14,8 @@
 
 package main
 
-// #cgo CFLAGS: -std=c11 -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
-// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread
+// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
+// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread -lz
 // #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
 // #include "hercules.h"
 // #include <linux/if_xdp.h>
@@ -25,6 +25,7 @@ package main
 import "C"
 import (
 	"github.com/google/gopacket"
+	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/pathmgr"
 	"github.com/scionproto/scion/go/lib/snet"
 	"go.uber.org/atomic"
@@ -35,7 +36,7 @@ import (
 
 type arrayFlags []string
 
-type HerculesPath struct {
+type HerculesPathHeader struct {
 	Header          []byte //!< C.HERCULES_MAX_HEADERLEN bytes
 	PartialChecksum uint16 //SCION L4 checksum over header with 0 payload
 }
@@ -45,6 +46,11 @@ type herculesStats = C.struct_hercules_stats
 type layerWithOpts struct {
 	Layer gopacket.SerializableLayer
 	Opts  gopacket.SerializeOptions
+}
+
+type Destination struct {
+	ia        addr.IA
+	hostAddrs []*net.UDPAddr
 }
 
 type PathManager struct {
@@ -77,9 +83,9 @@ type PathMeta struct {
 
 type PathsToDestination struct {
 	pm          *PathManager
-	addr        *snet.UDPAddr
+	dst         *Destination
 	sp          *pathmgr.SyncPaths
 	modifyTime  time.Time
 	ExtnUpdated atomic.Bool
-	paths       []PathMeta
+	paths       []PathMeta // nil indicates that the destination is in the same AS as the sender and we can use an empty path
 }

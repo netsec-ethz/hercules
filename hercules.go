@@ -14,8 +14,8 @@
 
 package main
 
-// #cgo CFLAGS: -std=c11 -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
-// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread
+// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
+// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread -lz
 // #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
 // #include "hercules.h"
 // #include <linux/if_xdp.h>
@@ -28,21 +28,25 @@ import (
 	"flag"
 	"fmt"
 	log "github.com/inconshreveable/log15"
+	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/snet"
 	"net"
 	"os"
 	"os/signal"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unsafe"
 )
 
 const (
-	etherLen    int = 1500
+	etherLen int = 1500
 )
 
 var (
 	activeInterface *net.Interface // activeInterface remembers the chosen interface for callbacks from C
+	localAddrRegexp = regexp.MustCompile(`^\[([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})]:([0-9]{1,5})$`)
 )
 
 func (i *arrayFlags) String() string {
@@ -69,12 +73,14 @@ func realMain() error {
 		enableBestEffort bool
 		enableSibra      bool
 		ifname           string
+		localAddrs       arrayFlags
 		localAddr        string
+		rxAddrs			 []*net.UDPAddr
 		maxRateLimit     int
 		mode             string
 		numPaths         int
-		numSendThreads   int
-		queue            int
+		queues			 []int
+		queueArgs        arrayFlags
 		remoteAddrs      arrayFlags
 		transmitFilename string
 		outputFilename   string
@@ -84,22 +90,40 @@ func realMain() error {
 	flag.DurationVar(&dumpInterval, "n", time.Second, "Print stats at given interval")
 	flag.BoolVar(&enablePCC, "pcc", true, "Enable performance-oriented congestion control (PCC)")
 	flag.StringVar(&ifname, "i", "", "interface")
-	flag.StringVar(&localAddr, "l", "", "local address")
+	flag.Var(&localAddrs, "l", "local address")
 	flag.IntVar(&maxRateLimit, "p", 3333333, "Maximum allowed send rate in Packets per Second (default: 3'333'333, ~40Gbps)")
 	flag.StringVar(&mode, "m", "", "XDP socket bind mode (Zero copy: z; Copy mode: c)")
-	flag.IntVar(&queue, "q", 0, "Use queue n")
-	flag.Var(&remoteAddrs, "d", "destination host address(es)")
+	flag.Var(&queueArgs, "q", "Use queue n (specify a separate queue for each worker thread; default is one worker on queue 0)")
+	flag.Var(&remoteAddrs, "d", "destination host address(es); omit the IA part of the address to add a receiver IP to the previous destination")
 	flag.StringVar(&transmitFilename, "t", "", "transmit file (sender)")
 	flag.StringVar(&outputFilename, "o", "", "output file (receiver)")
 	flag.StringVar(&verbose, "v", "", "verbose output (from '' to vv)")
 	flag.IntVar(&numPaths, "np", 1, "Maximum number of different paths per destination to use at the same time")
 	flag.BoolVar(&enableBestEffort, "be", true, "Enable best-effort traffic")
 	flag.BoolVar(&enableSibra, "resv", false, "Enable COLIBRI bandwidth reservations")
-	flag.IntVar(&numSendThreads, "nt", 4, "Number of threads dedicated to send data")
 	flag.Parse()
 
-	if (transmitFilename == "") == (outputFilename == "") {
+	if transmitFilename != "" {
+		if len(localAddrs) != 1 {
+			return errors.New("exactly one local address must be specified for sending")
+		}
+		localAddr = localAddrs[0]
+	} else if outputFilename != "" {
+		if len(localAddrs) < 1 {
+			return errors.New("at least one local address must be specified for receiving")
+		}
+		localAddr = localAddrs[0]
+	} else {
 		return errors.New("exactly one of -t or -o needs to be specified")
+	}
+
+	queues = make([]int, 0, len(queueArgs))
+	for _, qs := range(queueArgs) {
+		q, err := strconv.ParseInt(qs, 10, 32)
+		if err != nil {
+			return errors.New("could not parse queue: " + err.Error())
+		}
+		queues = append(queues, int(q))
 	}
 
 	if !enableBestEffort && !enableSibra {
@@ -142,26 +166,61 @@ func realMain() error {
 	xdpMode := getXDPMode(mode)
 
 	if transmitFilename != "" {
-		var remotes []*snet.UDPAddr
+		var dsts []*Destination
+		var dst *Destination = nil
 		for _, remoteAddr := range remoteAddrs {
-			remote, err := snet.ParseUDPAddr(remoteAddr)
-			if err != nil {
-				return err
+			match := localAddrRegexp.FindStringSubmatch(remoteAddr)
+			if match != nil { // if IP (-d [...]:...): add to previous destination
+				if dst == nil {
+					return errors.New("cannot add IP address to destination: no previous destination")
+				}
+				port, err := strconv.ParseInt(match[2], 10, 32)
+				if err != nil {
+					return err
+				}
+				dst.hostAddrs = append(dst.hostAddrs, &net.UDPAddr{
+					Port: int(port),
+					IP: net.ParseIP(match[1]),
+				})
+			} else { // else, if full SCION address: add new destination
+				remote, err := snet.ParseUDPAddr(remoteAddr)
+				if err != nil {
+					return err
+				}
+				if remote.Host.Port == 0 {
+					return errors.New("you must specify a destination port")
+				}
+				dst = &Destination{
+					ia: remote.IA,
+					hostAddrs: []*net.UDPAddr{remote.Host},
+				}
+				dsts = append(dsts, dst)
 			}
-			if remote.Host.Port == 0 {
-				return errors.New("you must specify a destination port")
-			}
-			remotes = append(remotes, remote)
 		}
-		if len(remotes) == 0 {
+		if len(dsts) == 0 {
 			return errors.New("you must specify at least one destination")
 		}
-		return mainTx(transmitFilename, local, remotes, iface, queue, maxRateLimit, enablePCC, enableBestEffort, enableSibra, xdpMode, dumpInterval, numPaths, numSendThreads)
+		return mainTx(transmitFilename, local, dsts, iface, queues, maxRateLimit, enablePCC, enableBestEffort, enableSibra, xdpMode, dumpInterval, numPaths)
 	}
-	return mainRx(outputFilename, local, iface, queue, xdpMode, dumpInterval)
+
+	if len(localAddrs) != len(queueArgs) {
+		log.Warn("You should specify exactly one queue for each receiving address to have a separate receiving thread for each address")
+	}
+	rxAddrs = make([]*net.UDPAddr, len(localAddrs))
+	for a, address := range localAddrs {
+		parsedAddr, err := snet.ParseUDPAddr(address)
+		if err != nil {
+			return err
+		}
+		if local.IA != parsedAddr.IA {
+			return errors.New("all local addresses must belong to the same IA")
+		}
+		rxAddrs[a] = parsedAddr.Host;
+	}
+	return mainRx(outputFilename, local.IA, rxAddrs, iface, queues, xdpMode, dumpInterval)
 }
 
-func mainTx(filename string, src *snet.UDPAddr, dsts []*snet.UDPAddr, iface *net.Interface, queue int, maxRateLimit int, enablePCC, enableBestEffort, enableSibra bool, xdpMode int, dumpInterval time.Duration, numPaths int, numSendThreads int) (err error) {
+func mainTx(filename string, src *snet.UDPAddr, dsts []*Destination, iface *net.Interface, queues []int, maxRateLimit int, enablePCC, enableBestEffort, enableSibra bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
 	pm, err := initNewPathManager(numPaths, iface, dsts, src, enableBestEffort, enableSibra, uint64(maxRateLimit)*uint64(C.ETHER_SIZE))
 	if err != nil {
 		return err
@@ -172,23 +231,23 @@ func mainTx(filename string, src *snet.UDPAddr, dsts []*snet.UDPAddr, iface *net
 		return errors.New("some destinations are unreachable, abort")
 	}
 
-	herculesInit(iface, src, queue)
+	herculesInit(iface, src.IA, []*net.UDPAddr{src.Host}, queues)
 	pm.pushPaths()
 
 	go pm.syncPathsToC()
 	go statsDumper(true, dumpInterval)
 	go cleanupOnSignal()
-	stats := herculesTx(filename, dsts, pm, maxRateLimit, enablePCC, xdpMode, numSendThreads)
+	stats := herculesTx(filename, dsts, pm, maxRateLimit, enablePCC, xdpMode)
 	printSummary(stats)
 	return nil
 }
 
-func mainRx(filename string, local *snet.UDPAddr, iface *net.Interface, queue int, xdpMode int, dumpInterval time.Duration) error {
+func mainRx(filename string, localIA addr.IA, local []*net.UDPAddr, iface *net.Interface, queues []int, xdpMode int, dumpInterval time.Duration) error {
 
 	filenamec := C.CString(filename)
 	defer C.free(unsafe.Pointer(filenamec))
 
-	herculesInit(iface, local, queue)
+	herculesInit(iface, localIA, local, queues)
 	go statsDumper(false, dumpInterval)
 	go cleanupOnSignal()
 	stats := C.hercules_rx(filenamec, C.int(xdpMode))
@@ -217,22 +276,27 @@ func getXDPMode(m string) (mode int) {
 	return mode
 }
 
-func herculesInit(iface *net.Interface, local *snet.UDPAddr, queue int) {
-	localC := toCAddr(local)
+func herculesInit(iface *net.Interface, ia addr.IA, local []*net.UDPAddr, queues []int) {
+	localC := toCLocalAddrs(local)
+	queuesC := toCIntArray(queues)
+	iaC := toCIA(ia)
 
-	C.hercules_init(C.int(iface.Index), localC, C.int(queue))
+	C.hercules_init(C.int(iface.Index), iaC, &localC[0], C.int(len(local)), &queuesC[0], C.int(len(queues)))
 	activeInterface = iface
 }
 
-func herculesTx(filename string, destinations []*snet.UDPAddr, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int, numSendThreads int) herculesStats {
+func herculesTx(filename string, destinations []*Destination, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
 
 	cDests := make([]C.struct_hercules_app_addr, len(destinations))
 	for d, dest := range destinations {
-		cDests[d] = toCAddr(dest)
+		cDests[d].ia = toCIA(dest.ia)
+		localC := toCLocalAddrs(dest.hostAddrs)
+		cDests[d].ip = localC[0].ip
+		cDests[d].port = localC[0].port
 	}
-	return C.hercules_tx(cFilename, &cDests[0], &pm.cPathsPerDest[0], C.int(len(destinations)), &pm.cNumPathsPerDst[0], pm.cMaxNumPathsPerDst, C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode), C.int(numSendThreads))
+	return C.hercules_tx(cFilename, &cDests[0], &pm.cPathsPerDest[0], C.int(len(destinations)), &pm.cNumPathsPerDst[0], pm.cMaxNumPathsPerDst, C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
 }
 
 func checkAssignedIP(iface *net.Interface, localAddr net.IP) (err error) {

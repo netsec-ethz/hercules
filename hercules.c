@@ -34,6 +34,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <float.h>
+#include <linux/bpf_util.h>
 
 #include "bpf/libbpf.h"
 #include "bpf/bpf.h"
@@ -63,6 +64,8 @@
 #define PATH_HANDSHAKE_TIMEOUT_NS 100000000 // send a path handshake every X=100 ms until the first response arrives
 
 #define ACK_RATE_TIME_MS 100 // send ACKS after at most X milliseconds
+
+#define FOREACH(type, key) for(int key = 0; key < num_ ## type ## s; key++)
 
 static const int rbudp_headerlen = 4;
 static const int tx_handshake_retries = 5;
@@ -209,12 +212,17 @@ struct sender_state {
 	atomic_bool has_new_paths;
 };
 
+typedef int xskmap;
+
 // XXX: cleanup naming: these things are called `opt_XXX` because they corresponded to options in the example application.
 static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
-static const char *opt_ifname = "";
+static char *opt_ifname = "";
 static int opt_ifindex;
-static int opt_queue;
-static struct hercules_app_addr local_addr; // XXX: this shouldn't need to be global.
+static int num_queues;
+static int *queues;
+static ia local_ia; // local as in "our IA"
+static int num_local_addrs; // local as in "relative to our IA"
+static struct local_addr *local_addrs;
 
 static u32 prog_id;
 
@@ -252,7 +260,7 @@ static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, const char *data, siz
 
 static bool rbudp_parse_initial(const char *pkt, size_t len, struct rbudp_initial_pkt *parsed_pkt);
 
-static void stitch_checksum(const struct hercules_path *path, char *pkt);
+static void stitch_checksum(const struct hercules_path *path, u16 precomputed_checksum, char *pkt);
 
 static bool rx_received_all(const struct receiver_state *r)
 {
@@ -387,7 +395,14 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 		//debug_printf("not UDP: %u, %zu", iph->protocol, offset);
 		return NULL;
 	}
-	if(iph->daddr != local_addr.ip) {
+	int addr_idx = -1;
+	FOREACH(local_addr, i) {
+		if(iph->daddr == local_addrs[i].ip) {
+			addr_idx = i;
+			break;
+		}
+	}
+	if(addr_idx == -1) {
 		debug_printf("not addressed to us (IP overlay)");
 		return NULL;
 	}
@@ -429,11 +444,11 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 		return NULL;
 	}
 	const struct scionaddrhdr_ipv4 *scionaddrh = (const struct scionaddrhdr_ipv4 *) (pkt + offset + 8);
-	if(scionaddrh->dst_ia != local_addr.ia) {
+	if(scionaddrh->dst_ia != local_ia) {
 		debug_printf("not addressed to us (IA)");
 		return NULL;
 	}
-	if(scionaddrh->dst_ip != local_addr.ip) {
+	if(scionaddrh->dst_ip != local_addrs[addr_idx].ip) {
 		debug_printf("not addressed to us (IP in SCION hdr)");
 		return NULL;
 	}
@@ -447,7 +462,7 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 	}
 
 	const struct udphdr *l4udph = (const struct udphdr *) (pkt + offset);
-	if(l4udph->dest != local_addr.port) {
+	if(l4udph->dest != local_addrs[addr_idx].port) {
 		debug_printf("not addressed to us (L4 UDP port): %u", ntohs(l4udph->dest));
 		return NULL;
 	}
@@ -499,7 +514,7 @@ static bool recv_rbudp_control_pkt(int sockfd, char *buf, size_t buflen, const c
 		return false;
 	}
 
-	rx_npkts++;
+	atomic_fetch_add(&rx_npkts, 1);
 
 	*payload = rbudp_pkt + rbudp_headerlen;
 	*payloadlen = rbudp_len - rbudp_headerlen;
@@ -553,21 +568,21 @@ static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
 	return umem;
 }
 
-static void submit_initial_rx_frames(struct xsk_socket_info *xsk)
+static void submit_initial_rx_frames(struct xsk_umem_info *umem)
 {
 	int initial_kernel_rx_frame_count = XSK_RING_PROD__DEFAULT_NUM_DESCS - BATCH_SIZE;
 	u32 idx;
-	int ret = xsk_ring_prod__reserve(&xsk->umem->fq,
+	int ret = xsk_ring_prod__reserve(&umem->fq,
 									 initial_kernel_rx_frame_count,
 									 &idx);
 	if(ret != initial_kernel_rx_frame_count)
 		exit_with_error(-ret);
 	for(int i = 0; i < initial_kernel_rx_frame_count; i++)
-		*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx++) = i * XSK_UMEM__DEFAULT_FRAME_SIZE;
-	xsk_ring_prod__submit(&xsk->umem->fq, initial_kernel_rx_frame_count);
+		*xsk_ring_prod__fill_addr(&umem->fq, idx++) = i * XSK_UMEM__DEFAULT_FRAME_SIZE;
+	xsk_ring_prod__submit(&umem->fq, initial_kernel_rx_frame_count);
 }
 
-static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem, int libbpf_flags, int bind_flags)
+static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem, int libbpf_flags, int queue, int bind_flags)
 {
 	struct xsk_socket_config cfg;
 	struct xsk_socket_info *xsk;
@@ -583,8 +598,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem, 
 	cfg.libbpf_flags = libbpf_flags;
 	cfg.xdp_flags = opt_xdp_flags;
 	cfg.bind_flags = bind_flags;
-	ret = xsk_socket__create(&xsk->xsk, opt_ifname, opt_queue, umem->umem,
-							 &xsk->rx, &xsk->tx, &cfg);
+	ret = xsk_socket__create(&xsk->xsk, opt_ifname, queue, umem->umem, &xsk->rx, &xsk->tx, &cfg);
 	if(ret)
 		exit_with_error(-ret);
 
@@ -595,11 +609,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem, 
 	return xsk;
 }
 
-// Helper function: create XSK with it's own UMEM
-// Note: XSKs can share UMEM and this is the setup in the sample application.
-// However, we don't care about this, and create a separate UMEM for each
-// socket.
-static struct xsk_socket_info *create_xsk_with_umem(int libbpf_flags, int bind_flags)
+static struct xsk_umem_info *create_umem()
 {
 	void *bufs;
 	int ret = posix_memalign(&bufs, getpagesize(), /* PAGE_SIZE aligned */
@@ -609,7 +619,13 @@ static struct xsk_socket_info *create_xsk_with_umem(int libbpf_flags, int bind_f
 
 	struct xsk_umem_info *umem;
 	umem = xsk_configure_umem(bufs, NUM_FRAMES * XSK_UMEM__DEFAULT_FRAME_SIZE);
-	return xsk_configure_socket(umem, libbpf_flags, bind_flags);
+	return umem;
+}
+
+static struct xsk_socket_info *create_xsk_with_umem(int libbpf_flags, int queue, int bind_flags)
+{
+	struct xsk_umem_info *umem = create_umem();
+	return xsk_configure_socket(umem, libbpf_flags, queue, bind_flags);
 }
 
 static void kick_tx(struct xsk_socket_info *xsk)
@@ -637,7 +653,7 @@ static void pop_completion_ring(struct xsk_socket_info *xsk)
 	if(likely(entries > 0)) {
 		xsk_ring_cons__release(&xsk->umem->cq, entries);
 		xsk->outstanding_tx -= entries;
-		tx_npkts += entries;
+		atomic_fetch_add(&tx_npkts, entries);
 	}
 }
 
@@ -914,7 +930,7 @@ tx_send_initial(int sockfd, const struct hercules_path *path, size_t filesize, u
 				u32 path_index, bool set_return_path)
 {
 	char buf[ETHER_SIZE];
-	void *rbudp_pkt = mempcpy(buf, path->header, path->headerlen);
+	void *rbudp_pkt = mempcpy(buf, path->headers[0].header, path->headerlen);
 
 	struct rbudp_initial_pkt pld = {
 			.u8_max = UINT8_MAX,
@@ -925,10 +941,10 @@ tx_send_initial(int sockfd, const struct hercules_path *path, size_t filesize, u
 			.flags = set_return_path ? HANDSHAKE_FLAG_SET_RETURN_PATH : 0,
 	};
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, (char *) &pld, sizeof(pld), path->payloadlen);
-	stitch_checksum(path, buf);
+	stitch_checksum(path, path->headers[0].checksum, buf);
 
 	send_eth_frame(sockfd, buf, path->framelen);
-	tx_npkts++;
+	atomic_fetch_add(&tx_npkts, 1);
 }
 
 static bool tx_handshake(int sockfd)
@@ -965,13 +981,13 @@ static bool tx_handshake(int sockfd)
 	return false;
 }
 
-static void stitch_checksum(const struct hercules_path *path, char *pkt)
+static void stitch_checksum(const struct hercules_path *path, u16 precomputed_checksum, char *pkt)
 {
 	chk_input chk_input_s;
 	chk_input *chksum_struc = init_chk_input(&chk_input_s, 2);
 	assert(chksum_struc);
 	char *payload = pkt + path->headerlen;
-	u16 precomputed_checksum = ~path->checksum; // take one complement of precomputed checksum
+	precomputed_checksum = ~precomputed_checksum; // take one complement of precomputed checksum
 	chk_add_chunk(chksum_struc, (u8 *) &precomputed_checksum, 2); // add precomputed header checksum
 	chk_add_chunk(chksum_struc, (u8 *) payload, path->payloadlen); // add payload
 	u16 pkt_checksum = checksum(chksum_struc);
@@ -1021,7 +1037,7 @@ static void rx_receive_batch(struct xsk_socket_info *xsk)
 	}
 	xsk_ring_prod__submit(&xsk->umem->fq, rcvd);
 	xsk_ring_cons__release(&xsk->rx, rcvd);
-	rx_npkts += (rcvd - ignored);
+	atomic_fetch_add(&rx_npkts, (rcvd - ignored));
 }
 
 static void rate_limit_tx(void)
@@ -1113,6 +1129,20 @@ void push_hercules_tx_paths()
 	}
 }
 
+void allocate_path_headers(struct hercules_path *path, int num_headers) {
+	// this function is only called in non-performance critical paths, hence we have the time to manage memory
+	if (path->num_headers < num_headers) {
+		if (path->headers != NULL) {
+			free(path->headers); // this should not be necessary: the number of header versions per destination should
+			// not change, as the number of IP addresses per destination is fixed at startup
+		}
+		path->headers = calloc(num_headers, sizeof(*path->headers));
+	} else if(num_headers == 0) {
+		debug_printf("no header versions given, abort");
+		exit_with_error(ENODATA);
+	}
+}
+
 static void update_hercules_tx_paths(void)
 {
 	acquire_path_lock();
@@ -1133,7 +1163,10 @@ static void update_hercules_tx_paths(void)
 					receiver->paths[p].enabled = false;
 					continue;
 				}
+				struct hercules_path_header *old_headers = receiver->paths[p].headers;
 				memcpy(&receiver->paths[p], shd_path, sizeof(struct hercules_path));
+				shd_path->headers = old_headers; // this pushes the memory management for struct hercules_path_header to
+				// the Go part which is less performance critical
 
 				atomic_store(&receiver->paths[p].next_handshake_at, UINT64_MAX); // by default do not send a new handshake
 				if(p == 0) {
@@ -1228,7 +1261,7 @@ static void submit_batch(struct xsk_socket_info *xsk, u32 *frame_nb, u32 i)
 
 	xsk->outstanding_tx += i;
 	*frame_nb += i;
-	if(*frame_nb + BATCH_SIZE > NUM_FRAMES) { // Wrap around if next batch would overflow
+	if(*frame_nb + SEND_QUEUE_ENTRIES_PER_UNIT > NUM_FRAMES) { // Wrap around if next batch would overflow
 		*frame_nb = 0;
 	}
 
@@ -1236,25 +1269,16 @@ static void submit_batch(struct xsk_socket_info *xsk, u32 *frame_nb, u32 i)
 	pop_completion_ring(xsk);
 }
 
-static inline void tx_handle_send_queue_unit(struct send_queue_unit *unit) {
-	for(u32 i = 0; i < unit->num_chunks; i++) {
-		const u32 chunk_idx = unit->chunk_idx[i];
-		const size_t chunk_start = (size_t) chunk_idx * tx_state->chunklen;
-		const size_t len = umin64(tx_state->chunklen, tx_state->filesize - chunk_start);
-
-		void *rbudp_pkt = mempcpy(unit->pkts[i], unit->paths[i]->header, unit->paths[i]->headerlen);
-		fill_rbudp_pkt(rbudp_pkt, chunk_idx, tx_state->mem + chunk_start, len, unit->paths[i]->payloadlen);
-		stitch_checksum(unit->paths[i], unit->pkts[i]);
+static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct send_queue_unit *unit, u32 *frame_nb) {
+	u32 num_chunks_in_unit;
+	for(num_chunks_in_unit = 0; num_chunks_in_unit < SEND_QUEUE_ENTRIES_PER_UNIT; num_chunks_in_unit++) {
+		if(unit->paths[num_chunks_in_unit] == NULL) {
+			break;
+		}
 	}
-}
 
-static void
-send_batch(struct xsk_socket_info *xsk, u32 *frame_nb, const struct hercules_path **path_by_rcvr, const u32 *chunks,
-		   const u32 *rcvr_by_chunk, u32 num_chunks)
-{
-	// reserve TX producer ring
 	u32 idx;
-	while(xsk_ring_prod__reserve(&xsk->tx, num_chunks, &idx) != num_chunks) {
+	while(xsk_ring_prod__reserve(&xsk->tx, num_chunks_in_unit, &idx) != num_chunks_in_unit) {
 		kick_tx(xsk); // XXX: investigate how sender can still starve without this, it seems it should NOT be necessary
 		// While we're waiting, consume completion ring to avoid that the kernel
 		// could starve on completion ring slots. (ring is smaller than number of
@@ -1262,55 +1286,67 @@ send_batch(struct xsk_socket_info *xsk, u32 *frame_nb, const struct hercules_pat
 		pop_completion_ring(xsk);
 	}
 
+	for(u32 i = 0; i < num_chunks_in_unit; i++) {
+		const u32 chunk_idx = unit->chunk_idx[i];
+		const size_t chunk_start = (size_t) chunk_idx * tx_state->chunklen;
+		const size_t len = umin64(tx_state->chunklen, tx_state->filesize - chunk_start);
+		u32 hdr_idx = chunk_idx % unit->paths[i]->num_headers; // pick arbitrary header version TODO improve selection?
+
+		void *pkt = produce_frame(xsk, *frame_nb + i, idx + i, unit->path_framelen[i]);
+		void *rbudp_pkt = mempcpy(pkt, unit->paths[i]->headers[hdr_idx].header, unit->paths[i]->headerlen);
+		fill_rbudp_pkt(rbudp_pkt, chunk_idx, tx_state->mem + chunk_start, len, unit->paths[i]->payloadlen);
+		stitch_checksum(unit->paths[i], unit->paths[i]->headers[hdr_idx].checksum, pkt);
+	}
+
+	submit_batch(xsk, frame_nb, num_chunks_in_unit);
+}
+
+static void
+produce_batch(const struct hercules_path **path_by_rcvr, const u32 *chunks, const u32 *rcvr_by_chunk, u32 num_chunks)
+{
 	u32 chk;
+	u32 num_chunks_in_unit;
 	u32 num_units = 0; // having this as a local variable avoids false sharing
 	struct send_queue_unit *unit = NULL;
-	atomic_store(&send_queue.complete_count, 0);
 	for(chk = 0; chk < num_chunks; chk++) {
 		if(unit == NULL) {
 			unit = send_queue_reserve(&send_queue);
+			num_chunks_in_unit = 0;
 			if(unit == NULL) {
 				debug_printf("producer blocked: queue is full");
 				continue;
 			}
 		}
 
-		unit->pkts[unit->num_chunks] = produce_frame(xsk, *frame_nb + chk, idx + chk, path_by_rcvr[rcvr_by_chunk[chk]]->framelen);
-		unit->paths[unit->num_chunks] = path_by_rcvr[rcvr_by_chunk[chk]];
-		unit->chunk_idx[unit->num_chunks] = chunks[chk];
+		unit->path_framelen[num_chunks_in_unit] = path_by_rcvr[rcvr_by_chunk[chk]]->framelen;
+		unit->paths[num_chunks_in_unit] = path_by_rcvr[rcvr_by_chunk[chk]];
+		unit->chunk_idx[num_chunks_in_unit] = chunks[chk];
 
-		unit->num_chunks++;
-		if(unit->num_chunks == SEND_QUEUE_ENTRIES_PER_UNIT || chk == num_chunks-1) {
+		num_chunks_in_unit++;
+		if(num_chunks_in_unit == SEND_QUEUE_ENTRIES_PER_UNIT || chk == num_chunks-1) {
+			if(num_chunks_in_unit < SEND_QUEUE_ENTRIES_PER_UNIT) {
+				unit->paths[num_chunks_in_unit] = NULL;
+			}
 			send_queue_push(&send_queue);
 			num_units++;
 			unit = NULL;
 		}
 	}
-
-	// wait until ready
-	while(atomic_load(&send_queue.complete_count) < num_units) {
-		// in the meantime: help with moving the data
-		struct send_queue_unit send_unit;
-		if(send_queue_pop(&send_queue, &send_unit)) {
-			tx_handle_send_queue_unit(&send_unit);
-			num_units--;
-		}
-	}
-
-	submit_batch(xsk, frame_nb, chk);
 }
 
-static void tx_send_p(__attribute__((unused)) void *tid) {
+static void tx_send_p(void *arg) {
+	struct xsk_socket_info *xsk = arg;
+
 	struct send_queue_unit unit;
 	send_queue_pop_wait(&send_queue, &unit);
-	u32 sent_units = 0;
+	u32 frame_nb = 0;
 	while(true) {
-		tx_handle_send_queue_unit(&unit);
-		sent_units++;
+		tx_handle_send_queue_unit(xsk, &unit, &frame_nb);
 		if(!send_queue_pop(&send_queue, &unit)) { // queue currently empty
-			atomic_fetch_add(&send_queue.complete_count, sent_units);
-			sent_units = 0;
-			send_queue_pop_wait(&send_queue, &unit);
+			while(!send_queue_pop(&send_queue, &unit)) {
+				// whenever we're waiting, claim frames back
+				pop_completion_ring(xsk);
+			}
 		}
 	}
 }
@@ -1436,10 +1472,9 @@ static void kick_cc(const bool *finished)
  * This assumes a uniform send rate and that chunks that need to be retransmitted (i.e. losses)
  * occur uniformly.
  */
-static void tx_only(struct xsk_socket_info *xsk)
+static void tx_only()
 {
 	prev_rate_check = get_nsecs();
-	u32 frame_nb = 0;
 	u64 prev_round_start[tx_state->num_receivers];
 	memset(prev_round_start, 0, sizeof(prev_round_start));
 	u64 prev_round_end[tx_state->num_receivers];
@@ -1555,7 +1590,7 @@ static void tx_only(struct xsk_socket_info *xsk)
 		if(num_chunks > 0) {
 			const struct hercules_path *rcvr_path[tx_state->num_receivers];
 			prepare_rcvr_paths(rcvr_path);
-			send_batch(xsk, &frame_nb, rcvr_path, chunks, chunk_rcvr, num_chunks);
+			produce_batch(rcvr_path, chunks, chunk_rcvr, num_chunks);
 			rate_limit_tx();
 
 			for(u32 r = 0; r < tx_state->num_receivers; r++) {
@@ -1575,9 +1610,6 @@ static void tx_only(struct xsk_socket_info *xsk)
 		iterate_paths();
 
 		if(now < chunk_ack_due) {
-			while(xsk->outstanding_tx && get_nsecs() < chunk_ack_due) {
-				pop_completion_ring(xsk);
-			}
 			sleep_until(chunk_ack_due);
 		}
 	}
@@ -1692,7 +1724,7 @@ static bool rbudp_parse_initial(const char *pkt, size_t len, struct rbudp_initia
 	return true;
 }
 
-static bool rx_get_reply_path(struct hercules_path *path)
+static bool rx_get_reply_path(struct hercules_path *path, struct hercules_path_header *path_header)
 {
 	// Get reply path for sending ACKs:
 	//
@@ -1708,6 +1740,10 @@ static bool rx_get_reply_path(struct hercules_path *path)
 	char rx_sample_buf[XSK_UMEM__DEFAULT_FRAME_SIZE];
 	memcpy(rx_sample_buf, rx_state->rx_sample_buf, rx_sample_len);
 
+	// prepare hercules_path
+	path->headers = path_header;
+	path->num_headers = 1;
+
 	int ret = HerculesGetReplyPath(rx_sample_buf, rx_sample_len, path);
 	if(ret) {
 		return false;
@@ -1718,18 +1754,19 @@ static bool rx_get_reply_path(struct hercules_path *path)
 static void rx_send_rtt_ack(int sockfd, struct rbudp_initial_pkt *pld)
 {
 	struct hercules_path path;
-	if(!rx_get_reply_path(&path)) {
+	struct hercules_path_header path_header;
+	if(!rx_get_reply_path(&path, &path_header)) {
 		return;
 	}
 
 	char buf[ETHER_SIZE];
-	void *rbudp_pkt = mempcpy(buf, path.header, path.headerlen);
+	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, (char *) pld, sizeof(*pld), path.payloadlen);
-	stitch_checksum(&path, buf);
+	stitch_checksum(&path, path.headers[0].checksum, buf);
 
 	send_eth_frame(sockfd, buf, path.framelen);
-	tx_npkts++;
+	atomic_fetch_add(&tx_npkts, 1);
 }
 
 static void
@@ -1766,33 +1803,35 @@ static bool rx_accept(int sockfd)
 static void rx_send_cts_ack(int sockfd)
 {
 	struct hercules_path path;
-	if(!rx_get_reply_path(&path)) {
+	struct hercules_path_header path_header;
+	if(!rx_get_reply_path(&path, &path_header)) {
 		return;
 	}
 
 	char buf[ETHER_SIZE];
-	void *rbudp_pkt = mempcpy(buf, path.header, path.headerlen);
+	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
 	struct rbudp_ack_pkt ack;
 	ack.num_acks = 0;
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, (char *) &ack, ack__len(&ack), path.payloadlen);
-	stitch_checksum(&path, buf);
+	stitch_checksum(&path, path.headers[0].checksum, buf);
 
 	send_eth_frame(sockfd, buf, path.framelen);
-	tx_npkts++;
+	atomic_fetch_add(&tx_npkts, 1);
 }
 
 static void rx_send_acks(int sockfd)
 {
 	struct hercules_path path;
-	if(!rx_get_reply_path(&path)) {
+	struct hercules_path_header path_header;
+	if(!rx_get_reply_path(&path, &path_header)) {
 		debug_printf("no reply path");
 		return;
 	}
 
 	char buf[ETHER_SIZE];
-	void *rbudp_pkt = mempcpy(buf, path.header, path.headerlen);
+	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
 	// XXX: could write ack payload directly to buf, but
 	// doesnt work nicely with existing fill_rbudp_pkt helper.
@@ -1805,10 +1844,10 @@ static void rx_send_acks(int sockfd)
 		if(ack.num_acks == 0) break;
 
 		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, (char *) &ack, ack__len(&ack), path.payloadlen);
-		stitch_checksum(&path, buf);
+		stitch_checksum(&path, path.headers[0].checksum, buf);
 
 		send_eth_frame(sockfd, buf, path.framelen);
-		tx_npkts++;
+		atomic_fetch_add(&tx_npkts, 1);
 	}
 }
 
@@ -1823,13 +1862,8 @@ static void rx_trickle_acks(int sockfd)
 
 static void *rx_p(void *arg)
 {
-	(void) arg;
-
-	struct xsk_socket_info *xsk = (struct xsk_socket_info *) arg;
-	submit_initial_rx_frames(xsk);
-
 	while(running && !rx_received_all(rx_state)) {
-		rx_receive_batch(xsk);
+		rx_receive_batch(arg);
 	}
 
 	return NULL;
@@ -1889,78 +1923,34 @@ static int load_xsk_nop_passthrough()
 	return 0;
 }
 
-// XXX: taken and adapted from https://github.com/torvalds/linux/blob/master/tools/lib/bpf/xsk.c
-static int xsk_lookup_current_xsks_map_fd(void)
+static void xsk_map__add_xsk(xskmap map, int index, struct xsk_socket_info *xsk)
 {
-	__u32 i, *map_ids, num_maps, info_len = sizeof(struct bpf_prog_info);
-	__u32 map_len = sizeof(struct bpf_map_info);
-	struct bpf_prog_info prog_info = {};
-	struct bpf_map_info map_info;
-	int fd, err;
-
-	int prog_fd = bpf_prog_get_fd_by_id(prog_id);
-	if(prog_fd < 0)
-		return -prog_fd;
-
-	err = bpf_obj_get_info_by_fd(prog_fd, &prog_info, &info_len);
-	if(err)
-		return err;
-
-	num_maps = prog_info.nr_map_ids;
-
-	map_ids = calloc(prog_info.nr_map_ids, sizeof(*map_ids));
-	if(!map_ids)
-		return -ENOMEM;
-
-	memset(&prog_info, 0, info_len);
-	prog_info.nr_map_ids = num_maps;
-	prog_info.map_ids = (__u64) (unsigned long) map_ids;
-
-	err = bpf_obj_get_info_by_fd(prog_fd, &prog_info, &info_len);
-	if(err)
-		goto out_map_ids;
-
-	int ret = -1;
-	for(i = 0; i < prog_info.nr_map_ids; i++) {
-		fd = bpf_map_get_fd_by_id(map_ids[i]);
-		if(fd < 0)
-			continue;
-
-		err = bpf_obj_get_info_by_fd(fd, &map_info, &map_len);
-		if(err) {
-			close(fd);
-			continue;
-		}
-
-		if(!strcmp(map_info.name, "xsks_map")) {
-			ret = fd;
-			continue;
-		}
-
-		close(fd);
+	int xsk_fd = xsk_socket__fd(xsk->xsk);
+	if(xsk_fd < 0) {
+		exit_with_error(-xsk_fd);
 	}
-
-	if(ret == -1)
-		ret = -ENOENT;
-
-	out_map_ids:
-	free(map_ids);
-	return ret;
+	bpf_map_update_elem(map, &index, &xsk_fd, 0);
 }
 
 /*
- * Replace the default program provided by the kernel with a program only redirecting IP
- * traffic to the XSK.
+ * Load a BPF program redirecting IP traffic to the XSK.
  */
-static void load_xsk_redirect_userspace(void)
+static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[])
 {
 	static const int log_buf_size = 16 * 1024;
 	char log_buf[log_buf_size];
 	int err, prog_fd;
 
-	int xsks_map_fd = xsk_lookup_current_xsks_map_fd();
-	if(xsks_map_fd < 0) {
-		exit_with_error(xsks_map_fd);
+	int max_queue = 0;
+	FOREACH(queue, q) {
+		max_queue = umax32(max_queue, queues[q]);
+	}
+	int xsks_map_fd = bpf_create_map(BPF_MAP_TYPE_XSKMAP, 4, 4, max_queue + 1, 0);
+	if (xsks_map_fd < 0) {
+		exit_with_error(-xsks_map_fd);
+	}
+	FOREACH(queue, q) {
+		xsk_map__add_xsk(xsks_map_fd, queues[q], xsks[q]);
 	}
 
 	/* This is the C-program:
@@ -1977,21 +1967,23 @@ static void load_xsk_redirect_userspace(void)
 	 *         return XDP_PASS; // not IP
 	 *     }
 	 *
-	 *	   return bpf_redirect_map(&xsks_map, 0, 0);
+	 *	   return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
      * }
 	 */
 	struct bpf_insn prog[] = {
 			/* r0 = XDP_PASS */
 			BPF_MOV64_IMM(BPF_REG_0, 2),
+			/* r6 = *(u32 *)(r1 + 16) */
+			BPF_LDX_MEM(BPF_W, BPF_REG_6, BPF_REG_1, 16), // ctx->rx_queue_index
 			/* r3 = *(u32 *)(r1 + 4) */
-			BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1, 4),
+			BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1, 4), // ctx->data_end
 			/* r2 = *(u32 *)(r1 + 0) */
-			BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_1, 0),
+			BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_1, 0), // ctx->data
 			/* r4 = r2 */
 			BPF_MOV64_REG(BPF_REG_4, BPF_REG_2),
 			/* r4 += 34 */
 			BPF_ALU64_IMM(BPF_ADD, BPF_REG_4, 34),
-			/* if r4 > r3 goto pc+20 */
+			/* if r4 > r3 goto exit (pc+13) */
 			BPF_JMP_REG(BPF_JGT, BPF_REG_4, BPF_REG_3, 13),
 			/* r3 = *(u8 *)(r2 + 12) */
 			BPF_LDX_MEM(BPF_B, BPF_REG_3, BPF_REG_2, 12),
@@ -2001,7 +1993,7 @@ static void load_xsk_redirect_userspace(void)
 			BPF_ALU64_IMM(BPF_LSH, BPF_REG_2, 8),
 			/* r2 |= r3 */
 			BPF_ALU64_REG(BPF_OR, BPF_REG_2, BPF_REG_3),
-			/* if r2 != htons(ETHERTYPE_IP) goto pc+15 */
+			/* if r2 != htons(ETHERTYPE_IP) goto exit (pc+8) */
 			BPF_JMP_IMM(BPF_JNE, BPF_REG_2, htons(ETHERTYPE_IP), 8),
 			/* r1 = r0 */
 			BPF_MOV64_REG(BPF_REG_1, BPF_REG_0),
@@ -2009,13 +2001,13 @@ static void load_xsk_redirect_userspace(void)
 			BPF_MOV64_IMM(BPF_REG_0, 2),
 			/* if r1 == 0 goto pc+5 */
 			BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 5),
-			/* r2 = *(u32 *)(r10 - 4) */
-			BPF_MOV64_IMM(BPF_REG_2, opt_queue),
-			/* r1 = xskmap[] */
-			BPF_LD_MAP_FD(BPF_REG_1, xsks_map_fd),
+			/* r2 = r6 */
+			BPF_MOV64_REG(BPF_REG_2, BPF_REG_6),
 			/* r3 = 0 */
 			BPF_MOV64_IMM(BPF_REG_3, 0),
-			/* call bpf_map_lookup_elem */
+			/* r1 = xskmap[] */
+			BPF_LD_MAP_FD(BPF_REG_1, xsks_map_fd),
+			/* call bpf_redirect_map */
 			BPF_EMIT_CALL(BPF_FUNC_redirect_map),
 			/* The jumps are to this instruction */
 			BPF_EXIT_INSN(),
@@ -2030,42 +2022,47 @@ static void load_xsk_redirect_userspace(void)
 		exit_with_error(-prog_fd);
 	}
 
-	// swap the programs
-	remove_xdp_program();
 	err = bpf_set_link_xdp_fd(opt_ifindex, prog_fd, opt_xdp_flags);
 	if(err) {
 		exit_with_error(-err);
 	}
-	err = bpf_get_link_xdp_id(opt_ifindex, &prog_id, opt_xdp_flags);
-	if(err) {
-		exit_with_error(-err);
+
+	int ret = bpf_get_link_xdp_id(opt_ifindex, &prog_id, opt_xdp_flags);
+	if(ret) {
+		exit_with_error(-ret);
 	}
 }
 
-static void *tx_p(void *arg)
+static void *tx_p(__attribute__ ((unused)) void *arg)
 {
-	int xdp_mode = *(int *) arg;
-
 	load_xsk_nop_passthrough();
-	struct xsk_socket_info *xsk = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, xdp_mode);
-	tx_only(xsk);
-	close_xsk(xsk);
+	tx_only();
 
 	return NULL;
 }
 
-void hercules_init(int ifindex, const struct hercules_app_addr local_addr_, int queue)
+void hercules_init(int ifindex, const ia local_ia_, const struct local_addr *local_addrs_, int num_local_addrs_, int queues_[], int num_queues_)
 {
+	num_queues = num_queues_;
+	queues = calloc(num_queues, sizeof(*queues));
+	memcpy(queues, queues_, sizeof(*queues) * num_queues);
 	static char if_name_buf[IF_NAMESIZE];
 	opt_ifindex = ifindex;
 
 	if_indextoname(ifindex, if_name_buf);
-	opt_ifname = if_name_buf; // XXX urrgh
-	opt_queue = queue;
+	int ifname_size = strlen(if_name_buf) + 1;
+	opt_ifname = malloc(ifname_size);
+	memcpy(opt_ifname, if_name_buf, ifname_size);
 
-	local_addr = local_addr_;
+	local_ia = local_ia_;
+	num_local_addrs = num_local_addrs_;
+	local_addrs = calloc(num_local_addrs_, sizeof(*local_addrs));
+	memcpy(local_addrs, local_addrs_, sizeof(*local_addrs) * num_local_addrs);
 
-	debug_printf("ifindex: %i, queue %i", opt_ifindex, opt_queue);
+	debug_printf("ifindex: %i", opt_ifindex);
+	FOREACH(queue, q) {
+		debug_printf("enabling queue %d", queues[q]);
+	}
 
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
 	setlocale(LC_ALL, "");
@@ -2074,7 +2071,6 @@ void hercules_init(int ifindex, const struct hercules_app_addr local_addr_, int 
 				strerror(errno));
 		exit(EXIT_FAILURE);
 	}
-
 }
 
 static struct hercules_stats tx_stats(struct sender_state *t)
@@ -2150,13 +2146,15 @@ static void join_thread(pthread_t pt)
 
 static void stop_thread(pthread_t pt)
 {
-	pthread_cancel(pt);
+	int ret = pthread_cancel(pt);
+	if(ret) {
+		exit_with_error(ret);
+	}
 }
 
 struct hercules_stats
 hercules_tx(const char *filename, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest,
-			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode,
-			const int num_senders)
+			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode)
 {
 	// Open mmaped send file
 	int f = open(filename, O_RDONLY);
@@ -2185,9 +2183,9 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	}
 
 	u32 chunklen = paths_per_dest[0].payloadlen - rbudp_headerlen;
-	for(int r = 0; r < num_dests; r++) {
-		for(int i = 0; i < num_paths[r]; i++) {
-			chunklen = umin32(chunklen, paths_per_dest[r * max_paths + i].payloadlen - rbudp_headerlen);
+	FOREACH(dest, d) {
+		for(int p = 0; p < num_paths[d]; p++) {
+			chunklen = umin32(chunklen, paths_per_dest[d * max_paths + p].payloadlen - rbudp_headerlen);
 		}
 	}
 	init_tx_state(filesize, chunklen, max_rate_limit, mem, destinations, paths_per_dest, num_dests, num_paths, max_paths, sockfd);
@@ -2198,8 +2196,8 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 
 	if(enable_pcc) {
 		u64 now = get_nsecs();
-		for(int i = 0; i < num_dests; i++) {
-			struct sender_state_per_receiver *receiver = &tx_state->receiver[i];
+		FOREACH(dest, d) {
+			struct sender_state_per_receiver *receiver = &tx_state->receiver[d];
 			receiver->cc_states = init_ccontrol_state(
 					max_rate_limit,
 					tx_state->total_chunks,
@@ -2208,7 +2206,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 			);
 			ccontrol_update_rtt(&receiver->cc_states[0], receiver->handshake_rtt);
 			debug_printf("[receiver %d] [path 0] handshake_rtt: %fs, MI: %fs",
-						 i, receiver->handshake_rtt / 1e9, receiver->cc_states[0].pcc_mi_duration);
+						 d, receiver->handshake_rtt / 1e9, receiver->cc_states[0].pcc_mi_duration);
 
 			// make sure tx_only() performs RTT estimation on every best-effort enabled path
 			for(u32 p = 1; p < receiver->num_paths; p++) {
@@ -2230,14 +2228,16 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 
 	init_send_queue(&send_queue, BATCH_SIZE);
 
-	pthread_t senders[num_senders];
-	for(int s = 0; s < num_senders; s++) {
-		senders[s] = start_thread(tx_send_p, (void *)(size_t)s);
+	pthread_t senders[num_queues];
+	struct xsk_socket_info *xsks[num_queues];
+	FOREACH(queue, q) {
+		xsks[q] = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queues[q], xdp_mode);
+		senders[q] = start_thread(tx_send_p, xsks[q]);
 	}
 
 	tx_state->start_time = get_nsecs();
 	running = true;
-	pthread_t worker = start_thread(tx_p, &xdp_mode);
+	pthread_t worker = start_thread(tx_p, NULL);
 
 	tx_recv_acks(sockfd);
 
@@ -2245,16 +2245,17 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	running = false;
 	join_thread(worker);
 
-	for(int s = 0; s < num_senders; s++) {
-		stop_thread(senders[s]);
+	FOREACH(queue, q) {
+		stop_thread(senders[q]);
+		close_xsk(xsks[q]);
 	}
 	destroy_send_queue(&send_queue);
 
 	struct hercules_stats stats = tx_stats(tx_state);
 
 	if(enable_pcc) {
-		for(int i = 0; i < num_dests; i++) {
-			destroy_ccontrol_state(tx_state->receiver[i].cc_states, num_paths[i]);
+		FOREACH(dest, d) {
+			destroy_ccontrol_state(tx_state->receiver[d].cc_states, num_paths[d]);
 		}
 	}
 	destroy_tx_state();
@@ -2283,14 +2284,22 @@ hercules_rx(const char *filename, int xdp_mode)
 	rx_state->mem = rx_mmap(filename, rx_state->filesize);
 	printf(" OK\n");
 
-	// attempt to load the default BPF program redirecting all traffic to the XSK
-	struct xsk_socket_info *xsk = create_xsk_with_umem(0, xdp_mode);
-	// swap the program while keeping the xsks_map
-	load_xsk_redirect_userspace();
+	struct xsk_socket_info *xsks[num_queues];
+	FOREACH(queue, q) {
+		struct xsk_socket_info *xsk = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queues[q], xdp_mode);
+		xsks[q] = xsk;
+		submit_initial_rx_frames(xsk->umem);
+	}
+
+	load_xsk_redirect_userspace(xsks);
 
 	rx_state->start_time = get_nsecs();
 	running = true;
-	pthread_t worker = start_thread(rx_p, xsk);
+
+	pthread_t worker[num_queues];
+	FOREACH(queue, q) {
+		worker[q] = start_thread(rx_p, xsks[q]);
+	}
 
 	rx_send_cts_ack(sockfd); // send Clear To Send ACK
 	rx_trickle_acks(sockfd);
@@ -2298,11 +2307,16 @@ hercules_rx(const char *filename, int xdp_mode)
 
 	rx_state->end_time = get_nsecs();
 	running = false;
-	join_thread(worker);
+
+	FOREACH(queue, q) {
+		join_thread(worker[q]);
+	}
 
 	struct hercules_stats stats = rx_stats(rx_state);
 
-	close_xsk(xsk);
+	FOREACH(queue, q) {
+		close_xsk(xsks[q]);
+	}
 	bitset__destroy(&rx_state->received_chunks);
 	free(rx_state);
 	close(sockfd);

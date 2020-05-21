@@ -14,8 +14,8 @@
 
 package main
 
-// #cgo CFLAGS: -std=c11 -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
-// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread
+// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
+// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread -lz
 // #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
 // #include "hercules.h"
 // #include <linux/if_xdp.h>
@@ -36,7 +36,7 @@ import (
 	"time"
 )
 
-func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.UDPAddr, src *snet.UDPAddr, enableBestEffort, enableSibra bool, maxBps uint64) (*PathManager, error) {
+func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*Destination, src *snet.UDPAddr, enableBestEffort, enableSibra bool, maxBps uint64) (*PathManager, error) {
 	sciondConn, err := sciond.NewService(sciond.DefaultSCIONDAddress).Connect(context.Background())
 	if err != nil {
 		return nil, err
@@ -55,7 +55,7 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*snet.U
 
 	for _, dst := range dsts {
 		var dstState *PathsToDestination
-		if src.IA == dst.IA {
+		if src.IA == dst.ia {
 			if !enableBestEffort {
 				return nil, errors.New(fmt.Sprintf("Can only use best-effort traffic to destination %s", dst))
 			}

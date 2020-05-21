@@ -17,19 +17,15 @@
 
 #include "hercules.h"
 
-#define CACHELINE_SIZE 64
-#define SEND_QUEUE_ENTRY_SIZE 20
+#define SEND_QUEUE_ENTRY_SIZE 16
 #define SEND_QUEUE_ENTRIES_PER_UNIT (CACHELINE_SIZE / SEND_QUEUE_ENTRY_SIZE)
 
-// With this layout, 3 chunks fit into each cache line. Assumes a cache line size of 64 bytes.
+// With this layout, 4 chunks fit into each cache line. Assumes a cache line size of 64 bytes.
 //  sizeof(struct send_queue_unit) = 64
 struct send_queue_unit {
 	const struct hercules_path *paths[SEND_QUEUE_ENTRIES_PER_UNIT];
-	void *pkts[SEND_QUEUE_ENTRIES_PER_UNIT];
+	u32 path_framelen[SEND_QUEUE_ENTRIES_PER_UNIT];
 	u32 chunk_idx[SEND_QUEUE_ENTRIES_PER_UNIT];
-
-	// the above add up to 60 bytes, so the following comes in handy (as opposed to using NULL pointers):
-	u32 num_chunks;
 };
 
 // single producer, multi consumer queue
@@ -39,7 +35,6 @@ struct send_queue {
 	u32 size;
 	u32 head;
 	u32 tail;
-	u32 complete_count;
 };
 
 void init_send_queue(struct send_queue *queue, u32 num_entries);
