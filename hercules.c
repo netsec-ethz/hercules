@@ -1306,14 +1306,12 @@ produce_batch(const struct hercules_path **path_by_rcvr, const u32 *chunks, cons
 {
 	u32 chk;
 	u32 num_chunks_in_unit;
-	u32 num_units = 0; // having this as a local variable avoids false sharing
 	struct send_queue_unit *unit = NULL;
 	for(chk = 0; chk < num_chunks; chk++) {
 		if(unit == NULL) {
 			unit = send_queue_reserve(&send_queue);
 			num_chunks_in_unit = 0;
 			if(unit == NULL) {
-				debug_printf("producer blocked: queue is full");
 				continue;
 			}
 		}
@@ -1328,7 +1326,6 @@ produce_batch(const struct hercules_path **path_by_rcvr, const u32 *chunks, cons
 				unit->paths[num_chunks_in_unit] = NULL;
 			}
 			send_queue_push(&send_queue);
-			num_units++;
 			unit = NULL;
 		}
 	}
