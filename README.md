@@ -20,23 +20,30 @@ Option
   
    Requires:
     - gcc/clang
-    - linux kernel headers >= 4.8
-    - go >= 1.11
+    - linux kernel headers >= 5.0
+    - go >= 1.14.1
 
 
 ## Running
 
 > **WARNING**: network drivers seem to crash occasionally.
 
+> **WARNING**: due to the most recent changes on the branch `multicore`, the rate-limit `computation` is a bit off.
+  When setting the rate-limit with `-p`, keep this in mind and set a lower rate than you aim at.
+
 > **NOTE**: if hercules is aborted forcefully (e.g. while debugging), it can leave an XDP program loaded which will prevent starting again.
 						Run `ip link set dev <device> xdp off`.
 
 > **NOTE**: many things can go wrong, expect to diagnose things before getting it to work.
 
+> **NOTE**: Some devices use separate queues for copy and zero-copy mode (e.g. Mellanox).
+  Make sure to use queues that support the selected mode.
+  Additionally, you may need to postpone step 2 until the handshake has succeeded.
 
-1. Make sure that SCION endhost services (sciond, dispatcher) are configured and running on both sender and receiver machines
+1. Make sure that SCION endhost services (sciond, dispatcher) are configured and running on both sender and receiver machines.
+   For the most recent versions of Hercules, use a SCION version compatible to `v2020.03-scionlab`.
 
-1. Configure queue network interfaces to particular queue (if supported by device); in this example queue 0 is used.
+1. Configure queue network interfaces to particular queue (if supported by device); in this example queue 0 is used. 
 
     ```shell
     sudo ethtool -N <device> rx-flow-hash udp4 fn
@@ -56,11 +63,13 @@ Option
     sudo numactl -l --cpunodebind=netdev:<device> -- \
         ./hercules -i <device> -q 0 -l <sender addr> -d <receiver addr> -t path/to/file.bin
     ```
-
+   **Warning**: this command will attempt to send at a rate of 40 Gbps!
+   To start, or if your sender or receiver NIC is not fast enough, use `-p` to set a more reasonable rate-limit.
 
 * Both `<receiver addr>` and `<sender addr>` are SCION/IPv4 addresses with UDP port, e.g. `17-ffaa:0:1102,[172.16.0.1]:10000`
 * The `numactl` is optional but has a huge effect on performance on systems with multiple numa nodes.
-* See source code for additional options
+* See source code (or `-h`) for additional options
+* You should be able to omit `-l`
 
 
 ## Protocol
