@@ -27,14 +27,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/BurntSushi/toml"
 	log "github.com/inconshreveable/log15"
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/snet"
 	"net"
 	"os"
 	"os/signal"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -46,7 +45,6 @@ const (
 
 var (
 	activeInterface *net.Interface // activeInterface remembers the chosen interface for callbacks from C
-	localAddrRegexp = regexp.MustCompile(`^\[([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})]:([0-9]{1,5})$`)
 )
 
 func (i *arrayFlags) String() string {
@@ -58,170 +56,165 @@ func (i *arrayFlags) Set(value string) error {
 	return nil
 }
 
+func isFlagPassed(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
 func main() {
 	err := realMain()
 	if err != nil {
-		fmt.Println("Error:", err)
+		log.Error(err.Error())
 		os.Exit(1)
 	}
 }
 
 func realMain() error {
 	var (
-		dumpInterval     time.Duration
-		enablePCC        bool
-		enableBestEffort bool
-		enableSibra      bool
-		ifname           string
-		localAddrs       arrayFlags
-		localAddr        string
-		rxAddrs			 []*net.UDPAddr
-		maxRateLimit     int
-		mode             string
-		numPaths         int
-		queues			 []int
-		queueArgs        arrayFlags
-		remoteAddrs      arrayFlags
-		transmitFilename string
-		outputFilename   string
-		verbose          string
+		configFile     string
+		flags          Flags
+		senderConfig   HerculesSenderConfig
+		receiverConfig HerculesReceiverConfig
 	)
-	// TODO(matzf): proper flag parsing (mandatory arguments, enforce --receive or --transmit, ...)
-	flag.DurationVar(&dumpInterval, "n", time.Second, "Print stats at given interval")
-	flag.BoolVar(&enablePCC, "pcc", true, "Enable performance-oriented congestion control (PCC)")
-	flag.StringVar(&ifname, "i", "", "interface")
-	flag.Var(&localAddrs, "l", "local address")
-	flag.IntVar(&maxRateLimit, "p", 3333333, "Maximum allowed send rate in Packets per Second (default: 3'333'333, ~40Gbps)")
-	flag.StringVar(&mode, "m", "", "XDP socket bind mode (Zero copy: z; Copy mode: c)")
-	flag.Var(&queueArgs, "q", "Use queue n (specify a separate queue for each worker thread; default is one worker on queue 0)")
-	flag.Var(&remoteAddrs, "d", "destination host address(es); omit the IA part of the address to add a receiver IP to the previous destination")
-	flag.StringVar(&transmitFilename, "t", "", "transmit file (sender)")
-	flag.StringVar(&outputFilename, "o", "", "output file (receiver)")
-	flag.StringVar(&verbose, "v", "", "verbose output (from '' to vv)")
-	flag.IntVar(&numPaths, "np", 1, "Maximum number of different paths per destination to use at the same time")
-	flag.BoolVar(&enableBestEffort, "be", true, "Enable best-effort traffic")
-	flag.BoolVar(&enableSibra, "resv", false, "Enable COLIBRI bandwidth reservations")
+	flag.DurationVar(&flags.dumpInterval, "n", time.Second, "Print stats at given interval")
+	flag.BoolVar(&flags.enablePCC, "pcc", true, "Enable performance-oriented congestion control (PCC)")
+	flag.StringVar(&flags.ifname, "i", "", "interface")
+	flag.Var(&flags.localAddrs, "l", "local address")
+	flag.IntVar(&flags.maxRateLimit, "p", 3333333, "Maximum allowed send rate in Packets per Second (default: 3'333'333, ~40Gbps)")
+	flag.StringVar(&flags.mode, "m", "", "XDP socket bind mode (Zero copy: z; Copy mode: c)")
+	flag.Var(&flags.queueArgs, "q", "Use queue n (specify a separate queue for each worker thread; default is one worker on queue 0)")
+	flag.Var(&flags.remoteAddrs, "d", "destination host address(es); omit the ia part of the address to add a receiver IP to the previous destination")
+	flag.StringVar(&flags.transmitFilename, "t", "", "transmit file (sender)")
+	flag.StringVar(&flags.outputFilename, "o", "", "output file (receiver)")
+	flag.StringVar(&flags.verbose, "v", "", "verbose output (from '' to vv)")
+	flag.IntVar(&flags.numPaths, "np", 1, "Maximum number of different paths per destination to use at the same time")
+	flag.BoolVar(&flags.enableBestEffort, "be", true, "Enable best-effort traffic")
+	flag.BoolVar(&flags.enableSibra, "resv", false, "Enable COLIBRI bandwidth reservations")
+	flag.StringVar(&configFile, "c", "", "File to parse configuration from, you may overwrite any configuration using command line arguemnts")
 	flag.Parse()
 
-	if transmitFilename != "" {
-		if len(localAddrs) != 1 {
-			return errors.New("exactly one local address must be specified for sending")
+	if err := configureLogger(flags.verbose); err != nil {
+		return err
+	}
+
+	// decide whether to send or to receive based on flags
+	sendMode := false
+	recvMode := false
+	if isFlagPassed("t") {
+		sendMode = true
+	}
+	if isFlagPassed("o") {
+		recvMode = true
+	}
+	if sendMode && recvMode {
+		return errors.New("you can not pass -o and -t at the same time")
+	}
+
+	// parse config file, if provided
+	senderConfig.initializeDefaults()
+	receiverConfig.initializeDefaults()
+	if isFlagPassed("c") {
+		if _, err := toml.DecodeFile(configFile, &senderConfig); err != nil {
+			return err
 		}
-		localAddr = localAddrs[0]
-	} else if outputFilename != "" {
-		if len(localAddrs) < 1 {
-			return errors.New("at least one local address must be specified for receiving")
+		if _, err := toml.DecodeFile(configFile, &receiverConfig); err != nil {
+			return err
 		}
-		localAddr = localAddrs[0]
+	}
+
+	// if not clear yet, decide whether to send or receive based on config file
+	if !sendMode && !recvMode {
+		if senderConfig.Direction == "upload" {
+			sendMode = true
+		} else if senderConfig.Direction == "download" {
+			recvMode = true
+		} else if senderConfig.Direction == "" {
+			if senderConfig.TransmitFile != "" {
+				sendMode = true
+			}
+			if receiverConfig.OutputFile != "" {
+				recvMode = true
+			}
+			if sendMode && recvMode {
+				return errors.New("unclear whether to send or to receive, use -t or -o on the command line or set Direction in the configuration file")
+			}
+			if !sendMode && !recvMode {
+				return errors.New("unclear whether to send or to receive, use -t or -o on the command line or at least one of Direction, OutputFile and TransmitFile in the configuration file")
+			}
+		} else {
+			return fmt.Errorf("'%s' is not a valid value for Direction", senderConfig.Direction)
+		}
+	}
+
+	if sendMode {
+		if err := senderConfig.validateLoose(); err != nil {
+			return errors.New("in config file: " + err.Error())
+		}
+		if err := senderConfig.mergeFlags(&flags); err != nil {
+			return errors.New("on command line: " + err.Error())
+		}
+		if err := configureLogger(senderConfig.Verbosity); err != nil {
+			return err
+		}
+		if err := senderConfig.validateStrict(); err != nil {
+			return err
+		}
+		return mainTx(&senderConfig)
+	} else if recvMode {
+		if err := receiverConfig.validateLoose(); err != nil {
+			return errors.New("in config file: " + err.Error())
+		}
+		if err := receiverConfig.mergeFlags(&flags); err != nil {
+			return errors.New("on command line: " + err.Error())
+		}
+		if err := configureLogger(receiverConfig.Verbosity); err != nil {
+			return err
+		}
+		if err := receiverConfig.validateStrict(); err != nil {
+			return err
+		}
+		return mainRx(&receiverConfig)
 	} else {
-		return errors.New("exactly one of -t or -o needs to be specified")
+		// we should not end up here...
+		return errors.New("unclear whether to send or receive")
 	}
+}
 
-	queues = make([]int, 0, len(queueArgs))
-	for _, qs := range(queueArgs) {
-		q, err := strconv.ParseInt(qs, 10, 32)
-		if err != nil {
-			return errors.New("could not parse queue: " + err.Error())
-		}
-		queues = append(queues, int(q))
-	}
-
-	if !enableBestEffort && !enableSibra {
-		return errors.New("best-effort traffic and COLIBRI bandwidth reservations both disabled, don't know how to send data")
-	}
-
+func configureLogger(verbosity string) error {
 	// Setup logger
 	h := log.CallerFileHandler(log.StdoutHandler)
-	if verbose == "vv" {
+	if verbosity == "vv" {
 		log.Root().SetHandler(log.LvlFilterHandler(log.LvlDebug, h))
-	} else if verbose == "v" {
+	} else if verbosity == "v" {
 		log.Root().SetHandler(log.LvlFilterHandler(log.LvlInfo, h))
-	} else if verbose == "" {
+	} else if verbosity == "" {
 		log.Root().SetHandler(log.LvlFilterHandler(log.LvlError, h))
 	} else {
 		return errors.New("-v can only be vv, v or empty")
 	}
-
-	iface, err := net.InterfaceByName(ifname)
-	if err != nil {
-		return err
-	}
-	if iface.Flags&net.FlagUp == 0 {
-		return errors.New("interface is not up")
-	}
-
-	local, err := snet.ParseUDPAddr(localAddr)
-	if err != nil {
-		return err
-	}
-	if local.Host.Port == 0 {
-		return errors.New("you must specify a source port")
-	}
-
-	err = checkAssignedIP(iface, local.Host.IP)
-	if err != nil {
-		return err
-	}
-
-	xdpMode := getXDPMode(mode)
-
-	if transmitFilename != "" {
-		var dsts []*Destination
-		var dst *Destination = nil
-		for _, remoteAddr := range remoteAddrs {
-			match := localAddrRegexp.FindStringSubmatch(remoteAddr)
-			if match != nil { // if IP (-d [...]:...): add to previous destination
-				if dst == nil {
-					return errors.New("cannot add IP address to destination: no previous destination")
-				}
-				port, err := strconv.ParseInt(match[2], 10, 32)
-				if err != nil {
-					return err
-				}
-				dst.hostAddrs = append(dst.hostAddrs, &net.UDPAddr{
-					Port: int(port),
-					IP: net.ParseIP(match[1]),
-				})
-			} else { // else, if full SCION address: add new destination
-				remote, err := snet.ParseUDPAddr(remoteAddr)
-				if err != nil {
-					return err
-				}
-				if remote.Host.Port == 0 {
-					return errors.New("you must specify a destination port")
-				}
-				dst = &Destination{
-					ia: remote.IA,
-					hostAddrs: []*net.UDPAddr{remote.Host},
-				}
-				dsts = append(dsts, dst)
-			}
-		}
-		if len(dsts) == 0 {
-			return errors.New("you must specify at least one destination")
-		}
-		return mainTx(transmitFilename, local, dsts, iface, queues, maxRateLimit, enablePCC, enableBestEffort, enableSibra, xdpMode, dumpInterval, numPaths)
-	}
-
-	if len(localAddrs) != len(queueArgs) {
-		log.Warn("You should specify exactly one queue for each receiving address to have a separate receiving thread for each address")
-	}
-	rxAddrs = make([]*net.UDPAddr, len(localAddrs))
-	for a, address := range localAddrs {
-		parsedAddr, err := snet.ParseUDPAddr(address)
-		if err != nil {
-			return err
-		}
-		if local.IA != parsedAddr.IA {
-			return errors.New("all local addresses must belong to the same IA")
-		}
-		rxAddrs[a] = parsedAddr.Host;
-	}
-	return mainRx(outputFilename, local.IA, rxAddrs, iface, queues, xdpMode, dumpInterval)
+	return nil
 }
 
-func mainTx(filename string, src *snet.UDPAddr, dsts []*Destination, iface *net.Interface, queues []int, maxRateLimit int, enablePCC, enableBestEffort, enableSibra bool, xdpMode int, dumpInterval time.Duration, numPaths int) (err error) {
-	pm, err := initNewPathManager(numPaths, iface, dsts, src, enableBestEffort, enableSibra, uint64(maxRateLimit)*uint64(C.ETHER_SIZE))
+// Assumes config to be strictly valid.
+func mainTx(config *HerculesSenderConfig) (err error) {
+	// since config is valid, there can be no errors here:
+	localAddress, _ := snet.ParseUDPAddr(config.LocalAddress)
+	iface, _ := net.InterfaceByName(config.Interface)
+	destinations := config.destinations()
+
+	pm, err := initNewPathManager(
+		config.NumPathsPerDest,
+		iface,
+		destinations,
+		localAddress,
+		config.EnableBestEffort,
+		config.EnableReservations,
+		uint64(config.RateLimit)*uint64(config.MTU))
 	if err != nil {
 		return err
 	}
@@ -231,26 +224,30 @@ func mainTx(filename string, src *snet.UDPAddr, dsts []*Destination, iface *net.
 		return errors.New("some destinations are unreachable, abort")
 	}
 
-	herculesInit(iface, src.IA, []*net.UDPAddr{src.Host}, queues)
+	herculesInit(iface, localAddress.IA, []*net.UDPAddr{localAddress.Host}, config.Queues)
 	pm.pushPaths()
 
 	go pm.syncPathsToC()
-	go statsDumper(true, dumpInterval)
+	go statsDumper(true, config.DumpInterval)
 	go cleanupOnSignal()
-	stats := herculesTx(filename, dsts, pm, maxRateLimit, enablePCC, xdpMode)
+	stats := herculesTx(config.TransmitFile, destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode())
 	printSummary(stats)
 	return nil
 }
 
-func mainRx(filename string, localIA addr.IA, local []*net.UDPAddr, iface *net.Interface, queues []int, xdpMode int, dumpInterval time.Duration) error {
+// Assumes config to be strictly valid.
+func mainRx(config *HerculesReceiverConfig) error {
+	// since config is valid, there can be no errors here:
+	iface, _ := net.InterfaceByName(config.Interface)
+	localAddresses := config.localAddresses()
 
-	filenamec := C.CString(filename)
+	filenamec := C.CString(config.OutputFile)
 	defer C.free(unsafe.Pointer(filenamec))
 
-	herculesInit(iface, localIA, local, queues)
-	go statsDumper(false, dumpInterval)
+	herculesInit(iface, config.LocalAddresses.IA, localAddresses, config.Queues)
+	go statsDumper(false, config.DumpInterval)
 	go cleanupOnSignal()
-	stats := C.hercules_rx(filenamec, C.int(xdpMode))
+	stats := C.hercules_rx(filenamec, C.int(config.getXDPMode()))
 	printSummary(stats)
 	return nil
 }
@@ -262,18 +259,6 @@ func cleanupOnSignal() {
 	<-c
 	C.hercules_close()
 	os.Exit(128 + 15) // Customary exit code after SIGTERM
-}
-
-func getXDPMode(m string) (mode int) {
-	switch m {
-	case "z":
-		mode = C.XDP_ZEROCOPY
-	case "c":
-		mode = C.XDP_COPY
-	default:
-		mode = 0
-	}
-	return mode
 }
 
 func herculesInit(iface *net.Interface, ia addr.IA, local []*net.UDPAddr, queues []int) {
@@ -297,19 +282,4 @@ func herculesTx(filename string, destinations []*Destination, pm *PathManager, m
 		cDests[d].port = localC[0].port
 	}
 	return C.hercules_tx(cFilename, &cDests[0], &pm.cPathsPerDest[0], C.int(len(destinations)), &pm.cNumPathsPerDst[0], pm.cMaxNumPathsPerDst, C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
-}
-
-func checkAssignedIP(iface *net.Interface, localAddr net.IP) (err error) {
-	// Determine src IP matches information on Interface
-	interfaceAddrs, err := iface.Addrs()
-	if err != nil {
-		return
-	}
-	for _, ifAddr := range interfaceAddrs {
-		ip, ok := ifAddr.(*net.IPNet)
-		if ok && ip.IP.To4() != nil && ip.IP.To4().Equal(localAddr) {
-			return nil
-		}
-	}
-	return errors.New("interface does not have the specified IPv4 address")
 }

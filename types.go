@@ -89,3 +89,56 @@ type PathsToDestination struct {
 	ExtnUpdated atomic.Bool
 	paths       []PathMeta // nil indicates that the destination is in the same AS as the sender and we can use an empty path
 }
+
+type Flags struct {
+	dumpInterval     time.Duration
+	enablePCC        bool
+	ifname           string
+	localAddrs       arrayFlags
+	maxRateLimit     int
+	mode             string
+	queueArgs        arrayFlags
+	remoteAddrs      arrayFlags
+	transmitFilename string
+	outputFilename   string
+	verbose          string
+	numPaths         int
+	enableBestEffort bool
+	enableSibra      bool
+}
+
+type HerculesGeneralConfig struct {
+	Direction    string
+	DumpInterval time.Duration
+	Interface    string
+	Mode         string
+	Queues       []int
+	Verbosity    string
+}
+
+type SiteConfig struct {
+	IA        addr.IA
+	HostAddrs []string
+	NumPaths  int        // TODO implement feature
+	PathSpec  [][]string // TODO implement feature
+}
+
+type HerculesReceiverConfig struct {
+	HerculesGeneralConfig
+	OutputFile      string
+	LocalAddresses  SiteConfig
+	ConfigureQueues bool // TODO implement feature
+}
+
+type HerculesSenderConfig struct {
+	HerculesGeneralConfig
+	TransmitFile       string
+	MTU                int
+	EnableReservations bool
+	EnableBestEffort   bool
+	EnablePCC          bool
+	RateLimit          int
+	LocalAddress       string
+	NumPathsPerDest    int
+	Destinations       []SiteConfig
+}

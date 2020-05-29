@@ -44,6 +44,10 @@ import (
 	"unsafe"
 )
 
+const XDP_ZEROCOPY = C.XDP_ZEROCOPY
+const XDP_COPY = C.XDP_COPY
+const minFrameSize = int(C.HERCULES_MAX_HEADERLEN) + 212 // sizeof(struct rbudp_initial_pkt) + rbudp_headerlen
+
 // HerculesGetReplyPath creates a reply path header for the packet header in headerPtr with given length.
 // Returns 0 iff successful.
 // This function is exported to C and called to obtain a reply path to send NACKs from the receiver (slow path).
@@ -150,8 +154,8 @@ func toCPath(from []*HerculesPathHeader, to *C.struct_hercules_path, replaced, e
 			panic(fmt.Sprintf("Header versions not all of equal length, can't invoke hercules C API."))
 		}
 		// XXX(matzf): is there a nicer way to do this?
-		var headerCopy C.struct_hercules_path_header // accessing indices on a C array does not work, so we make a local copy...
-		curHeaderC := headersC + uintptr(i) * unsafe.Sizeof(headerCopy) // ... and implement the index logic ourselves
+		var headerCopy C.struct_hercules_path_header                  // accessing indices on a C array does not work, so we make a local copy...
+		curHeaderC := headersC + uintptr(i)*unsafe.Sizeof(headerCopy) // ... and implement the index logic ourselves
 		C.memcpy(unsafe.Pointer(&headerCopy.header),
 			unsafe.Pointer(&header.Header[0]),
 			C.ulong(len(header.Header)))
