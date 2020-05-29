@@ -25,7 +25,6 @@ package main
 import "C"
 import (
 	"context"
-	"errors"
 	"fmt"
 	log "github.com/inconshreveable/log15"
 	"github.com/scionproto/scion/go/lib/pathmgr"
@@ -57,7 +56,7 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*Destin
 		var dstState *PathsToDestination
 		if src.IA == dst.ia {
 			if !enableBestEffort {
-				return nil, errors.New(fmt.Sprintf("Can only use best-effort traffic to destination %s", dst))
+				return nil, fmt.Errorf("Can only use best-effort traffic to destination %s", dst)
 			}
 			if enableSibra {
 				log.Warn(fmt.Sprintf("Can not use bandwidth reservation to destination %s", dst))

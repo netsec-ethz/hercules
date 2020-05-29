@@ -238,7 +238,7 @@ func readLines(conn net.Conn, events chan *Event, stop chan struct{}, sresvs *sy
 			default:
 				events <- &Event{
 					Code: ExtnExpired,
-					Error: errors.New(fmt.Sprintf("Could not parse line: %s", *line.line)),
+					Error: fmt.Errorf("could not parse line: %s", *line.line),
 				}
 			}
 		}
