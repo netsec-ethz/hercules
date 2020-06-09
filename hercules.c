@@ -2168,8 +2168,22 @@ void hercules_init(int ifindex, const ia local_ia_, const struct local_addr *loc
 static struct hercules_stats tx_stats(struct sender_state *t)
 {
 	u32 completed_chunks = 0;
-	for(u32 r = 0; r < tx_state->num_receivers; r++) {
+	u64 rate_limit = 0;
+	for(u32 r = 0; r < t->num_receivers; r++) {
+		const struct sender_state_per_receiver *receiver = &t->receiver[r];
 		completed_chunks += t->receiver[r].acked_chunks.num_set;
+		for(u8 p = 0; p < receiver->num_paths; p++) {
+			struct hercules_path *path = &receiver->paths[p];
+			if(path->max_bps == 0) { // best-effort
+				if(receiver->cc_states == NULL) { // no path-specific rate-limit
+					rate_limit += t->rate_limit;
+				} else { // PCC provided limit
+					rate_limit += receiver->cc_states[p].max_rate_limit;
+				}
+			} else { // SIBRA
+				rate_limit += path->max_bps;
+			}
+		}
 	}
 	return (struct hercules_stats) {
 			.start_time = t->start_time,
@@ -2182,7 +2196,7 @@ static struct hercules_stats tx_stats(struct sender_state *t)
 			.chunklen = t->chunklen,
 			.total_chunks = t->total_chunks * t->num_receivers,
 			.completed_chunks = completed_chunks,
-			.rate_limit = t->rate_limit
+			.rate_limit = umin64(t->rate_limit, rate_limit),
 	};
 }
 
