@@ -248,7 +248,7 @@ func mainRx(config *HerculesReceiverConfig) error {
 	herculesInit(iface, config.LocalAddresses.IA, localAddresses, config.Queues)
 	go statsDumper(false, config.DumpInterval)
 	go cleanupOnSignal()
-	stats := C.hercules_rx(filenamec, C.int(config.getXDPMode()))
+	stats := C.hercules_rx(filenamec, C.int(config.getXDPMode()), C.bool(config.ConfigureQueues))
 	printSummary(stats)
 	return nil
 }

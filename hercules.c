@@ -236,6 +236,8 @@ static int *queues;
 static ia local_ia; // local as in "our IA"
 static int num_local_addrs; // local as in "relative to our IA"
 static struct local_addr *local_addrs;
+static int *ethtool_rules = NULL; // rule IDs configured on receiver side
+static int num_ethtool_rules = 0;
 
 static u32 prog_id;
 
@@ -312,10 +314,13 @@ static void remove_xdp_program(void)
 		printf("program on interface changed, not removing\n");
 }
 
+static void unconfigure_queues();
+
 static void __exit_with_error(int error, const char *file, const char *func, int line)
 {
 	fprintf(stderr, "%s:%s:%i: errno: %d/\"%s\"\n", file, func, line, error, strerror(error));
 	remove_xdp_program();
+	unconfigure_queues();
 	exit(EXIT_FAILURE);
 }
 
@@ -1850,6 +1855,72 @@ static void rx_get_rtt_estimate(void *arg)
 	}
 }
 
+static void configure_queues()
+{
+	ethtool_rules = calloc(num_local_addrs, sizeof(int));
+	FOREACH(local_addr, l) {
+		debug_printf("map UDP4 flow to %d.%d.%d.%d to queue %d",
+					 (u8) (local_addrs[l].ip),
+					 (u8) (local_addrs[l].ip >> 8u),
+					 (u8) (local_addrs[l].ip >> 16u),
+					 (u8) (local_addrs[l].ip >> 24u),
+					 queues[l % num_queues]
+		);
+
+		char cmd[1024];
+		int cmd_len = snprintf(cmd, 1024, "ethtool -N %s flow-type udp4 dst-ip %d.%d.%d.%d action %d",
+							   opt_ifname,
+							   (u8) (local_addrs[l].ip),
+							   (u8) (local_addrs[l].ip >> 8u),
+							   (u8) (local_addrs[l].ip >> 16u),
+							   (u8) (local_addrs[l].ip >> 24u),
+							   queues[l % num_queues]
+		);
+		if(cmd_len > 1023) {
+			printf("could not configure queue %d - command too long, abort\n", queues[l % num_queues]);
+		}
+
+		FILE *proc = popen(cmd, "r");
+		int rule_id;
+		int num_parsed = fscanf(proc, "Added rule with ID %d", &rule_id);
+		int ret = pclose(proc);
+		if(ret != 0) {
+			printf("could not configure queue %d, abort\n", queues[l % num_queues]);
+			exit_with_error(ret);
+		}
+		if(num_parsed != 1) {
+			printf("could not configure queue %d, abort\n", queues[l % num_queues]);
+			exit_with_error(EXIT_FAILURE);
+		}
+		ethtool_rules[num_ethtool_rules] = rule_id;
+		num_ethtool_rules++;
+	}
+}
+
+static void unconfigure_queues() {
+	FOREACH(ethtool_rule, r) {
+		char cmd[1024];
+		int cmd_len = snprintf(cmd, 1024, "ethtool -N %s delete %d", opt_ifname, ethtool_rules[r]);
+		if(cmd_len > 1023) { // This will never happen as the command to configure is strictly longer than this one
+			printf("could not unconfigure rule %d - command too long, abort\n", r);
+		}
+		int ret = system(cmd);
+		if (ret < 0) {
+			exit_with_error(-ret);
+		}
+		if (ret > 0) {
+			exit_with_error(ret);
+		}
+	}
+}
+
+static void rx_rtt_and_configure(void *arg)
+{
+	rx_get_rtt_estimate(arg);
+	// as soon as we got the RTT estimate, we are ready to set up the queues
+	configure_queues();
+}
+
 static void rx_send_cts_ack(int sockfd)
 {
 	struct hercules_path path;
@@ -2370,8 +2441,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	return stats;
 }
 
-struct hercules_stats
-hercules_rx(const char *filename, int xdp_mode)
+struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues)
 {
 	// Open RAW socket to receive and send control messages on
 	// Note: this socket will not receive any packets once the XSK has been
@@ -2384,7 +2454,12 @@ hercules_rx(const char *filename, int xdp_mode)
 	if(!rx_accept(sockfd)) {
 		exit_with_error(EBADMSG);
 	}
-	pthread_t rtt_estimator = start_thread(rx_get_rtt_estimate, (void *)(u64)sockfd);
+	pthread_t rtt_estimator;
+	if(configure_queues) {
+		rtt_estimator = start_thread(rx_rtt_and_configure, (void *)(u64)sockfd);
+	} else {
+		rtt_estimator = start_thread(rx_get_rtt_estimate, (void *)(u64)sockfd);
+	}
 	debug_printf("Filesize %lu Bytes, %u total chunks of size %u.",
 				 rx_state->filesize, rx_state->total_chunks, rx_state->chunklen);
 	printf("Preparing file for receive..."); fflush(stdout);
@@ -2425,6 +2500,7 @@ hercules_rx(const char *filename, int xdp_mode)
 
 	struct hercules_stats stats = rx_stats(rx_state);
 
+	unconfigure_queues();
 	FOREACH(queue, q) {
 		close_xsk(xsks[q]);
 	}
@@ -2438,4 +2514,5 @@ void hercules_close()
 {
 	// Only essential cleanup.
 	remove_xdp_program();
+	unconfigure_queues();
 }

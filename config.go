@@ -32,6 +32,7 @@ import (
 
 var (
 	localAddrRegexp = regexp.MustCompile(`^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})$`)
+	configurableInterfaceRegexp = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
 )
 
 // receiver related
@@ -103,6 +104,12 @@ func (config *HerculesReceiverConfig) validateLoose() error {
 			log.Warn("you should specify exactly one queue for each receiving address to have a separate receiving thread for each address")
 		}
 	}
+
+	if config.ConfigureQueues {
+		if !configurableInterfaceRegexp.MatchString(config.Interface) {
+			return fmt.Errorf("cannot configure interface '%s' - escaping not implemented", config.Interface)
+		}
+	}
 	return nil
 }
 
@@ -120,6 +127,16 @@ func (config *HerculesReceiverConfig) validateStrict() error {
 	}
 	if config.OutputFile == "" {
 		return errors.New("no output file specified")
+	}
+
+	if config.ConfigureQueues {
+		numQueues := len(config.Queues)
+		numAddrs := len(config.LocalAddresses.HostAddrs)
+		if numQueues > numAddrs {
+			log.Warn(fmt.Sprintf("can not use all queues: %d queues and %d addresses given", numQueues, numAddrs))
+		} else if numAddrs%numQueues != 0 {
+			log.Warn(fmt.Sprintf("can not distribute flows evenly across queues: number of queues (%d) does not divide number of addresses (%d)", numQueues, numAddrs))
+		}
 	}
 	return nil
 }
