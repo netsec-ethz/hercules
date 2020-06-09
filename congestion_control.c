@@ -20,7 +20,6 @@ struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 total_chunks,
 		struct ccontrol_state *cc_state = &cc_states[i];
 		cc_state->max_rate_limit = max_rate_limit;
 		cc_state->total_num_paths = total_num_paths;
-		bitset__create(&cc_state->mi_acked_chunks, total_chunks);
 
 		continue_ccontrol(cc_state);
 	}
@@ -43,7 +42,8 @@ void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt) {
 	// restart current MI
 	cc_state->mi_start = get_nsecs();
 	cc_state->mi_tx_npkts = 0;
-	bitset__reset(&cc_state->mi_acked_chunks);
+	cc_state->total_acked_chunks += cc_state->mi_acked_chunks;
+	cc_state->mi_acked_chunks = 0;
 }
 
 void terminate_ccontrol(struct ccontrol_state *cc_state) {
@@ -69,9 +69,6 @@ void kick_ccontrol(struct ccontrol_state *cc_state) {
 }
 
 void destroy_ccontrol_state(struct ccontrol_state *cc_states, size_t num_paths) {
-	for (size_t i = 0; i < num_paths; i++) {
-		bitset__destroy(&cc_states[i].mi_acked_chunks);
-	}
 	free(cc_states);
 }
 

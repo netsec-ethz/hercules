@@ -254,10 +254,18 @@ func (config *HerculesSenderConfig) validateLoose() error {
 		}
 	}
 
+	if config.NumPathsPerDest > maxPathsPerReceiver {
+		return fmt.Errorf("can use at most %d paths per destination; configured limit (%d) too large", maxPathsPerReceiver, config.NumPathsPerDest)
+	}
+
 	// validate destinations
 	for d, _ := range config.Destinations {
 		if (config.Destinations[d].IA == addr.IA{}) {
 			return errors.New("invalid IA")
+		}
+
+		if config.Destinations[d].NumPaths > maxPathsPerReceiver {
+			return fmt.Errorf("can use at most %d paths per destination; max for destination %d is too large (%d)", maxPathsPerReceiver, d, config.Destinations[d].NumPaths)
 		}
 
 		for _, address := range config.Destinations[d].HostAddrs {

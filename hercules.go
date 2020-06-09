@@ -41,6 +41,7 @@ import (
 
 const (
 	etherLen int = 1500
+	maxPathsPerReceiver int = 126 // the maximum path index needs to fit into a uint8; best-effort and SIBRA paths get separate path indices
 )
 
 var (
