@@ -194,8 +194,6 @@ func toCIA(in addr.IA) C.ia {
 }
 
 func toCIntArray(in []int) []C.int {
-	print(in)
-	print(len(in))
 	out := make([]C.int, 0, len(in))
 	for _, i := range in {
 		out = append(out, C.int(i))
