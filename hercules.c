@@ -68,7 +68,7 @@
 #define FOREACH(type, key) for(int key = 0; key < num_ ## type ## s; key++)
 
 static const int rbudp_headerlen = 4;
-static const int tx_handshake_retries = 5;
+static const u64 tx_handshake_timeout = 5e9;
 
 
 // exported from hercules.go
@@ -951,7 +951,7 @@ static bool tx_handshake(int sockfd)
 {
 	bool succeeded[tx_state->num_receivers];
 	memset(succeeded, 0, sizeof(succeeded));
-	for(int i = 0; i < tx_handshake_retries; ++i) {
+	for(u64 start = get_nsecs(); start >= get_nsecs() - tx_handshake_timeout;) {
 		int await = 0;
 		for(u32 r = 0; r < tx_state->num_receivers; r++) {
 			if(!succeeded[r]) {
@@ -977,7 +977,7 @@ static bool tx_handshake(int sockfd)
 		}
 		debug_printf("Timeout, retry.");
 	}
-	fprintf(stderr, "ERR: timeout during handshake. Gave up after %i tries.\n", tx_handshake_retries);
+	fprintf(stderr, "ERR: timeout during handshake. Gave up after %.0f seconds.\n", tx_handshake_timeout / 1e9);
 	return false;
 }
 
