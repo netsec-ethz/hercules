@@ -204,6 +204,7 @@ static u32 pcc_control_adjust(struct ccontrol_state *cc_state, float utility)
 	} else {
 		// Update state: Adjust -> Decision
 		cc_state->state =  pcc_decision;
+		cc_state->adjust_iter = 0;
 		return cc_state->prev_rate;
 	}
 }
