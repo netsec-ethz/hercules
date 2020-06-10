@@ -46,7 +46,7 @@ import (
 
 const XDP_ZEROCOPY = C.XDP_ZEROCOPY
 const XDP_COPY = C.XDP_COPY
-const minFrameSize = int(C.HERCULES_MAX_HEADERLEN) + 212 // sizeof(struct rbudp_initial_pkt) + rbudp_headerlen
+const minFrameSize = int(C.HERCULES_MAX_HEADERLEN) + 213 // sizeof(struct rbudp_initial_pkt) + rbudp_headerlen
 
 // HerculesGetReplyPath creates a reply path header for the packet header in headerPtr with given length.
 // Returns 0 iff successful.
