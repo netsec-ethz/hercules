@@ -17,15 +17,16 @@
 
 #include "hercules.h"
 
-#define SEND_QUEUE_ENTRY_SIZE 16
+#define SEND_QUEUE_ENTRY_SIZE 6
 #define SEND_QUEUE_ENTRIES_PER_UNIT (CACHELINE_SIZE / SEND_QUEUE_ENTRY_SIZE)
 
-// With this layout, 4 chunks fit into each cache line. Assumes a cache line size of 64 bytes.
+// With this layout, 10 chunks fit into each cache line. Assumes a cache line size of 64 bytes.
 //  sizeof(struct send_queue_unit) = 64
 struct send_queue_unit {
-	u32 rcvr[SEND_QUEUE_ENTRIES_PER_UNIT];
 	u32 chunk_idx[SEND_QUEUE_ENTRIES_PER_UNIT];
+	u8 rcvr[SEND_QUEUE_ENTRIES_PER_UNIT];
 	u8 paths[SEND_QUEUE_ENTRIES_PER_UNIT];
+	char a; // force padding to 64 bytes
 };
 
 // single producer, multi consumer queue

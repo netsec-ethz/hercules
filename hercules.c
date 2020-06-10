@@ -1343,7 +1343,7 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 }
 
 static void
-produce_batch(const u8 *path_by_rcvr, const u32 *chunks, const u32 *rcvr_by_chunk, u32 num_chunks)
+produce_batch(const u8 *path_by_rcvr, const u32 *chunks, const u8 *rcvr_by_chunk, u32 num_chunks)
 {
 	u32 chk;
 	u32 num_chunks_in_unit;
@@ -1535,7 +1535,7 @@ static void tx_only()
 	memset(round, 0, sizeof(round));
 #endif
 	u32 chunks[BATCH_SIZE];
-	u32 chunk_rcvr[BATCH_SIZE];
+	u8 chunk_rcvr[BATCH_SIZE];
 	u32 max_chunks_per_rcvr[tx_state->num_receivers];
 	u32 chunk_idx_per_rcvr[tx_state->num_receivers];
 	memset(chunk_idx_per_rcvr, 0, sizeof(chunk_idx_per_rcvr));
