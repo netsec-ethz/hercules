@@ -253,6 +253,7 @@ static size_t prev_tx_npkts;
 static size_t rx_npkts;
 
 static bool running;
+static int ether_size;
 
 
 /**
@@ -821,13 +822,13 @@ static void tx_recv_acks(int sockfd)
 	struct timeval to = {.tv_sec = 0, .tv_usec = 100};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
-	char buf[ETHER_SIZE];
+	char buf[ether_size];
 	while(!tx_acked_all(tx_state)) {
 		const char *payload;
 		int payloadlen;
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
 		const struct udphdr *udphdr;
-		if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
+		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
 			const struct rbudp_ack_pkt *ack = (const struct rbudp_ack_pkt *) payload;
 			if(ack->num_acks == 0) { // received a PCC feedback
 				tx_register_pcc_feedback((struct pcc_feedback *) payload,
@@ -880,13 +881,13 @@ static bool tx_await_cts(int sockfd)
 	struct timeval to = {.tv_sec = 20, .tv_usec = 0};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
-	char buf[ETHER_SIZE];
+	char buf[ether_size];
 	const char *payload;
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
 	for(u32 i = 0; i < tx_state->num_receivers; ++i) {
-		if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
+		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
 			if(tx_handle_cts(payload, rcvr_by_src_address(scionaddrhdr, udphdr))) {
 				received++;
 				if(received >= tx_state->num_receivers) {
@@ -900,7 +901,7 @@ static bool tx_await_cts(int sockfd)
 
 static void tx_send_handshake_ack(int sockfd, u32 rcvr)
 {
-	char buf[ETHER_SIZE];
+	char buf[ether_size];
 	struct hercules_path *path = &tx_state->receiver[rcvr].paths[0];
 	void *rbudp_pkt = mempcpy(buf, path->headers[0].header, path->headerlen);
 
@@ -930,10 +931,10 @@ static bool tx_await_rtt_ack(int sockfd, const struct scionaddrhdr_ipv4 **sciona
 	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
-	char buf[ETHER_SIZE];
+	char buf[ether_size];
 	const char *payload;
 	int payloadlen;
-	if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, scionaddrhdr, udphdr)) {
+	if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, scionaddrhdr, udphdr)) {
 		struct rbudp_initial_pkt parsed_pkt;
 		u32 rcvr = rcvr_by_src_address(*scionaddrhdr, *udphdr);
 		if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
@@ -962,7 +963,7 @@ static void
 tx_send_initial(int sockfd, const struct hercules_path *path, size_t filesize, u32 chunklen, unsigned long timestamp,
 				u32 path_index, bool set_return_path)
 {
-	char buf[ETHER_SIZE];
+	char buf[ether_size];
 	void *rbudp_pkt = mempcpy(buf, path->headers[0].header, path->headerlen);
 
 	struct rbudp_initial_pkt pld = {
@@ -1236,7 +1237,7 @@ static void update_hercules_tx_paths(void)
 				receiver->paths[p].max_bps = shd_path->max_bps;
 			}
 
-			u32 max_pps = receiver->paths[p].max_bps / ETHER_SIZE;
+			u32 max_pps = receiver->paths[p].max_bps / ether_size;
 			if(receiver->sibra_states[p].max_pps != max_pps) {
 				if(receiver->sibra_states[p].max_pps < max_pps) {
 					// We got more bandwidth, start new MI to profit immediately
@@ -1797,7 +1798,7 @@ static void rx_send_rtt_ack(int sockfd, struct rbudp_initial_pkt *pld)
 		return;
 	}
 
-	char buf[ETHER_SIZE];
+	char buf[ether_size];
 	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, (char *) pld, sizeof(*pld), path.payloadlen);
@@ -1821,11 +1822,11 @@ rx_handle_initial(int sockfd, struct rbudp_initial_pkt *initial, const char *buf
 
 static bool rx_accept(int sockfd)
 {
-	char buf[ETHER_SIZE];
+	char buf[ether_size];
 	while(true) { // Wait for well formed startup packet
 		const char *payload;
 		int payloadlen;
-		if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, NULL, NULL)) {
+		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, NULL, NULL)) {
 			struct rbudp_initial_pkt parsed_pkt;
 			if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
 				rx_state = make_rx_state(parsed_pkt.filesize, parsed_pkt.chunklen, sockfd);
@@ -1842,12 +1843,12 @@ static bool rx_accept(int sockfd)
 static void rx_get_rtt_estimate(void *arg)
 {
 	int sockfd = (int) (u64) arg;
-	char buf[ETHER_SIZE];
+	char buf[ether_size];
 	const char *payload;
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
-	if(recv_rbudp_control_pkt(sockfd, buf, ETHER_SIZE, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
+	if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
 		u64 now = get_nsecs();
 		rx_state->handshake_rtt = (now - rx_state->cts_sent_at) / 1000;
 	} else {
@@ -1929,7 +1930,7 @@ static void rx_send_cts_ack(int sockfd)
 		return;
 	}
 
-	char buf[ETHER_SIZE];
+	char buf[ether_size];
 	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
 	struct rbudp_ack_pkt ack;
@@ -1951,7 +1952,7 @@ static void rx_send_acks(int sockfd)
 		return;
 	}
 
-	char buf[ETHER_SIZE];
+	char buf[ether_size];
 	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
 	// XXX: could write ack payload directly to buf, but
@@ -1995,7 +1996,7 @@ static void rx_send_pcc_feedback(int sockfd)
 		return;
 	}
 
-	char buf[ETHER_SIZE];
+	char buf[ether_size];
 	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
 	// XXX: could write fbk payload directly to buf, but
@@ -2204,8 +2205,17 @@ static void *tx_p(__attribute__ ((unused)) void *arg)
 	return NULL;
 }
 
-void hercules_init(int ifindex, const ia local_ia_, const struct local_addr *local_addrs_, int num_local_addrs_, int queues_[], int num_queues_)
+void hercules_init(int ifindex, const ia local_ia_, const struct local_addr *local_addrs_, int num_local_addrs_,
+				   int queues_[], int num_queues_, int mtu)
 {
+	if(HERCULES_MAX_HEADERLEN + sizeof(struct rbudp_initial_pkt) + rbudp_headerlen > (size_t)mtu) {
+		printf("MTU too small (min: %lu, given: %d)",
+			   HERCULES_MAX_HEADERLEN + sizeof(struct rbudp_initial_pkt) + rbudp_headerlen,
+			   mtu
+		);
+		exit_with_error(EINVAL);
+	}
+	ether_size = mtu;
 	num_queues = num_queues_;
 	queues = calloc(num_queues, sizeof(*queues));
 	memcpy(queues, queues_, sizeof(*queues) * num_queues);

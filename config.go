@@ -43,6 +43,7 @@ func (config *HerculesReceiverConfig) initializeDefaults() {
 		DumpInterval: 1 * time.Second,
 		Interface:    "",
 		Mode:         "",
+		MTU: 		  1500,
 		Queues:       []int{0},
 		Verbosity:    "",
 	}
@@ -196,6 +197,9 @@ func (config *HerculesReceiverConfig) mergeFlags(flags *Flags) error {
 	if isFlagPassed("v") {
 		config.Verbosity = flags.verbose
 	}
+	if isFlagPassed("mtu") {
+		config.MTU = flags.mtu
+	}
 	return nil
 }
 
@@ -218,11 +222,11 @@ func (config *HerculesSenderConfig) initializeDefaults() {
 		DumpInterval: 1 * time.Second,
 		Interface:    "",
 		Mode:         "",
+		MTU: 		  1500,
 		Queues:       []int{0},
 		Verbosity:    "",
 	}
 	config.TransmitFile = ""
-	config.MTU = 1500
 	config.EnableReservations = false
 	config.EnableBestEffort = true
 	config.EnablePCC = true
@@ -251,10 +255,6 @@ func (config *HerculesSenderConfig) validateLoose() error {
 		if stat.IsDir() {
 			return errors.New("file to transmit is a directory")
 		}
-	}
-
-	if config.MTU < minFrameSize {
-		return fmt.Errorf("MTU too small: %d < %d", config.MTU, minFrameSize)
 	}
 
 	if config.RateLimit < 100 {
@@ -405,6 +405,9 @@ func (config *HerculesSenderConfig) mergeFlags(flags *Flags) error {
 	if isFlagPassed("resv") {
 		config.EnableReservations = flags.enableSibra
 	}
+	if isFlagPassed("mtu") {
+		config.MTU = flags.mtu
+	}
 	return nil
 }
 
@@ -451,6 +454,13 @@ func (config *HerculesGeneralConfig) validateLoose() (error, *net.Interface) {
 		return fmt.Errorf("unknown mode %s", config.Mode), nil
 	}
 
+	if config.MTU < minFrameSize {
+		return fmt.Errorf("MTU too small: %d < %d", config.MTU, minFrameSize), nil
+	}
+	if config.MTU > 9038 {
+		return fmt.Errorf("can not use jumbo frames of size %d > 9038", config.MTU), nil
+	}
+
 	sort.Ints(config.Queues)
 	for i, q := range config.Queues {
 		if q < 0 {
@@ -477,6 +487,9 @@ func (config *HerculesGeneralConfig) validateStrict() error {
 	}
 	if len(config.Queues) == 0 {
 		return errors.New("you must specify at least one queue")
+	}
+	if config.MTU > 8015 {
+		log.Warn(fmt.Sprintf("using frame size %d > 8015 (IEEE 802.11)", config.MTU))
 	}
 	return nil
 }

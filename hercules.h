@@ -37,7 +37,6 @@ typedef __u8 u8;
 
 #define CACHELINE_SIZE 64
 
-#define ETHER_SIZE 1500
 #define HERCULES_MAX_HEADERLEN 256
 struct hercules_path_header {
 	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
@@ -82,7 +81,8 @@ struct local_addr { // local as in "relative to the local IA"
 typedef u64 ia;
 
 
-void hercules_init(int ifindex, ia ia, const struct local_addr *local_addrs, int num_local_addrs, int queues[], int num_queues);
+void hercules_init(int ifindex, ia ia, const struct local_addr *local_addrs, int num_local_addrs, int queues[],
+				   int num_queues, int mtu);
 void hercules_close();
 
 struct hercules_stats {

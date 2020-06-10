@@ -97,6 +97,7 @@ type Flags struct {
 	localAddrs       arrayFlags
 	maxRateLimit     int
 	mode             string
+	mtu              int
 	queueArgs        arrayFlags
 	remoteAddrs      arrayFlags
 	transmitFilename string
@@ -112,6 +113,7 @@ type HerculesGeneralConfig struct {
 	DumpInterval time.Duration
 	Interface    string
 	Mode         string
+	MTU          int
 	Queues       []int
 	Verbosity    string
 }
@@ -133,7 +135,6 @@ type HerculesReceiverConfig struct {
 type HerculesSenderConfig struct {
 	HerculesGeneralConfig
 	TransmitFile       string
-	MTU                int
 	EnableReservations bool
 	EnableBestEffort   bool
 	EnablePCC          bool

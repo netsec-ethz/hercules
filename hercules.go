@@ -40,12 +40,12 @@ import (
 )
 
 const (
-	etherLen int = 1500
 	maxPathsPerReceiver int = 126 // the maximum path index needs to fit into a uint8; best-effort and SIBRA paths get separate path indices
 )
 
 var (
 	activeInterface *net.Interface // activeInterface remembers the chosen interface for callbacks from C
+	etherLen int
 )
 
 func (i *arrayFlags) String() string {
@@ -97,6 +97,7 @@ func realMain() error {
 	flag.BoolVar(&flags.enableBestEffort, "be", true, "Enable best-effort traffic")
 	flag.BoolVar(&flags.enableSibra, "resv", false, "Enable COLIBRI bandwidth reservations")
 	flag.StringVar(&configFile, "c", "", "File to parse configuration from, you may overwrite any configuration using command line arguemnts")
+	flag.IntVar(&flags.mtu, "mtu", 0, "Set the frame size to use")
 	flag.Parse()
 
 	if err := configureLogger(flags.verbose); err != nil {
@@ -204,6 +205,7 @@ func configureLogger(verbosity string) error {
 // Assumes config to be strictly valid.
 func mainTx(config *HerculesSenderConfig) (err error) {
 	// since config is valid, there can be no errors here:
+	etherLen = config.MTU
 	localAddress, _ := snet.ParseUDPAddr(config.LocalAddress)
 	iface, _ := net.InterfaceByName(config.Interface)
 	destinations := config.destinations()
@@ -225,7 +227,7 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 		return errors.New("some destinations are unreachable, abort")
 	}
 
-	herculesInit(iface, localAddress.IA, []*net.UDPAddr{localAddress.Host}, config.Queues)
+	herculesInit(iface, localAddress.IA, []*net.UDPAddr{localAddress.Host}, config.Queues, config.MTU)
 	pm.pushPaths()
 
 	go pm.syncPathsToC()
@@ -239,13 +241,14 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 // Assumes config to be strictly valid.
 func mainRx(config *HerculesReceiverConfig) error {
 	// since config is valid, there can be no errors here:
+	etherLen = config.MTU
 	iface, _ := net.InterfaceByName(config.Interface)
 	localAddresses := config.localAddresses()
 
 	filenamec := C.CString(config.OutputFile)
 	defer C.free(unsafe.Pointer(filenamec))
 
-	herculesInit(iface, config.LocalAddresses.IA, localAddresses, config.Queues)
+	herculesInit(iface, config.LocalAddresses.IA, localAddresses, config.Queues, config.MTU)
 	go statsDumper(false, config.DumpInterval)
 	go cleanupOnSignal()
 	stats := C.hercules_rx(filenamec, C.int(config.getXDPMode()), C.bool(config.ConfigureQueues))
@@ -262,12 +265,12 @@ func cleanupOnSignal() {
 	os.Exit(128 + 15) // Customary exit code after SIGTERM
 }
 
-func herculesInit(iface *net.Interface, ia addr.IA, local []*net.UDPAddr, queues []int) {
+func herculesInit(iface *net.Interface, ia addr.IA, local []*net.UDPAddr, queues []int, MTU int) {
 	localC := toCLocalAddrs(local)
 	queuesC := toCIntArray(queues)
 	iaC := toCIA(ia)
 
-	C.hercules_init(C.int(iface.Index), iaC, &localC[0], C.int(len(local)), &queuesC[0], C.int(len(queues)))
+	C.hercules_init(C.int(iface.Index), iaC, &localC[0], C.int(len(local)), &queuesC[0], C.int(len(queues)), C.int(MTU))
 	activeInterface = iface
 }
 
