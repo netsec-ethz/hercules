@@ -247,8 +247,9 @@ static struct send_queue send_queue;
 
 // State for transmit rate control
 static size_t tx_npkts;
-static size_t prev_rate_check;
-static size_t prev_tx_npkts;
+static size_t tx_npkts_queued;
+static u64 prev_rate_check;
+static size_t prev_tx_npkts_queued;
 // State for receive rate, for stat dump only
 static size_t rx_npkts;
 
@@ -1076,13 +1077,13 @@ static void rx_receive_batch(struct xsk_socket_info *xsk)
 
 static void rate_limit_tx(void)
 {
-	if(prev_tx_npkts + RATE_LIMIT_CHECK > tx_npkts)
+	if(prev_tx_npkts_queued + RATE_LIMIT_CHECK > tx_npkts_queued)
 		return;
 
 	u64 now = get_nsecs();
 	u64 dt = now - prev_rate_check;
 
-	u64 d_npkts = tx_npkts - prev_tx_npkts;
+	u64 d_npkts = tx_npkts_queued - prev_tx_npkts_queued;
 
 	dt = umin64(dt, 1);
 	u32 tx_pps = d_npkts * 1000000000. / dt;
@@ -1097,7 +1098,7 @@ static void rate_limit_tx(void)
 	}
 
 	prev_rate_check = now;
-	prev_tx_npkts = tx_npkts;
+	prev_tx_npkts_queued = tx_npkts_queued;
 }
 
 static u32 path_can_send_npkts_sibra(struct sibra_state *sibra_state, u64 now)
@@ -1354,6 +1355,7 @@ produce_batch(const u8 *path_by_rcvr, const u32 *chunks, const u8 *rcvr_by_chunk
 			unit = send_queue_reserve(&send_queue);
 			num_chunks_in_unit = 0;
 			if(unit == NULL) {
+				chk--; // retry with same chunk
 				continue;
 			}
 		}
@@ -1631,6 +1633,7 @@ static void tx_only()
 			u8 rcvr_path[tx_state->num_receivers];
 			prepare_rcvr_paths(rcvr_path);
 			produce_batch(rcvr_path, chunks, chunk_rcvr, num_chunks);
+			tx_npkts_queued += num_chunks;
 			rate_limit_tx();
 
 			for(u32 r = 0; r < tx_state->num_receivers; r++) {
