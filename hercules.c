@@ -1304,7 +1304,8 @@ static void submit_batch(struct xsk_socket_info *xsk, u32 *frame_nb, u32 i)
 	pop_completion_ring(xsk);
 }
 
-static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct send_queue_unit *unit, u32 *frame_nb) {
+static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct send_queue_unit *unit, u32 *frame_nb,
+		u32 *random_seed) {
 	u32 num_chunks_in_unit;
 	for(num_chunks_in_unit = 0; num_chunks_in_unit < SEND_QUEUE_ENTRIES_PER_UNIT; num_chunks_in_unit++) {
 		if(unit->paths[num_chunks_in_unit] == UINT8_MAX) {
@@ -1327,7 +1328,7 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 		const u32 chunk_idx = unit->chunk_idx[i];
 		const size_t chunk_start = (size_t) chunk_idx * tx_state->chunklen;
 		const size_t len = umin64(tx_state->chunklen, tx_state->filesize - chunk_start);
-		u32 hdr_idx = chunk_idx % path->num_headers; // pick arbitrary header version TODO improve selection?
+		u32 hdr_idx = rand_r(random_seed) % path->num_headers; // pick random header version
 
 		void *pkt = produce_frame(xsk, *frame_nb + i, idx + i, path->framelen);
 		void *rbudp_pkt = mempcpy(pkt, path->headers[hdr_idx].header, path->headerlen);
@@ -1378,8 +1379,9 @@ static void tx_send_p(void *arg) {
 	struct send_queue_unit unit;
 	send_queue_pop_wait(&send_queue, &unit);
 	u32 frame_nb = 0;
+	u32 random_seed = (u32) (size_t) arg + pthread_self() + (u32) get_nsecs();
 	while(true) {
-		tx_handle_send_queue_unit(xsk, &unit, &frame_nb);
+		tx_handle_send_queue_unit(xsk, &unit, &frame_nb, &random_seed);
 		if(!send_queue_pop(&send_queue, &unit)) { // queue currently empty
 			while(!send_queue_pop(&send_queue, &unit)) {
 				// whenever we're waiting, claim frames back
