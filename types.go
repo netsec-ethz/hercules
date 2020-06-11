@@ -129,7 +129,7 @@ type HerculesReceiverConfig struct {
 	HerculesGeneralConfig
 	OutputFile      string
 	LocalAddresses  SiteConfig
-	ConfigureQueues bool // TODO implement feature
+	ConfigureQueues bool
 }
 
 type HerculesSenderConfig struct {
