@@ -419,6 +419,7 @@ func (config *HerculesSenderConfig) destinations() []*Destination {
 		dest := &Destination{
 			ia:        config.Destinations[d].IA,
 			hostAddrs: []*net.UDPAddr{},
+			pathSpec:  &config.Destinations[d].PathSpec,
 		}
 		dests = append(dests, dest)
 

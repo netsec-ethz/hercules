@@ -26,6 +26,7 @@ import "C"
 import (
 	"github.com/google/gopacket"
 	"github.com/scionproto/scion/go/lib/addr"
+	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/pathmgr"
 	"github.com/scionproto/scion/go/lib/snet"
 	"go.uber.org/atomic"
@@ -51,6 +52,7 @@ type layerWithOpts struct {
 type Destination struct {
 	ia        addr.IA
 	hostAddrs []*net.UDPAddr
+	pathSpec  *[]PathSpec
 }
 
 type PathManager struct {
@@ -122,7 +124,7 @@ type SiteConfig struct {
 	IA        addr.IA
 	HostAddrs []string
 	NumPaths  int        // TODO implement feature
-	PathSpec  [][]string // TODO implement feature
+	PathSpec  []PathSpec
 }
 
 type HerculesReceiverConfig struct {
@@ -143,3 +145,10 @@ type HerculesSenderConfig struct {
 	NumPathsPerDest    int
 	Destinations       []SiteConfig
 }
+
+type PathInterface struct {
+	ia   addr.IA
+	ifId common.IFIDType
+}
+
+type PathSpec []PathInterface
