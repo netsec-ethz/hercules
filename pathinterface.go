@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
+	"github.com/scionproto/scion/go/lib/snet"
 )
 
 func (iface *PathInterface) ID() common.IFIDType {
@@ -41,4 +42,11 @@ func (iface *PathInterface) UnmarshalText(text []byte) error {
 	}
 	ret := iface.ia.UnmarshalText(parts[0])
 	return ret
+}
+
+func (iface *PathInterface) match(pathIface snet.PathInterface) bool {
+	if iface.ifId == 0 {
+		return iface.IA() == pathIface.IA()
+	}
+	return iface.ID() == pathIface.ID() && iface.IA() == pathIface.IA()
 }

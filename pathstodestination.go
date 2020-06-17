@@ -236,41 +236,54 @@ func (pwd *PathsToDestination) disableVanishedPaths(previousPathAvailable *[]boo
 
 func (pwd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, availablePaths *spathmeta.AppPathSet) bool {
 	updated := false
-	for i, slotInUse := range *previousPathAvailable {
-		if slotInUse == false {
-			// TODO choose paths more cleverly
-			for _, newPath := range *availablePaths {
-				// check if the path is already in use
-				newFingerprint := newPath.Fingerprint()
-				pathInUse := false
-				for _, pathMeta := range pwd.paths {
-					if pathMeta.fingerprint == newFingerprint {
-						pathInUse = true
-						break
-					}
-				}
-				if pathInUse {
-					continue
-				}
+	// XXX for now, we do not support replacing vanished paths
+	// check that no previous path available
+	for _, prev := range *previousPathAvailable {
+		if prev {
+			return false
+		}
+	}
 
-				// use it from now on
-				log.Info(fmt.Sprintf("[Destination %s] enabling path %d:\n\t%s\n", pwd.dst.ia, i, newPath))
-				pwd.paths[i].path = newPath
-				pwd.paths[i].fingerprint = newFingerprint
-				pwd.paths[i].enabled = true
-				pwd.paths[i].updated = true
-
-				updated = true
-
-				if pwd.pm.sibraMgr != nil {
-					err := pwd.initSibraPath(&pwd.paths[i], i)
-					if err != nil {
-						log.Error("Could not initialize SIBRA: " + err.Error())
-						pwd.modifyTime = time.Now()
-						return updated
-					}
+	// pick paths
+	picker := makePathPicker(pwd.dst.pathSpec, availablePaths, pwd.pm.numPathsPerDst)
+	var pathSet []snet.Path
+	disjointness := 0 // negative number denoting how many network interfaces are shared among paths (to be maximized)
+	maxRuleIdx := 0   // the highest index of a PathSpec that is used (to be minimized)
+	for i := pwd.pm.numPathsPerDst; i > 0; i-- {
+		picker.reset(i)
+		for picker.nextRuleSet() { // iterate through different choices of PathSpecs to use
+			if pathSet != nil && maxRuleIdx < picker.maxRuleIdx() { // ignore rule set, if path set with lower maxRuleIndex is known
+				continue // due to the iteration order, we cannot break here
+			}
+			for picker.nextPick() { // iterate through different choices of paths obeying the rules of the current set of PathSpecs
+				curDisjointness := picker.disjointnessScore()
+				if pathSet == nil || disjointness < curDisjointness { // maximize disjointness
+					disjointness = curDisjointness
+					maxRuleIdx = picker.maxRuleIdx()
+					pathSet = picker.getPaths()
 				}
-				break
+			}
+		}
+		if pathSet != nil { // if no path set of size i found, try with i-1
+			break
+		}
+	}
+
+	log.Info(fmt.Sprintf("[Destination %s] using %d paths:", pwd.dst.ia, len(pathSet)))
+	for i, path := range pathSet {
+		log.Info(fmt.Sprintf("\t%s", path))
+		pwd.paths[i].path = path
+		pwd.paths[i].fingerprint = path.Fingerprint()
+		pwd.paths[i].enabled = true
+		pwd.paths[i].updated = true
+		updated = true
+
+		if pwd.pm.sibraMgr != nil {
+			err := pwd.initSibraPath(&pwd.paths[i], i)
+			if err != nil {
+				log.Error("Could not initialize SIBRA: " + err.Error())
+				pwd.modifyTime = time.Now()
+				return updated
 			}
 		}
 	}

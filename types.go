@@ -152,3 +152,14 @@ type PathInterface struct {
 }
 
 type PathSpec []PathInterface
+
+type PathPickDescriptor struct {
+	ruleIndex int
+	pathIndex int
+}
+
+type PathPicker struct {
+	pathSpec        *[]PathSpec
+	availablePaths  []snet.Path
+	currentPathPick []PathPickDescriptor
+}
