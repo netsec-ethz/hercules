@@ -53,11 +53,11 @@ type Destination struct {
 	ia        addr.IA
 	hostAddrs []*net.UDPAddr
 	pathSpec  *[]PathSpec
+	numPaths  int
 }
 
 type PathManager struct {
-	numPathsPerDst     int
-	numSlotsPerPath    int
+	numPathSlotsPerDst int
 	iface              *net.Interface
 	dsts               []*PathsToDestination
 	src                *snet.UDPAddr

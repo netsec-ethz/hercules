@@ -211,7 +211,6 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 	destinations := config.destinations()
 
 	pm, err := initNewPathManager(
-		config.NumPathsPerDest,
 		iface,
 		destinations,
 		localAddress,

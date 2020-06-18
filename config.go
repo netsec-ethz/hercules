@@ -163,21 +163,21 @@ func (config *HerculesReceiverConfig) mergeFlags(flags *Flags) error {
 				}
 				config.LocalAddresses.HostAddrs = append(config.LocalAddresses.HostAddrs, localAddr)
 			} else { // else, if full SCION address: add host address and set IA
-				remote, err := snet.ParseUDPAddr(localAddr)
+				local, err := snet.ParseUDPAddr(localAddr)
 				if err != nil {
 					return err
 				}
-				if remote.Host.Port == 0 {
-					return errors.New("you must specify a destination port")
+				if local.Host.Port == 0 {
+					return errors.New("you must specify a source port")
 				}
 				if (config.LocalAddresses.IA != addr.IA{}) {
-					if config.LocalAddresses.IA != remote.IA {
+					if config.LocalAddresses.IA != local.IA {
 						return errors.New("local addresses must belong to the same AS")
 					}
 				} else {
-					config.LocalAddresses.IA = remote.IA
+					config.LocalAddresses.IA = local.IA
 				}
-				config.LocalAddresses.HostAddrs = append(config.LocalAddresses.HostAddrs, remote.Host.IP.String()+":"+strconv.Itoa(remote.Host.Port))
+				config.LocalAddresses.HostAddrs = append(config.LocalAddresses.HostAddrs, local.Host.IP.String()+":"+strconv.Itoa(local.Host.Port))
 			}
 		}
 	}
@@ -420,6 +420,10 @@ func (config *HerculesSenderConfig) destinations() []*Destination {
 			ia:        config.Destinations[d].IA,
 			hostAddrs: []*net.UDPAddr{},
 			pathSpec:  &config.Destinations[d].PathSpec,
+			numPaths:  config.NumPathsPerDest,
+		}
+		if config.Destinations[d].NumPaths > 0 {
+			dest.numPaths = config.Destinations[d].NumPaths
 		}
 		dests = append(dests, dest)
 

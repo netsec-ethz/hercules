@@ -35,21 +35,30 @@ import (
 	"time"
 )
 
-func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*Destination, src *snet.UDPAddr, enableBestEffort, enableSibra bool, maxBps uint64) (*PathManager, error) {
+const numPathsResolved = 20
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func initNewPathManager(iface *net.Interface, dsts []*Destination, src *snet.UDPAddr, enableBestEffort, enableSibra bool, maxBps uint64) (*PathManager, error) {
 	sciondConn, err := sciond.NewService(sciond.DefaultSCIONDAddress).Connect(context.Background())
 	if err != nil {
 		return nil, err
 	}
 
+	numPathsPerDst := 0
 	pm := &PathManager{
-		numPathsPerDst: numPathsPerDst,
-		iface:          iface,
-		src:            src,
-		dsts:           make([]*PathsToDestination, 0, len(dsts)),
-		syncTime:       time.Unix(0, 0),
-		useBestEffort:  enableBestEffort,
-		maxBps:         maxBps,
-		pathResolver:   pathmgr.New(sciondConn, pathmgr.Timers{}, uint16(numPathsPerDst)),
+		iface:         iface,
+		src:           src,
+		dsts:          make([]*PathsToDestination, 0, len(dsts)),
+		syncTime:      time.Unix(0, 0),
+		useBestEffort: enableBestEffort,
+		maxBps:        maxBps,
+		pathResolver:  pathmgr.New(sciondConn, pathmgr.Timers{}, uint16(numPathsResolved)),
 	}
 
 	for _, dst := range dsts {
@@ -63,12 +72,13 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*Destin
 			}
 			dstState = initNewPathsToDestinationWithEmptyPath(pm, dst)
 		} else {
-			dstState, err = initNewPathsToDestination(pm, src, dst, numPathsPerDst)
+			dstState, err = initNewPathsToDestination(pm, src, dst)
 			if err != nil {
 				return nil, err
 			}
 		}
 		pm.dsts = append(pm.dsts, dstState)
+		numPathsPerDst = max(numPathsPerDst, dst.numPaths)
 	}
 
 	if enableSibra {
@@ -82,13 +92,13 @@ func initNewPathManager(numPathsPerDst int, iface *net.Interface, dsts []*Destin
 	}
 
 	// allocate memory to pass paths to C
-	pm.numSlotsPerPath = 1
+	pm.numPathSlotsPerDst = numPathsPerDst
 	if enableSibra && enableBestEffort {
-		pm.numSlotsPerPath = 2
+		pm.numPathSlotsPerDst = 2 * numPathsPerDst
 	}
 	pm.cNumPathsPerDst = make([]C.int, len(dsts))
-	pm.cMaxNumPathsPerDst = C.int(numPathsPerDst * pm.numSlotsPerPath)
-	pm.cPathsPerDest = make([]C.struct_hercules_path, len(dsts)*numPathsPerDst*pm.numSlotsPerPath)
+	pm.cMaxNumPathsPerDst = C.int(pm.numPathSlotsPerDst)
+	pm.cPathsPerDest = make([]C.struct_hercules_path, len(dsts)*pm.numPathSlotsPerDst)
 	return pm, nil
 }
 
@@ -112,7 +122,7 @@ func (pm *PathManager) pushPaths() {
 			continue
 		}
 
-		dst.pushPaths(d, d*pm.numPathsPerDst*pm.numSlotsPerPath)
+		dst.pushPaths(d, d*pm.numPathSlotsPerDst)
 	}
 
 	pm.syncTime = syncTime

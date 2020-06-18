@@ -46,7 +46,7 @@ func initNewPathsToDestinationWithEmptyPath(pm *PathManager, dst *Destination) *
 	}
 }
 
-func initNewPathsToDestination(pm *PathManager, src *snet.UDPAddr, dst *Destination, numPaths int) (*PathsToDestination, error) {
+func initNewPathsToDestination(pm *PathManager, src *snet.UDPAddr, dst *Destination) (*PathsToDestination, error) {
 	// monitor path changes
 	sp, err := pm.pathResolver.Watch(context.Background(), src.IA, dst.ia)
 	if err != nil {
@@ -56,7 +56,7 @@ func initNewPathsToDestination(pm *PathManager, src *snet.UDPAddr, dst *Destinat
 		pm:         pm,
 		dst:        dst,
 		sp:         sp,
-		paths:      make([]PathMeta, numPaths),
+		paths:      make([]PathMeta, dst.numPaths),
 		modifyTime: time.Unix(0, 0),
 	}, nil
 }
@@ -165,7 +165,7 @@ func (pwd *PathsToDestination) choosePaths() bool {
 		log.Error(fmt.Sprintf("no paths to destination %s", pwd.dst.ia.String()))
 	}
 
-	previousPathAvailable := make([]bool, pwd.pm.numPathsPerDst)
+	previousPathAvailable := make([]bool, pwd.dst.numPaths)
 	updated := pwd.choosePreviousPaths(&previousPathAvailable, &availablePaths)
 
 	if pwd.disableVanishedPaths(&previousPathAvailable) {
@@ -245,11 +245,11 @@ func (pwd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, ava
 	}
 
 	// pick paths
-	picker := makePathPicker(pwd.dst.pathSpec, availablePaths, pwd.pm.numPathsPerDst)
+	picker := makePathPicker(pwd.dst.pathSpec, availablePaths, pwd.dst.numPaths)
 	var pathSet []snet.Path
 	disjointness := 0 // negative number denoting how many network interfaces are shared among paths (to be maximized)
 	maxRuleIdx := 0   // the highest index of a PathSpec that is used (to be minimized)
-	for i := pwd.pm.numPathsPerDst; i > 0; i-- {
+	for i := pwd.dst.numPaths; i > 0; i-- {
 		picker.reset(i)
 		for picker.nextRuleSet() { // iterate through different choices of PathSpecs to use
 			if pathSet != nil && maxRuleIdx < picker.maxRuleIdx() { // ignore rule set, if path set with lower maxRuleIndex is known
