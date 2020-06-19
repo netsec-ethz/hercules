@@ -190,6 +190,7 @@ struct sender_state_per_receiver {
 	atomic_uint_least64_t handshake_rtt; // Handshake RTT in ns
 
 	u32 num_paths;
+	u32 return_path_idx;
 	struct hercules_app_addr addr;
 	struct hercules_path *paths;
 	struct ccontrol_state *cc_states;
@@ -1188,9 +1189,12 @@ static void update_hercules_tx_paths(void)
 		struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
 		receiver->num_paths = tx_state->shd_num_paths[r];
 
+		bool replaced_return_path = false;
 		for(u32 p = 0; p < receiver->num_paths; p++) {
 			struct hercules_path *shd_path = &tx_state->shd_paths[r * tx_state->max_paths_per_rcvr + p];
-			bool replaced_return_path = false;
+			if(!shd_path->enabled && p == receiver->return_path_idx) {
+				receiver->return_path_idx++;
+			}
 			if(shd_path->replaced) {
 				shd_path->replaced = false;
 				// assert that chunk length fits into packet with new header
@@ -1205,7 +1209,7 @@ static void update_hercules_tx_paths(void)
 				// the Go part which is less performance critical
 
 				atomic_store(&receiver->paths[p].next_handshake_at, UINT64_MAX); // by default do not send a new handshake
-				if(p == 0) {
+				if (p == receiver->return_path_idx) {
 					atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure handshake_rtt is adapted
 					// don't trigger RTT estimate on other paths, as it will be triggered by the ACK on the new return path
 					replaced_return_path = true;
@@ -1220,6 +1224,11 @@ static void update_hercules_tx_paths(void)
 					receiver->sibra_states[p].max_pps = 0; // triggers reset below if necessary
 				}
 			} else {
+				if (p == receiver->return_path_idx) {
+					atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure handshake_rtt is adapted
+					// don't trigger RTT estimate on other paths, as it will be triggered by the ACK on the new return path
+					replaced_return_path = true;
+				}
 				if(receiver->cc_states != NULL && shd_path->max_bps == 0 && receiver->paths[p].enabled != shd_path->enabled) {
 					if(shd_path->enabled) { // reactivate PCC
 						if(receiver->cc_states != NULL) {
@@ -1263,7 +1272,8 @@ void send_path_handshakes()
 				u64 handshake_at = atomic_load(&path->next_handshake_at);
 				if(handshake_at < now) {
 					if(atomic_compare_exchange_strong(&path->next_handshake_at, &handshake_at, now + PATH_HANDSHAKE_TIMEOUT_NS)) {
-						tx_send_initial(tx_state->control_socket_fd, path, tx_state->filesize, tx_state->chunklen, get_nsecs(), p, p == 0);
+						tx_send_initial(tx_state->control_socket_fd, path, tx_state->filesize, tx_state->chunklen,
+								get_nsecs(), p, p == rcvr->return_path_idx);
 					}
 				}
 			}
