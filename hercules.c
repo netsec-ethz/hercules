@@ -2274,10 +2274,10 @@ static struct hercules_stats tx_stats(struct sender_state *t)
 				if(receiver->cc_states == NULL) { // no path-specific rate-limit
 					rate_limit += t->rate_limit;
 				} else { // PCC provided limit
-					rate_limit += receiver->cc_states[p].max_rate_limit;
+					rate_limit += receiver->cc_states[p].curr_rate;
 				}
 			} else { // SIBRA
-				rate_limit += path->max_bps;
+				rate_limit += path->max_bps / ether_size;
 			}
 		}
 	}
