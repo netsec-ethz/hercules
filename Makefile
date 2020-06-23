@@ -9,7 +9,9 @@ endif
 	cp hercules mockules/mockules $(DESTDIR)
 
 hercules: builder hercules.h hercules.go hercules.c
-	docker exec hercules-builder go build
+	@taggedRef=$$(git describe --tags --long --dirty 2>/dev/null) && startupVersion=$$(git rev-parse --abbrev-ref HEAD)"-$${taggedRef}" || \
+		startupVersion=$$(git rev-parse --abbrev-ref HEAD)"-untagged-"$$(git describe --tags --dirty --always); \
+	docker exec hercules-builder go build -ldflags "-X main.startupVersion=$${startupVersion}"
 
 mockules: builder mockules/main.go
 	docker exec -w /`basename $(PWD)`/mockules hercules-builder go build

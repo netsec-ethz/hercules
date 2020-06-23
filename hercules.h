@@ -17,50 +17,20 @@
 
 #include <stdbool.h>
 #include <linux/types.h>
-#include <stdatomic.h>
-#include <stdio.h>
 
 typedef __u64 u64;
 typedef __u32 u32;
 typedef __u16 u16;
 typedef __u8 u8;
 
-#ifndef NDEBUG
-#define debug_printf(fmt, ...) printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
-#else
-#define debug_printf(...) ;
-#endif
-
-#ifndef likely
-# define likely(x)              __builtin_expect(!!(x), 1)
-#endif
-
-#define CACHELINE_SIZE 64
-
 #define HERCULES_MAX_HEADERLEN 256
-struct hercules_path_header {
-	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
-	u16  checksum;	//SCION L4 checksum over header with 0 payload
-};
-
 // Path are specified as ETH/IP/UDP/SCION/UDP headers.
 struct hercules_path {
-	u64 next_handshake_at;
 	int headerlen;
 	int payloadlen;
 	int framelen;	//!< length of ethernet frame; headerlen + payloadlen
-	u64 max_bps;    // bandwidth limit on that path, 0 = no limit
-	struct hercules_path_header *headers; //!< separate header for each destination IP address
-	u8 num_headers; //!< number of different versions available for this path (i.e. different destination host IP addresses)
-	atomic_bool enabled; // e.g. when a path has been revoked and no replacement is available, this will be set to false
-	atomic_bool replaced;
-};
-
-struct rcv_batch_pc {
-	u32 num_empty;
-	u32 num_nonempty;
-	u32 num_full;
-	char padding[52];
+	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
+	u16  checksum;	//SCION L4 checksum over header with 0 payload
 };
 
 // Connection information
@@ -73,16 +43,7 @@ struct hercules_app_addr {
 	u16 port;
 };
 
-struct local_addr { // local as in "relative to the local IA"
-	u32 ip;
-	u16 port;
-};
-
-typedef u64 ia;
-
-
-void hercules_init(int ifindex, ia ia, const struct local_addr *local_addrs, int num_local_addrs, int queues[],
-				   int num_queues, int mtu);
+void hercules_init(int ifindex, const struct hercules_app_addr local_addr, int queue);
 void hercules_close();
 
 struct hercules_stats {
@@ -106,22 +67,13 @@ struct hercules_stats {
 // Returns stats with `start_time==0` if no transfer is active.
 struct hercules_stats hercules_get_stats();
 
-void allocate_path_headers(struct hercules_path *path, int num_headers);
-void push_hercules_tx_paths(void);
-
-// locks for working with the shared path memory
-void acquire_path_lock(void);
-void free_path_lock(void);
-
 // Initiate transfer of file over the given path.
 // Synchronous; returns when the transfer has been completed or if it has failed.
 // Does not take ownership of `paths`.
 // Retur
-struct hercules_stats
-hercules_tx(const char *filename, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest,
-			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode);
+struct hercules_stats hercules_tx(const char *filename, const struct hercules_path *path, int max_rate_limit, bool enable_pcc, int xdp_mode);
 
 // Initiate receiver, waiting for a transmitter to initiate the file transfer.
-struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues);
+struct hercules_stats hercules_rx(const char *filename, int xdp_mode);
 
 #endif // __HERCULES_H__

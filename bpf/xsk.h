@@ -15,8 +15,24 @@
 #include <stdint.h>
 #include <linux/if_xdp.h>
 
+//#include <linux/compiler.h> // XXX
+#define barrier() __asm__ __volatile__("": : :"memory")
+
+#ifndef likely
+# define likely(x)              __builtin_expect(!!(x), 1)
+#endif
+
+#ifndef unlikely
+# define unlikely(x)            __builtin_expect(!!(x), 0)
+#endif
+
+// #include <asm/barrier.h> // XXX
+//  __smp_wmb/rmb() in x86 defined as barrier() (which is hopefully the one from compiler.h)
+#define smp_wmb() barrier()
+#define smp_rmb() barrier()
+
+
 #include "libbpf.h"
-#include "libbpf_util.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,15 +48,10 @@ struct name { \
 	__u32 *producer; \
 	__u32 *consumer; \
 	void *ring; \
-	__u32 *flags; \
 }
 
 DEFINE_XSK_RING(xsk_ring_prod);
 DEFINE_XSK_RING(xsk_ring_cons);
-
-/* For a detailed explanation on the memory barriers associated with the
- * ring, please take a look at net/xdp/xsk_queue.h.
- */
 
 struct xsk_umem;
 struct xsk_socket;
@@ -77,11 +88,6 @@ xsk_ring_cons__rx_desc(const struct xsk_ring_cons *rx, __u32 idx)
 	return &descs[idx & rx->mask];
 }
 
-static inline int xsk_ring_prod__needs_wakeup(const struct xsk_ring_prod *r)
-{
-	return *r->flags & XDP_RING_NEED_WAKEUP;
-}
-
 static inline __u32 xsk_prod_nb_free(struct xsk_ring_prod *r, __u32 nb)
 {
 	__u32 free_entries = r->cached_cons - r->cached_prod;
@@ -116,7 +122,7 @@ static inline __u32 xsk_cons_nb_avail(struct xsk_ring_cons *r, __u32 nb)
 static inline size_t xsk_ring_prod__reserve(struct xsk_ring_prod *prod,
 					    size_t nb, __u32 *idx)
 {
-	if (xsk_prod_nb_free(prod, nb) < nb)
+	if (unlikely(xsk_prod_nb_free(prod, nb) < nb))
 		return 0;
 
 	*idx = prod->cached_prod;
@@ -127,10 +133,10 @@ static inline size_t xsk_ring_prod__reserve(struct xsk_ring_prod *prod,
 
 static inline void xsk_ring_prod__submit(struct xsk_ring_prod *prod, size_t nb)
 {
-	/* Make sure everything has been written to the ring before indicating
-	 * this to the kernel by writing the producer pointer.
+	/* Make sure everything has been written to the ring before signalling
+	 * this to the kernel.
 	 */
-	libbpf_smp_wmb();
+	smp_wmb();
 
 	*prod->producer += nb;
 }
@@ -140,11 +146,11 @@ static inline size_t xsk_ring_cons__peek(struct xsk_ring_cons *cons,
 {
 	size_t entries = xsk_cons_nb_avail(cons, nb);
 
-	if (entries > 0) {
+	if (likely(entries > 0)) {
 		/* Make sure we do not speculatively read the data before
 		 * we have received the packet buffers from the ring.
 		 */
-		libbpf_smp_rmb();
+		smp_rmb();
 
 		*idx = cons->cached_cons;
 		cons->cached_cons += entries;
@@ -155,11 +161,6 @@ static inline size_t xsk_ring_cons__peek(struct xsk_ring_cons *cons,
 
 static inline void xsk_ring_cons__release(struct xsk_ring_cons *cons, size_t nb)
 {
-	/* Make sure data has been read before indicating we are done
-	 * with the entries by updating the consumer pointer.
-	 */
-	libbpf_smp_rwmb();
-
 	*cons->consumer += nb;
 }
 
@@ -168,37 +169,20 @@ static inline void *xsk_umem__get_data(void *umem_area, __u64 addr)
 	return &((char *)umem_area)[addr];
 }
 
-static inline __u64 xsk_umem__extract_addr(__u64 addr)
-{
-	return addr & XSK_UNALIGNED_BUF_ADDR_MASK;
-}
-
-static inline __u64 xsk_umem__extract_offset(__u64 addr)
-{
-	return addr >> XSK_UNALIGNED_BUF_OFFSET_SHIFT;
-}
-
-static inline __u64 xsk_umem__add_offset_to_addr(__u64 addr)
-{
-	return xsk_umem__extract_addr(addr) + xsk_umem__extract_offset(addr);
-}
-
 LIBBPF_API int xsk_umem__fd(const struct xsk_umem *umem);
 LIBBPF_API int xsk_socket__fd(const struct xsk_socket *xsk);
 
 #define XSK_RING_CONS__DEFAULT_NUM_DESCS      2048
 #define XSK_RING_PROD__DEFAULT_NUM_DESCS      2048
-#define XSK_UMEM__DEFAULT_FRAME_SHIFT    12 /* 4096 bytes */
+#define XSK_UMEM__DEFAULT_FRAME_SHIFT    11 /* 2048 bytes */
 #define XSK_UMEM__DEFAULT_FRAME_SIZE     (1 << XSK_UMEM__DEFAULT_FRAME_SHIFT)
 #define XSK_UMEM__DEFAULT_FRAME_HEADROOM 0
-#define XSK_UMEM__DEFAULT_FLAGS 0
 
 struct xsk_umem_config {
 	__u32 fill_size;
 	__u32 comp_size;
 	__u32 frame_size;
 	__u32 frame_headroom;
-	__u32 flags;
 };
 
 /* Flags for the libbpf_flags field. */
@@ -218,16 +202,6 @@ LIBBPF_API int xsk_umem__create(struct xsk_umem **umem,
 				struct xsk_ring_prod *fill,
 				struct xsk_ring_cons *comp,
 				const struct xsk_umem_config *config);
-LIBBPF_API int xsk_umem__create_v0_0_2(struct xsk_umem **umem,
-				       void *umem_area, __u64 size,
-				       struct xsk_ring_prod *fill,
-				       struct xsk_ring_cons *comp,
-				       const struct xsk_umem_config *config);
-LIBBPF_API int xsk_umem__create_v0_0_4(struct xsk_umem **umem,
-				       void *umem_area, __u64 size,
-				       struct xsk_ring_prod *fill,
-				       struct xsk_ring_cons *comp,
-				       const struct xsk_umem_config *config);
 LIBBPF_API int xsk_socket__create(struct xsk_socket **xsk,
 				  const char *ifname, __u32 queue_id,
 				  struct xsk_umem *umem,

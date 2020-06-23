@@ -36,42 +36,27 @@ void bitset__destroy(struct bitset *s);
 inline bool bitset__check(struct bitset *s, u32 i)
 {
   assert(i < s->num);
-  return (s->bitmap[i/HERCULES_BITSET_WORD_BITS]) & (1u << i % HERCULES_BITSET_WORD_BITS);
+  return (s->bitmap[i/HERCULES_BITSET_WORD_BITS]) & (1 << i % HERCULES_BITSET_WORD_BITS);
 }
 
 // set bit at index i in bitmap.
 // Returns the previous state of the bit.
 inline bool bitset__set(struct bitset *s, u32 i)
 {
-	unsigned int bit = 1u << i % HERCULES_BITSET_WORD_BITS;
-	unsigned int prev = atomic_fetch_or(&s->bitmap[i/HERCULES_BITSET_WORD_BITS], bit);
-	if(!(prev & bit)) {
-		atomic_fetch_add(&s->num_set, 1);
-		return false;
-	}
-	return true;
+  const bool prev = bitset__check(s, i);
+  s->bitmap[i/HERCULES_BITSET_WORD_BITS] |= (1 << i % HERCULES_BITSET_WORD_BITS);
+  if(!prev) {
+    s->num_set++;
+  }
+  return prev;
 }
-
-// set bit at index i in bitmap.
-// This function is not thread-safe.
-inline bool bitset__set_unsafe(struct bitset *s, u32 i)
-{
-	unsigned int before = s->bitmap[i/HERCULES_BITSET_WORD_BITS];
-	s->bitmap[i/HERCULES_BITSET_WORD_BITS] |= (1u << i % HERCULES_BITSET_WORD_BITS);
-	if(before != s->bitmap[i/HERCULES_BITSET_WORD_BITS]) {
-		s->num_set++;
-		return false;
-	}
-	return true;
-}
-
 
 // unset bit at index i in bitmap.
 // Returns the previous state of the bit.
 inline bool bitset__unset(struct bitset *s, u32 i)
 {
   const bool prev = bitset__check(s, i);
-  s->bitmap[i/HERCULES_BITSET_WORD_BITS] &= ~(1u << i % HERCULES_BITSET_WORD_BITS);
+  s->bitmap[i/HERCULES_BITSET_WORD_BITS] &= ~(1 << i % HERCULES_BITSET_WORD_BITS);
   if(prev) {
     s->num_set--;
   }

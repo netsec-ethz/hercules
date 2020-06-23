@@ -20,30 +20,23 @@ Option
   
    Requires:
     - gcc/clang
-    - linux kernel headers >= 5.0
-    - go >= 1.14.1
+    - linux kernel headers >= 4.8
+    - go >= 1.11
 
 
 ## Running
 
 > **WARNING**: network drivers seem to crash occasionally.
 
-> **WARNING**: due to the most recent changes on the branch `multicore`, the rate-limit `computation` is a bit off.
-  When setting the rate-limit with `-p`, keep this in mind and set a lower rate than you aim at.
-
 > **NOTE**: if hercules is aborted forcefully (e.g. while debugging), it can leave an XDP program loaded which will prevent starting again.
 						Run `ip link set dev <device> xdp off`.
 
 > **NOTE**: many things can go wrong, expect to diagnose things before getting it to work.
 
-> **NOTE**: Some devices use separate queues for copy and zero-copy mode (e.g. Mellanox).
-  Make sure to use queues that support the selected mode.
-  Additionally, you may need to postpone step 2 until the handshake has succeeded.
 
-1. Make sure that SCION endhost services (sciond, dispatcher) are configured and running on both sender and receiver machines.
-   For the most recent versions of Hercules, use a SCION version compatible to `v2020.03-scionlab`.
+1. Make sure that SCION endhost services (sciond, dispatcher) are configured and running on both sender and receiver machines
 
-1. Configure queue network interfaces to particular queue (if supported by device); in this example queue 0 is used. 
+1. Configure queue network interfaces to particular queue (if supported by device); in this example queue 0 is used.
 
     ```shell
     sudo ethtool -N <device> rx-flow-hash udp4 fn
@@ -63,13 +56,11 @@ Option
     sudo numactl -l --cpunodebind=netdev:<device> -- \
         ./hercules -i <device> -q 0 -l <sender addr> -d <receiver addr> -t path/to/file.bin
     ```
-   **Warning**: this command will attempt to send at a rate of 40 Gbps!
-   To start, or if your sender or receiver NIC is not fast enough, use `-p` to set a more reasonable rate-limit.
+
 
 * Both `<receiver addr>` and `<sender addr>` are SCION/IPv4 addresses with UDP port, e.g. `17-ffaa:0:1102,[172.16.0.1]:10000`
 * The `numactl` is optional but has a huge effect on performance on systems with multiple numa nodes.
-* See source code (or `-h`) for additional options
-* You should be able to omit `-l`
+* See source code for additional options
 
 
 ## Protocol
@@ -85,8 +76,8 @@ This is repeated until all chunks are acked.
 
 All packets have the following basic layout:
 
-	|  index  |  path  | payload ... |
-	|   u32   |   u8   |     ...     |
+	|  index  |  payload ... |
+	|   u32   |    ...       |
 
 
 > **NOTE**: Integers are transmitted little endian (host endianness).
@@ -94,22 +85,14 @@ All packets have the following basic layout:
 For control packets (handshake and acknowledgements, either sender to receiver or receiver to sender), index is `UINT_MAX`.
 For data packets (sender to receiver), the index field is the index of the chunk being transmitted. This is **not** a packet sequence number, as chunks may be retransmitted.
 
-If path is not `UINT8_MAX`, it is used to account the packet to a specific path.
-This is used to provide quick feedback to the PCC algorithm, if enabled.
 
 
 #### Handshake
 
 1. Sender sends initial packet:
 
-        | num entries | filesize | chunksize | timestamp | path index | flags |
-        |     u8      |   u64    |   u32     |    u64    |    u32     |  u8   |
-        
-    Where `num entries` is `UINT8_MAX` to distinguish handshake replies from ACKs.
-    
-    Flags:
-    - 0-th bit: `SET_RETURN_PATH` The receiver should use this path for sending
-    ACKs from now on.
+        | filesize | chunksize | timestamp |
+        |   u64    |   u32     |    u64    |
 
 1. Receiver replies immediately with the same packet.
 
@@ -118,14 +101,6 @@ This is used to provide quick feedback to the PCC algorithm, if enabled.
 	The receiver proceeds to  prepare the file mapping etc.
 
 1. Receiver replies with an empty ACK signaling "Clear to send"
-
-##### Path handshakes
-
-Every time the sender starts using a new path or the receiver starts using a new
-return path, the sender will update the RTT estimate used by PCC.
-In order to achieve this, it sends a handshake (identical to the above) on the
-affected path(s).
-The receiver replies immediately with the same packet (using the current return path).
 
 #### Data transmit
 
@@ -141,16 +116,6 @@ The receiver replies immediately with the same packet (using the current return 
         | num entries | begin, end | begin, end | begin, end | ...
         |    u8       |  u32   u32 |  u32   u32 |  u32   u32 | ...
 
-* The receiver sends a PCC feedback two times per RTT.
-  The PCC feedback packet uses the following payload layout, where the zero field is
-  needed to distinguish it from regular ACKs.
-   
-   
-        | zero | num paths | pkt count | pkt count | ...
-        |  u8  |    u8     |    u32    |    u32    | ...
-       
-  These PCC feedback packets are not sent, if no paths have been accounted packets for
-  (e.g. if no path uses PCC). 
 
 #### Termination
 
@@ -163,7 +128,7 @@ The receiver replies immediately with the same packet (using the current return 
 	  The congestion control naturally solves this too, but is fairly slow to adapt.
 	  Maybe a simple window size would work.
 * [ ] Abort of transmission not handled (if one side is stopped, the other side will wait forever).
-* [ ] Jumbo frames; requires increasing FRAME_SIZE
+* [ ] Jumbo frames; requires increasing FRAME_SIZE (but there are additional limitations, since "XDP doesn't support packets spanning more than one memory page.")
 * [ ] (Huge) Move SCION packet parsing & port dispatching to an XDP program;
       Allows that SCION traffic can go through while hercules is running & allows running multiple instances of hercules on same NIC.
 * [ ] Use multiple paths; some tricky parts may be "load balancing", splitting the congestion control and applying separate rate limits.
