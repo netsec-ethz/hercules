@@ -2035,7 +2035,7 @@ static void rx_trickle_pcc_feedback(int sockfd)
 	while(!rx_received_all(rx_state)) {
 		u64 ack_round_start = get_nsecs();
 		rx_send_pcc_feedback(sockfd);
-		sleep_until(ack_round_start + rx_state->handshake_rtt / 4);
+		sleep_until(ack_round_start + rx_state->handshake_rtt * 1000 / 4);
 	}
 }
 
