@@ -108,7 +108,7 @@ struct rbudp_initial_pkt {
 	u64 filesize;
 	u32 chunklen;
 	u64 timestamp;
-	u32 path_index;
+	u8 path_index;
 	u8 flags;
 };
 
