@@ -888,7 +888,7 @@ static bool tx_await_cts(int sockfd)
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
-	for(u32 i = 0; i < tx_state->num_receivers; ++i) {
+	for(u64 start = get_nsecs(); start + 20e9l > get_nsecs();) {
 		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
 			if(tx_handle_cts(payload, rcvr_by_src_address(scionaddrhdr, udphdr))) {
 				received++;
