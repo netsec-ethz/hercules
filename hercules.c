@@ -776,7 +776,7 @@ static void pcc_monitor()
 
 				sent_mi = umax32(sent_mi, 1);
 				acked_mi = umin32(acked_mi, sent_mi);
-				float loss = (sent_mi - acked_mi) / sent_mi;
+				float loss = (float)(sent_mi - acked_mi) / sent_mi;
 				float throughput = cc_state->curr_rate * (1 - loss);
 				pcc_control(cc_state, throughput, loss);
 
