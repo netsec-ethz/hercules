@@ -771,19 +771,20 @@ static void pcc_monitor()
 		for(u32 cur_path = 0; cur_path < tx_state->receiver[r].num_paths; cur_path++) {
 			struct ccontrol_state *cc_state = &tx_state->receiver[r].cc_states[cur_path];
 			if(pcc_mi_elapsed(cc_state)) {
-				u32 sent_mi = cc_state->mi_tx_npkts; // pkts sent in MI
+				u64 now = get_nsecs();
+				u64 mi_duration = now - cc_state->mi_start;
+				u32 throughput = cc_state->curr_rate * mi_duration / 1000000000; // pkts sent in MI
 				u32 acked_mi = cc_state->mi_acked_chunks; // acked pkts from MI
 
-				sent_mi = umax32(sent_mi, 1);
-				acked_mi = umin32(acked_mi, sent_mi);
-				float loss = (float)(sent_mi - acked_mi) / sent_mi;
-				float throughput = sent_mi * (1 - loss);
+				throughput = umax32(throughput, 1);
+				acked_mi = umin32(acked_mi, throughput);
+				float loss = (float)(throughput - acked_mi) / throughput;
 				pcc_control(cc_state, throughput, loss);
 
 				// Start new MI; only safe because no acks are processed during those updates
 				cc_state->total_acked_chunks += cc_state->mi_acked_chunks;
 				cc_state->mi_acked_chunks = 0;
-				cc_state->mi_start = get_nsecs();
+				cc_state->mi_start = now;
 				cc_state->mi_tx_npkts = 0;
 			}
 		}
