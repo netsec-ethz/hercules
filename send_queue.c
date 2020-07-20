@@ -19,7 +19,10 @@
 
 void init_send_queue(struct send_queue *queue, u32 num_entries)
 {
-	queue->units = (struct send_queue_unit *) calloc(num_entries, sizeof(struct send_queue_unit));
+	queue->units_base = (struct send_queue_unit *) calloc(num_entries + 1, sizeof(struct send_queue_unit));
+	// make sure units are aligned to cache lines
+	u32 offset = (size_t) queue->units_base % CACHELINE_SIZE;
+	queue->units = (void *) ((size_t) queue->units_base + CACHELINE_SIZE - offset);
 	queue->size = num_entries;
 	queue->head = 0;
 	queue->tail = 0;
@@ -27,8 +30,9 @@ void init_send_queue(struct send_queue *queue, u32 num_entries)
 
 void destroy_send_queue(struct send_queue *queue)
 {
-	free(queue->units);
+	free(queue->units_base);
 	queue->units = NULL;
+	queue->units_base = NULL;
 }
 
 // single producer queue: this does not need to be thread-safe

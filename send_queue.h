@@ -36,6 +36,7 @@ struct send_queue {
 	u32 size;
 	u32 head;
 	u32 tail;
+	void *units_base;
 };
 
 void init_send_queue(struct send_queue *queue, u32 num_entries);
