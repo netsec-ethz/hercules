@@ -25,10 +25,11 @@ package main
 import "C"
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
-func statsDumper(tx bool, interval time.Duration) {
+func statsDumper(tx bool, interval time.Duration, aggregate *aggregateStats) {
 	if interval == 0 {
 		return
 	}
@@ -103,6 +104,9 @@ func statsDumper(tx bool, interval time.Duration) {
 					uint(stats.tx_npkts),
 					uint(stats.rx_npkts),
 				)
+				aggregate.maxPps = math.Max(aggregate.maxPps, ppsNow)
+				aggregate.maxBpsGood = math.Max(aggregate.maxBpsGood, bpsGoodNow)
+				aggregate.maxBpsThru = math.Max(aggregate.maxBpsThru, bpsThruNow)
 			} else {
 
 				ppsNow := float64(uint(stats.rx_npkts)-uint(prevStats.rx_npkts)) / dt
@@ -123,6 +127,9 @@ func statsDumper(tx bool, interval time.Duration) {
 					uint(stats.rx_npkts),
 					uint(stats.tx_npkts),
 				)
+				aggregate.maxPps = math.Max(aggregate.maxPps, ppsNow)
+				aggregate.maxBpsGood = math.Max(aggregate.maxBpsGood, bpsGoodNow)
+				aggregate.maxBpsThru = math.Max(aggregate.maxBpsThru, bpsThruNow)
 			}
 
 			if stats.end_time > 0 || stats.start_time == 0 { // explicitly finished or already de-initialized
@@ -144,17 +151,19 @@ func statsAwaitStart() {
 	}
 }
 
-func printSummary(stats herculesStats) {
+func printSummary(stats herculesStats, aggregate aggregateStats) {
 
 	dttot := float64(stats.end_time-stats.start_time) / 1e9
 	filesize := uint64(stats.filesize)
 	goodputBytePS := float64(filesize) / dttot
-	fmt.Printf("\nTransfer completed:\n  %-12s%10.3fs\n  %-12s%11s\n  %-13s%11s (%s)\n  %-11s%11.3f\n  %-11s%11.3f\n",
+	fmt.Printf("\nTransfer completed:\n  %-12s%10.3fs\n  %-12s%11s\n  %-13s%11s (%s)\n  %-11s%11.3f\n  %-11s%11.3f\n  %-13s%11s (%s)\n  %-13s%11s\n",
 		"Duration:", dttot,
 		"Filesize:", humanReadableSize(filesize, "B"),
 		"Rate:", humanReadable(8*goodputBytePS, "b/s"), humanReadableSize(uint64(goodputBytePS), "B/s"),
 		"Sent/Chunk:", float64(stats.tx_npkts)/float64(stats.total_chunks),
 		"Rcvd/Chunk:", float64(stats.rx_npkts)/float64(stats.total_chunks),
+		"Max thr.put:", humanReadable(aggregate.maxBpsThru, "b/s"), humanReadable(aggregate.maxPps, "P/s"),
+		"Max goodput:", humanReadable(aggregate.maxBpsGood, "b/s"),
 	)
 }
 

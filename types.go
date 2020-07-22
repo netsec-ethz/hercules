@@ -44,6 +44,12 @@ type HerculesPathHeader struct {
 
 type herculesStats = C.struct_hercules_stats
 
+type aggregateStats struct {
+	maxPps float64
+	maxBpsThru float64
+	maxBpsGood float64
+}
+
 type layerWithOpts struct {
 	Layer gopacket.SerializableLayer
 	Opts  gopacket.SerializeOptions

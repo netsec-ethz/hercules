@@ -237,11 +237,12 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 	herculesInit(iface, localAddress.IA, []*net.UDPAddr{localAddress.Host}, config.Queues, config.MTU)
 	pm.pushPaths()
 
+	aggregateStats := aggregateStats{}
 	go pm.syncPathsToC()
-	go statsDumper(true, config.DumpInterval)
+	go statsDumper(true, config.DumpInterval, &aggregateStats)
 	go cleanupOnSignal()
 	stats := herculesTx(config.TransmitFile, destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode())
-	printSummary(stats)
+	printSummary(stats, aggregateStats)
 	return nil
 }
 
@@ -256,10 +257,11 @@ func mainRx(config *HerculesReceiverConfig) error {
 	defer C.free(unsafe.Pointer(filenamec))
 
 	herculesInit(iface, config.LocalAddresses.IA, localAddresses, config.Queues, config.MTU)
-	go statsDumper(false, config.DumpInterval)
+	aggregateStats := aggregateStats{}
+	go statsDumper(false, config.DumpInterval, &aggregateStats)
 	go cleanupOnSignal()
 	stats := C.hercules_rx(filenamec, C.int(config.getXDPMode()), C.bool(config.ConfigureQueues))
-	printSummary(stats)
+	printSummary(stats, aggregateStats)
 	return nil
 }
 
