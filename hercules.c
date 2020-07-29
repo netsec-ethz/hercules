@@ -762,7 +762,7 @@ static bool pcc_mi_elapsed(const struct ccontrol_state *cc_state)
 {
 	unsigned long now = get_nsecs();
 	unsigned long dt = now - cc_state->mi_start;
-	return dt > (cc_state->pcc_mi_duration + cc_state->rtt) * 1e9;
+	return cc_state->pcc_initialized && dt > (cc_state->pcc_mi_duration + cc_state->rtt) * 1e9;
 }
 
 static void pcc_monitor()
@@ -776,6 +776,7 @@ static void pcc_monitor()
 				u32 throughput = cc_state->curr_rate * mi_duration / 1000000000; // pkts sent in MI
 				u32 acked_mi = cc_state->mi_acked_chunks; // acked pkts from MI
 
+				throughput = umax32(throughput, cc_state->mi_tx_npkts);
 				throughput = umax32(throughput, 1);
 				acked_mi = umin32(acked_mi, throughput);
 				float loss = (float)(throughput - acked_mi) / throughput;
@@ -1124,6 +1125,10 @@ static u32 path_can_send_npkts_sibra(struct sibra_state *sibra_state, u64 now)
 
 static u32 path_can_send_npkts_best_effort(struct ccontrol_state *cc_state, u64 now)
 {
+	if(!cc_state->pcc_initialized) {
+		cc_state->pcc_initialized = true;
+		cc_state->mi_start = get_nsecs();
+	}
 	u64 dt = now - cc_state->mi_start;
 
 	dt = umax64(dt, 1);

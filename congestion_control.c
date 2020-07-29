@@ -52,6 +52,7 @@ void terminate_ccontrol(struct ccontrol_state *cc_state) {
 }
 
 void continue_ccontrol(struct ccontrol_state *cc_state) {
+	cc_state->pcc_initialized = false;
 	cc_state->prev_rate = cc_state->curr_rate;
 	cc_state->state = pcc_startup;
 	cc_state->eps = EPS_MIN;

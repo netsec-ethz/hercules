@@ -40,6 +40,7 @@ struct ccontrol_state {
 	struct rct rcts[RCTS_INTERVALS];
 	int rcts_iter;
 	enum pcc_state state;
+	bool pcc_initialized;
 };
 
 
