@@ -882,7 +882,7 @@ static bool tx_await_cts(int sockfd)
 	}
 
 	// Set 20 second timeout on the socket, wait for receiver to get ready
-	struct timeval to = {.tv_sec = 20, .tv_usec = 0};
+	struct timeval to = {.tv_sec = 60, .tv_usec = 0};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
 	char buf[ether_size];
