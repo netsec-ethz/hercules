@@ -147,11 +147,8 @@ func (config *HerculesReceiverConfig) mergeFlags(flags *Flags) error {
 	if err := forbidFlags([]string{"pcc", "p", "d", "t", "np", "be", "resv"}, "receiving"); err != nil {
 		return err
 	}
-	if isFlagPassed("n") {
-		config.DumpInterval = flags.dumpInterval * time.Second
-	}
-	if isFlagPassed("i") {
-		config.Interface = flags.ifname
+	if err := config.HerculesGeneralConfig.mergeFlags(flags); err != nil {
+		return nil
 	}
 	if isFlagPassed("l") {
 		config.LocalAddresses = SiteConfig{}
@@ -181,24 +178,8 @@ func (config *HerculesReceiverConfig) mergeFlags(flags *Flags) error {
 			}
 		}
 	}
-	if isFlagPassed("m") {
-		config.Mode = flags.mode
-	}
-	if isFlagPassed("q") {
-		var err error
-		err, config.Queues = parseQueues(flags)
-		if err != nil {
-			return err
-		}
-	}
 	if isFlagPassed("o") {
 		config.OutputFile = flags.outputFilename
-	}
-	if isFlagPassed("v") {
-		config.Verbosity = flags.verbose
-	}
-	if isFlagPassed("mtu") {
-		config.MTU = flags.mtu
 	}
 	return nil
 }
@@ -334,14 +315,11 @@ func (config *HerculesSenderConfig) mergeFlags(flags *Flags) error {
 	if err := forbidFlags([]string{"o"}, "sending"); err != nil {
 		return err
 	}
-	if isFlagPassed("n") {
-		config.DumpInterval = flags.dumpInterval * time.Second
+	if err := config.HerculesGeneralConfig.mergeFlags(flags); err != nil {
+		return nil
 	}
 	if isFlagPassed("pcc") {
 		config.EnablePCC = flags.enablePCC
-	}
-	if isFlagPassed("i") {
-		config.Interface = flags.ifname
 	}
 	if isFlagPassed("l") {
 		if len(flags.localAddrs) == 1 {
@@ -352,16 +330,6 @@ func (config *HerculesSenderConfig) mergeFlags(flags *Flags) error {
 	}
 	if isFlagPassed("p") {
 		config.RateLimit = flags.maxRateLimit
-	}
-	if isFlagPassed("m") {
-		config.Mode = flags.mode
-	}
-	if isFlagPassed("q") {
-		var err error
-		err, config.Queues = parseQueues(flags)
-		if err != nil {
-			return err
-		}
 	}
 	if isFlagPassed("d") {
 		sites := make([]SiteConfig, 0)
@@ -393,9 +361,6 @@ func (config *HerculesSenderConfig) mergeFlags(flags *Flags) error {
 	if isFlagPassed("t") {
 		config.TransmitFile = flags.transmitFilename
 	}
-	if isFlagPassed("v") {
-		config.Verbosity = flags.verbose
-	}
 	if isFlagPassed("np") {
 		config.NumPathsPerDest = flags.numPaths
 	}
@@ -404,9 +369,6 @@ func (config *HerculesSenderConfig) mergeFlags(flags *Flags) error {
 	}
 	if isFlagPassed("resv") {
 		config.EnableReservations = flags.enableSibra
-	}
-	if isFlagPassed("mtu") {
-		config.MTU = flags.mtu
 	}
 	return nil
 }
@@ -495,6 +457,32 @@ func (config *HerculesGeneralConfig) validateStrict() error {
 	}
 	if config.MTU > 8015 {
 		log.Warn(fmt.Sprintf("using frame size %d > 8015 (IEEE 802.11)", config.MTU))
+	}
+	return nil
+}
+
+func (config *HerculesGeneralConfig) mergeFlags(flags *Flags) error {
+	if isFlagPassed("n") {
+		config.DumpInterval = flags.dumpInterval * time.Second
+	}
+	if isFlagPassed("i") {
+		config.Interface = flags.ifname
+	}
+	if isFlagPassed("m") {
+		config.Mode = flags.mode
+	}
+	if isFlagPassed("q") {
+		var err error
+		err, config.Queues = parseQueues(flags)
+		if err != nil {
+			return err
+		}
+	}
+	if isFlagPassed("v") {
+		config.Verbosity = flags.verbose
+	}
+	if isFlagPassed("mtu") {
+		config.MTU = flags.mtu
 	}
 	return nil
 }
