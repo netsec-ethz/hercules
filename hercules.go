@@ -129,11 +129,23 @@ func realMain() error {
 	senderConfig.initializeDefaults()
 	receiverConfig.initializeDefaults()
 	if isFlagPassed("c") {
-		if _, err := toml.DecodeFile(configFile, &senderConfig); err != nil {
+		undecoded := make(map[string]struct{})
+		if meta, err := toml.DecodeFile(configFile, &senderConfig); err != nil {
 			return err
+		} else {
+			for _, key := range meta.Undecoded() {
+				undecoded[strings.Join(key, ".")] = struct{}{}
+			}
 		}
-		if _, err := toml.DecodeFile(configFile, &receiverConfig); err != nil {
+		if meta, err := toml.DecodeFile(configFile, &receiverConfig); err != nil {
 			return err
+		} else {
+			for _, key := range meta.Undecoded() {
+				key := strings.Join(key, ".")
+				if _, ok := undecoded[key]; ok {
+					log.Warn(fmt.Sprintf("Configuration file contains key \"%s\" which is unknown for both, sending and receiving", key))
+				}
+			}
 		}
 	}
 
