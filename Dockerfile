@@ -1,10 +1,10 @@
 # ubuntu/disco with go-1.11
 # copy pasted from 
-#  https://github.com/docker-library/golang/blob/master/1.11/stretch/Dockerfile
+#  https://github.com/docker-library/golang/blob/master/1.15/buster/Dockerfile
 # but with a different base image (ubuntu:disco instead of debian:stretch); we
 # need the newer kernel headers to build XDP C code against
 
-FROM ubuntu:disco
+FROM ubuntu:focal
 
 # gcc for cgo
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -19,48 +19,112 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 		ca-certificates \
 		libelf-dev \
 		vim less \
+		gpg \
+		gpg-agent \
+		dirmngr \
 	&& rm -rf /var/lib/apt/lists/*
 
-ENV GOLANG_VERSION 1.14.1
+ENV PATH /usr/local/go/bin:$PATH
+
+ENV GOLANG_VERSION 1.15
 
 RUN set -eux; \
 	\
-# this "case" statement is generated via "update.sh"
 	dpkgArch="$(dpkg --print-architecture)"; \
 	case "${dpkgArch##*-}" in \
-		amd64) goRelArch='linux-amd64'; goRelSha256='2f49eb17ce8b48c680cdb166ffd7389702c0dec6effa090c324804a5cac8a7f8' ;; \
-		armhf) goRelArch='linux-armv6l'; goRelSha256='04f10e345dae0d7c6c32ffd6356b47f2d4d0e8a0cb757f4ef48ead6c5bef206f' ;; \
-		arm64) goRelArch='linux-arm64'; goRelSha256='5d8f2c202f35481617e24e63cca30c6afb1ec2585006c4a6ecf16c5f4928ab3c' ;; \
-		i386) goRelArch='linux-386'; goRelSha256='92d465accdebbe2d0749b2f90c22ecb1fd2492435144923f88ce410cd56b6546' ;; \
-		ppc64el) goRelArch='linux-ppc64le'; goRelSha256='6559201d452ee2782dfd684d59c05e3ecf789dc40a7ec0ad9ae2dd9f489c0fe1' ;; \
-		s390x) goRelArch='linux-s390x'; goRelSha256='af009bd6e7729c441fec78af427743fefbf11f919c562e01b37836d835f74226' ;; \
-		*) goRelArch='src'; goRelSha256='2ad2572115b0d1b4cb4c138e6b3a31cee6294cb48af75ee86bec3dca04507676'; \
-			echo >&2; echo >&2 "warning: current architecture ($dpkgArch) does not have a corresponding Go binary release; will be building from source"; echo >&2 ;; \
+		'amd64') \
+			arch='linux-amd64'; \
+			url='https://storage.googleapis.com/golang/go1.15.linux-amd64.tar.gz'; \
+			sha256='2d75848ac606061efe52a8068d0e647b35ce487a15bb52272c427df485193602'; \
+			;; \
+		'armhf') \
+			arch='linux-armv6l'; \
+			url='https://storage.googleapis.com/golang/go1.15.linux-armv6l.tar.gz'; \
+			sha256='6d8914ddd25f85f2377c269ccfb359acf53adf71a42cdbf53434a7c76fa7a9bd'; \
+			;; \
+		'arm64') \
+			arch='linux-arm64'; \
+			url='https://storage.googleapis.com/golang/go1.15.linux-arm64.tar.gz'; \
+			sha256='7e18d92f61ddf480a4f9a57db09389ae7b9dadf68470d0cb9c00d734a0c57f8d'; \
+			;; \
+		'i386') \
+			arch='linux-386'; \
+			url='https://storage.googleapis.com/golang/go1.15.linux-386.tar.gz'; \
+			sha256='68ce979083126694ceef60233f69efe870f54af24d81a120f76265107a9e9aab'; \
+			;; \
+		'ppc64el') \
+			arch='linux-ppc64le'; \
+			url='https://storage.googleapis.com/golang/go1.15.linux-ppc64le.tar.gz'; \
+			sha256='4603736a158b3d8ac52b9245f39bf715936c801e05bb5ad7c44b1edd6d5ef6a2'; \
+			;; \
+		's390x') \
+			arch='linux-s390x'; \
+			url='https://storage.googleapis.com/golang/go1.15.linux-s390x.tar.gz'; \
+			sha256='8825f93caaf87465e32f298408c48b98d4180f3ddb885bd027f2926e711d23e8'; \
+			;; \
+		*) \
+# https://github.com/golang/go/issues/38536#issuecomment-616897960
+			arch='src'; \
+			url='https://storage.googleapis.com/golang/go1.15.src.tar.gz'; \
+			sha256='69438f7ed4f532154ffaf878f3dfd83747e7a00b70b3556eddabf7aaee28ac3a'; \
+			echo >&2; \
+			echo >&2 "warning: current architecture ($dpkgArch) does not have a corresponding Go binary release; will be building from source"; \
+			echo >&2; \
+			;; \
 	esac; \
 	\
-	url="https://golang.org/dl/go${GOLANG_VERSION}.${goRelArch}.tar.gz"; \
-	wget --no-check-certificate -O go.tgz "$url"; \
-	echo "${goRelSha256} *go.tgz" | sha256sum -c -; \
+	wget -O go.tgz.asc "$url.asc" --progress=dot:giga; \
+	wget -O go.tgz "$url" --progress=dot:giga; \
+	echo "$sha256 *go.tgz" | sha256sum --strict --check -; \
+	\
+# https://github.com/golang/go/issues/14739#issuecomment-324767697
+	export GNUPGHOME="$(mktemp -d)"; \
+# https://www.google.com/linuxrepositories/
+	gpg --batch --keyserver ha.pool.sks-keyservers.net --recv-keys 'EB4C 1BFD 4F04 2F6D DDCC EC91 7721 F63B D38B 4796'; \
+	gpg --batch --verify go.tgz.asc go.tgz; \
+	rm -rf "$GNUPGHOME" go.tgz.asc; \
+	\
 	tar -C /usr/local -xzf go.tgz; \
 	rm go.tgz; \
 	\
-	if [ "$goRelArch" = 'src' ]; then \
-		echo >&2; \
-		echo >&2 'error: UNIMPLEMENTED'; \
-		echo >&2 'TODO install golang-any from jessie-backports for GOROOT_BOOTSTRAP (and uninstall after build)'; \
-		echo >&2; \
-		exit 1; \
+	if [ "$arch" = 'src' ]; then \
+		savedAptMark="$(apt-mark showmanual)"; \
+		apt-get update; \
+		apt-get install -y --no-install-recommends golang-go; \
+		\
+		goEnv="$(go env | sed -rn -e '/^GO(OS|ARCH|ARM|386)=/s//export \0/p')"; \
+		eval "$goEnv"; \
+		[ -n "$GOOS" ]; \
+		[ -n "$GOARCH" ]; \
+		( \
+			cd /usr/local/go/src; \
+			./make.bash; \
+		); \
+		\
+		apt-mark auto '.*' > /dev/null; \
+		apt-mark manual $savedAptMark > /dev/null; \
+		apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \
+		rm -rf /var/lib/apt/lists/*; \
+		\
+# pre-compile the standard library, just like the official binary release tarballs do
+		go install std; \
+# go install: -race is only supported on linux/amd64, linux/ppc64le, linux/arm64, freebsd/amd64, netbsd/amd64, darwin/amd64 and windows/amd64
+#		go install -race std; \
+		\
+# remove a few intermediate / bootstrapping files the official binary release tarballs do not contain
+		rm -rf \
+			/usr/local/go/pkg/*/cmd \
+			/usr/local/go/pkg/bootstrap \
+			/usr/local/go/pkg/obj \
+			/usr/local/go/pkg/tool/*/api \
+			/usr/local/go/pkg/tool/*/go_bootstrap \
+			/usr/local/go/src/cmd/dist/dist \
+		; \
 	fi; \
 	\
-	export PATH="/usr/local/go/bin:$PATH"; \
 	go version
 
-RUN useradd buildboy --create-home --shell /bin/bash
-USER buildboy
-WORKDIR /home/buildboy
-RUN mkdir go
-ENV GOPATH /home/buildboy/go
-
-ENV PATH $GOPATH/bin:/usr/local/go/bin:$PATH
-
+ENV GOPATH /go
+ENV PATH $GOPATH/bin:$PATH
 RUN mkdir -p "$GOPATH/src" "$GOPATH/bin" && chmod -R 777 "$GOPATH"
+WORKDIR $GOPATH
