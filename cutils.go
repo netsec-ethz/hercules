@@ -349,7 +349,7 @@ func getAddrs(iface *net.Interface, destination net.IP) (dstMAC, srcMAC net.Hard
 	}
 	dstMAC, err = getNeighborMAC(n, iface.Index, dstIP)
 	if err != nil {
-		if err.Error() == "Missing ARP entry" {
+		if err.Error() == "missing ARP entry" {
 			// Handle missing ARP entry
 			fmt.Printf("Sending ICMP echo to %v over %v and retrying...\n", dstIP, iface.Name)
 
