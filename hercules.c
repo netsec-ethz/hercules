@@ -2441,6 +2441,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	FOREACH(queue, q) {
 		xsks[q] = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queues[q], xdp_mode);
 		senders[q] = start_thread(tx_send_p, xsks[q]);
+		submit_initial_rx_frames(xsks[q]->umem);
 	}
 
 	tx_state->start_time = get_nsecs();
