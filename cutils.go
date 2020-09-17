@@ -111,6 +111,9 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPathHeader, 
 	scionPkt.L4.Reverse()
 
 	overlayHeader, err := prepareOverlayPacketHeader(srcIP, dstIP, uint16(udpDstPort), iface)
+	if err != nil {
+		return nil, err
+	}
 
 	scionHeaderLen := scionPkt.HdrLen() + l4.UDPLen
 	payloadLen := etherLen - len(overlayHeader) - scionHeaderLen
@@ -388,11 +391,6 @@ func getNeighborMAC(n *netlink.Handle, linkIndex int, ip net.IP) (net.HardwareAd
 }
 
 func sendICMP(iface *net.Interface, srcIP net.IP, dstIP net.IP) (err error) {
-	ip := layers.IPv4{
-		SrcIP:    srcIP,
-		DstIP:    dstIP,
-		Protocol: layers.IPProtocolICMPv4,
-	}
 	icmp := layers.ICMPv4{
 		TypeCode: layers.ICMPv4TypeEchoRequest,
 	}
@@ -401,7 +399,7 @@ func sendICMP(iface *net.Interface, srcIP net.IP, dstIP net.IP) (err error) {
 		FixLengths:       true,
 		ComputeChecksums: true,
 	}
-	err = gopacket.SerializeLayers(buf, serializeOpts, &ip, &icmp)
+	err = gopacket.SerializeLayers(buf, serializeOpts, &icmp)
 	if err != nil {
 		return err
 	}
