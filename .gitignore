@@ -1,2 +1,4 @@
+bpf_prgm/*.ll
+bpf_prgm/*.o
 hercules
 mockules/mockules

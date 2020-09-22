@@ -8,10 +8,31 @@ ifndef DESTDIR
 endif
 	cp hercules mockules/mockules $(DESTDIR)
 
-hercules: builder hercules.h hercules.go hercules.c
+hercules: builder hercules.h hercules.go hercules.c bpf_prgm/redirect_userspace.o bpf_prgm/pass.o
+	@# update modification dates in assembly, so that the new version gets loaded
+	@sed -i -e "s/\(load bpf_prgm_pass\)\( \)\?\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\)\?/\1 $$(date -r bpf_prgm/pass.c '+%Y-%m-%d %H:%M:%S')/g" bpf_prgms.s
+	@sed -i -e "s/\(load bpf_prgm_redirect_userspace\)\( \)\?\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\)\?/\1 $$(date -r bpf_prgm/redirect_userspace.c '+%Y-%m-%d %H:%M:%S')/g" bpf_prgms.s
 	@taggedRef=$$(git describe --tags --long --dirty 2>/dev/null) && startupVersion=$$(git rev-parse --abbrev-ref HEAD)"-$${taggedRef}" || \
 		startupVersion=$$(git rev-parse --abbrev-ref HEAD)"-untagged-"$$(git describe --tags --dirty --always); \
 	docker exec hercules-builder go build -ldflags "-X main.startupVersion=$${startupVersion}"
+
+bpf_prgm/%.ll: bpf_prgm/%.c builder
+	docker exec hercules-builder clang -S -target bpf -D __BPF_TRACING__ -I. -Wall -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Werror -O2 -emit-llvm -c -g -o $@ $<
+
+bpf_prgm/redirect_userspace.o: bpf_prgm/redirect_userspace.ll builder
+	docker exec hercules-builder llc -march=bpf -filetype=obj -o $@ $<
+
+bpf_prgm/pass.o: bpf_prgm/pass.ll builder
+	docker exec hercules-builder llc -march=bpf -filetype=obj -o $@ $<
+
+#bpf_prgm/redirect_userspace.ll: bpf_prgm/redirect_userspace.c builder
+#	docker exec hercules-builder clang -S -target bpf -D __BPF_TRACING__ -I. -Wall -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Werror -O2 -emit-llvm -c -g -o $@ $<
+
+#bpf_prgm/pass.ll: bpf_prgm/pass.c builder
+#	docker exec hercules-builder clang -S -target bpf -D __BPF_TRACING__ -I. -Wall -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Werror -O2 -emit-llvm -c -g -o $@ $<
+
+#bpf_prgm/redirect_userspace.o: bpf_prgm_redirect_userspace.ll builder
+#	docker exec hercules-builder llc -march=bpf -filetype=obj -o $@ $<
 
 mockules: builder mockules/main.go
 	docker exec -w /`basename $(PWD)`/mockules hercules-builder go build

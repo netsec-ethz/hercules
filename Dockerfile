@@ -22,6 +22,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 		gpg \
 		gpg-agent \
 		dirmngr \
+		clang \
+		llvm \
+		libelf-dev \
+		libpcap-dev \
+		gcc-multilib \
+		build-essential \
 	&& rm -rf /var/lib/apt/lists/*
 
 ENV PATH /usr/local/go/bin:$PATH

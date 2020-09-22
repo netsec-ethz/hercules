@@ -46,6 +46,7 @@
 #include "congestion_control.h"
 #include "utils.h"
 #include "send_queue.h"
+#include "bpf_prgms.h"
 
 
 #define SCION_ENDHOST_PORT 30041 // aka SCION_UDP_EH_DATA_PORT
@@ -2073,32 +2074,47 @@ static int socket_on_if(int ifindex)
 	return sockfd;
 }
 
-// XXX Workaround: the i40e driver (in zc mode) does not seem to allow sending if no program is loaded.
-//	   Load an XDP program that just passes all packets (i.e. does the same thing as no program).
-static int load_xsk_nop_passthrough()
+static int load_bpf(const void *prgm, ssize_t prgm_size, struct bpf_object **obj)
 {
 	static const int log_buf_size = 16 * 1024;
 	char log_buf[log_buf_size];
-	int err, prog_fd;
+	int prog_fd;
 
-	/* This is the C-program:
-	 * SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
-	 * {
-	 *     return XDP_PASS;
-	 * }
-	 */
-	struct bpf_insn prog[] = {
-			BPF_MOV32_IMM(BPF_REG_0, 2),
-			BPF_EXIT_INSN(),
-	};
-	size_t insns_cnt = sizeof(prog) / sizeof(struct bpf_insn);
+	char tmp_file[] = "/tmp/hrcbpfXXXXXX";
+	int fd = mkstemp(tmp_file);
+	if(fd < 0) {
+		return -errno;
+	}
+	if(prgm_size != write(fd, prgm, prgm_size)) {
+		debug_printf("Could not write bpf file");
+		return -EXIT_FAILURE;
+	}
 
-	prog_fd = bpf_load_program(BPF_PROG_TYPE_XDP, prog, insns_cnt,
-							   "LGPL-2.1 or BSD-2-Clause", 0, log_buf,
-							   log_buf_size);
-	if(prog_fd < 0) {
+	struct bpf_object *_obj;
+	if(obj == NULL) {
+		obj = &_obj;
+	}
+	int ret = bpf_prog_load(tmp_file, BPF_PROG_TYPE_XDP, obj, &prog_fd);
+	debug_printf("error loading file(%s): %d %s", tmp_file, -ret, strerror(-ret));
+	int unlink_ret = unlink(tmp_file);
+	if(0 != unlink_ret) {
+		fprintf(stderr, "Could not remove temporary file, error: %d", unlink_ret);
+	}
+	if(ret != 0) {
 		printf("BPF log buffer:\n%s", log_buf);
-		return prog_fd;
+		return ret;
+	}
+	return prog_fd;
+}
+
+// XXX Workaround: the i40e driver (in zc mode) does not seem to allow sending if no program is loaded.
+//	   Load an XDP program that just passes all packets (i.e. does the same thing as no program).
+static int load_xsk_pass()
+{
+	int err, prog_fd;
+	prog_fd = load_bpf(bpf_prgm_pass, bpf_prgm_pass_size, NULL);
+	if(prog_fd < 0) {
+		exit_with_error(-prog_fd);
 	}
 
 	err = bpf_set_link_xdp_fd(opt_ifindex, prog_fd, opt_xdp_flags);
@@ -2122,89 +2138,19 @@ static void xsk_map__add_xsk(xskmap map, int index, struct xsk_socket_info *xsk)
  */
 static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[])
 {
-	static const int log_buf_size = 16 * 1024;
-	char log_buf[log_buf_size];
-	int err, prog_fd;
-
-	int max_queue = 0;
-	FOREACH(queue, q) {
-		max_queue = umax32(max_queue, queues[q]);
+	int err;
+	struct bpf_object *obj;
+	int prog_fd = load_bpf(bpf_prgm_redirect_userspace, bpf_prgm_redirect_userspace_size, &obj);
+	if(prog_fd < 0) {
+		exit_with_error(prog_fd);
 	}
-	int xsks_map_fd = bpf_create_map(BPF_MAP_TYPE_XSKMAP, 4, 4, max_queue + 1, 0);
-	if (xsks_map_fd < 0) {
+
+	int xsks_map_fd = bpf_object__find_map_fd_by_name(obj, "xsks_map");
+	if(xsks_map_fd < 0) {
 		exit_with_error(-xsks_map_fd);
 	}
 	FOREACH(queue, q) {
 		xsk_map__add_xsk(xsks_map_fd, queues[q], xsks[q]);
-	}
-
-	/* This is the C-program:
-	 * SEC("xdp_sock") int xdp_sock_prog(struct xdp_md *ctx)
-	 * {
-	 *	   void *data = (void *)(long)ctx->data;
-	 *	   void *data_end = (void *)(long)ctx->data_end;
-	 *
-	 * 	   if(data + sizeof(struct ether_header) + sizeof(struct iphdr) > data_end) {
-	 *         return XDP_PASS; // too short
-	 *     }
-	 *     const struct ether_header *eh = (const struct ether_header *)data;
-	 *     if(eh->ether_type != htons(ETHERTYPE_IP)) {
-	 *         return XDP_PASS; // not IP
-	 *     }
-	 *
-	 *	   return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
-     * }
-	 */
-	struct bpf_insn prog[] = {
-			/* r0 = XDP_PASS */
-			BPF_MOV64_IMM(BPF_REG_0, 2),
-			/* r6 = *(u32 *)(r1 + 16) */
-			BPF_LDX_MEM(BPF_W, BPF_REG_6, BPF_REG_1, 16), // ctx->rx_queue_index
-			/* r3 = *(u32 *)(r1 + 4) */
-			BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1, 4), // ctx->data_end
-			/* r2 = *(u32 *)(r1 + 0) */
-			BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_1, 0), // ctx->data
-			/* r4 = r2 */
-			BPF_MOV64_REG(BPF_REG_4, BPF_REG_2),
-			/* r4 += 34 */
-			BPF_ALU64_IMM(BPF_ADD, BPF_REG_4, 34),
-			/* if r4 > r3 goto exit (pc+13) */
-			BPF_JMP_REG(BPF_JGT, BPF_REG_4, BPF_REG_3, 13),
-			/* r3 = *(u8 *)(r2 + 12) */
-			BPF_LDX_MEM(BPF_B, BPF_REG_3, BPF_REG_2, 12),
-			/* r2 = *(u8 *)(r2 + 13) */
-			BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_2, 13),
-			/* r2 <<= 8 */
-			BPF_ALU64_IMM(BPF_LSH, BPF_REG_2, 8),
-			/* r2 |= r3 */
-			BPF_ALU64_REG(BPF_OR, BPF_REG_2, BPF_REG_3),
-			/* if r2 != htons(ETHERTYPE_IP) goto exit (pc+8) */
-			BPF_JMP_IMM(BPF_JNE, BPF_REG_2, htons(ETHERTYPE_IP), 8),
-			/* r1 = r0 */
-			BPF_MOV64_REG(BPF_REG_1, BPF_REG_0),
-			/* r0 = XPF_PASS */
-			BPF_MOV64_IMM(BPF_REG_0, 2),
-			/* if r1 == 0 goto pc+5 */
-			BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 5),
-			/* r2 = r6 */
-			BPF_MOV64_REG(BPF_REG_2, BPF_REG_6),
-			/* r3 = 0 */
-			BPF_MOV64_IMM(BPF_REG_3, 0),
-			/* r1 = xskmap[] */
-			BPF_LD_MAP_FD(BPF_REG_1, xsks_map_fd),
-			/* call bpf_redirect_map */
-			BPF_EMIT_CALL(BPF_FUNC_redirect_map),
-			/* The jumps are to this instruction */
-			BPF_EXIT_INSN(),
-	};
-	size_t insns_cnt = sizeof(prog) / sizeof(struct bpf_insn);
-
-	prog_fd = bpf_load_program(BPF_PROG_TYPE_XDP, prog, insns_cnt,
-							   "LGPL-2.1 or BSD-2-Clause", 0, log_buf,
-							   log_buf_size);
-	if(prog_fd < 0) {
-		printf("BPF log buffer:\n%s", log_buf);
-		exit_with_error(-prog_fd);
 	}
 
 	err = bpf_set_link_xdp_fd(opt_ifindex, prog_fd, opt_xdp_flags);
@@ -2220,7 +2166,7 @@ static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[])
 
 static void *tx_p(__attribute__ ((unused)) void *arg)
 {
-	load_xsk_nop_passthrough();
+	load_xsk_pass();
 	tx_only();
 
 	return NULL;
