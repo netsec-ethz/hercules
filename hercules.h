@@ -15,15 +15,10 @@
 #ifndef __HERCULES_H__
 #define __HERCULES_H__
 
+#include "shared_bpf.h"
 #include <stdbool.h>
-#include <linux/types.h>
 #include <stdatomic.h>
 #include <stdio.h>
-
-typedef __u64 u64;
-typedef __u32 u32;
-typedef __u16 u16;
-typedef __u8 u8;
 
 #undef NDEBUG
 

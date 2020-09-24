@@ -49,8 +49,6 @@
 #include "bpf_prgms.h"
 
 
-#define SCION_ENDHOST_PORT 30041 // aka SCION_UDP_EH_DATA_PORT
-
 #define L4_SCMP 1
 // #define L4_UDP 17 //  == IPPROTO_UDP
 
@@ -79,28 +77,6 @@ extern int HerculesGetReplyPath(const char *packetPtr, int length, struct hercul
 
 #pragma pack(push)
 #pragma pack(1)
-// XXX: from libscion/packet.h
-struct scionhdr {
-	/** Packet Type of the packet (version, dstType, srcType) */
-	u16 ver_dst_src;
-	/** Total Length of the packet */
-	u16 total_len;
-	/** Header length that includes the path */
-	u8 header_len;
-	/** Offset of current Info opaque field*/
-	u8 current_iof;
-	/** Offset of current Hop opaque field*/
-	u8 current_hof;
-	/** next header type, shared with IP protocol number*/
-	u8 next_header;
-};
-
-struct scionaddrhdr_ipv4 {
-	u64 dst_ia;
-	u64 src_ia;
-	u32 dst_ip;
-	u32 src_ip;
-};
 
 // Structure of first RBUDP packet sent by sender.
 // Integers all transmitted in little endian (host endianness).
@@ -388,6 +364,38 @@ u16 scion_udp_checksum(const u8 *buf, int len)
 }
 
 // Parse ethernet/IP/UDP/SCION/UDP packet,
+// this is an extension to the parse_pkt
+// function below only doing the checking
+// that the BPF program has not already done.
+//
+// The BPF program writes the offset and the
+// addr_idx to the first two words, set
+// these arguments to -1 to use them.
+static const char *parse_pkt_fast_path(const char *pkt, size_t length, bool check, size_t offset)
+{
+	if(offset == UINT32_MAX) {
+		offset = *(int *) pkt;
+	}
+	if(check) {
+		// we compute these pointers here again so that we do not have to pass it from kernel space into user space
+		// which could negatively affect the performance in the case when the checksum is not verified
+		struct scionhdr *scionh = (struct scionhdr *)
+				(pkt + sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct udphdr));
+		struct udphdr *l4udph = (struct udphdr *) (pkt + offset) - 1;
+
+		u16 header_checksum = l4udph->check;
+		u16 computed_checksum = scion_udp_checksum((u8 *) scionh, length - offset + sizeof(struct udphdr));
+		if(header_checksum != computed_checksum) {
+			debug_printf("Checksum in SCION/UDP header %u "
+						 "does not match computed checksum %u",
+						 ntohs(header_checksum), ntohs(computed_checksum));
+			return NULL;
+		}
+	}
+	return pkt + offset;
+}
+
+// Parse ethernet/IP/UDP/SCION/UDP packet,
 // check that it is addressed to us,
 // check SCION-UDP checksum if set.
 // sets scionaddrh_o to SCION address header, if provided
@@ -414,7 +422,7 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 	}
 	const struct iphdr *iph = (const struct iphdr *) (pkt + offset);
 	if(iph->protocol != IPPROTO_UDP) {
-		//debug_printf("not UDP: %u, %zu", iph->protocol, offset);
+		debug_printf("not UDP: %u, %zu", iph->protocol, offset);
 		return NULL;
 	}
 	int addr_idx = -1;
@@ -428,7 +436,7 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 		debug_printf("not addressed to us (IP overlay)");
 		return NULL;
 	}
-	offset += iph->ihl * 4; // IHL is header length, in number of 32-bit words.
+	offset += iph->ihl * 4u; // IHL is header length, in number of 32-bit words.
 
 	// Parse UDP header
 	if(offset + sizeof(struct udphdr) > length) {
@@ -465,7 +473,7 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 		}
 		return NULL;
 	}
-	const struct scionaddrhdr_ipv4 *scionaddrh = (const struct scionaddrhdr_ipv4 *) (pkt + offset + 8);
+	const struct scionaddrhdr_ipv4 *scionaddrh = (const struct scionaddrhdr_ipv4 *) (pkt + offset + sizeof(struct scionhdr));
 	if(scionaddrh->dst_ia != local_ia) {
 		debug_printf("not addressed to us (IA)");
 		return NULL;
@@ -489,17 +497,6 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 		return NULL;
 	}
 
-	if(check) {
-		u16 header_checksum = l4udph->check;
-		u16 computed_checksum = scion_udp_checksum((u8 *) scionh, length - offset);
-		if(header_checksum != computed_checksum) {
-			debug_printf("Checksum in SCION/UDP header %u "
-						 "does not match computed checksum %u",
-						 ntohs(header_checksum), ntohs(computed_checksum));
-			return NULL;
-		}
-	}
-
 	offset += sizeof(struct udphdr);
 	if(scionaddrh_o != NULL) {
 		*scionaddrh_o = scionaddrh;
@@ -507,7 +504,7 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 	if(udphdr_o != NULL) {
 		*udphdr_o = l4udph;
 	}
-	return pkt + offset;
+	return parse_pkt_fast_path(pkt, length, check, offset);
 }
 
 static bool recv_rbudp_control_pkt(int sockfd, char *buf, size_t buflen, const char **payload, int *payloadlen,
@@ -1058,7 +1055,7 @@ static void rx_receive_batch(struct xsk_socket_info *xsk)
 		u64 addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->addr;
 		u32 len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->len;
 		const char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
-		const char *rbudp_pkt = parse_pkt(pkt, len, true, NULL, NULL);
+		const char *rbudp_pkt = parse_pkt_fast_path(pkt, len, true, UINT32_MAX);
 		if(rbudp_pkt) {
 			if(!handle_rbudp_data_pkt(rbudp_pkt, len - (rbudp_pkt - pkt))) {
 				struct rbudp_initial_pkt initial;
@@ -2145,13 +2142,37 @@ static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[])
 		exit_with_error(prog_fd);
 	}
 
+	// push XSKs
 	int xsks_map_fd = bpf_object__find_map_fd_by_name(obj, "xsks_map");
 	if(xsks_map_fd < 0) {
+		debug_printf("Note that the BPF program assumes a maximum number of 256 queues on the NIC.");
 		exit_with_error(-xsks_map_fd);
 	}
 	FOREACH(queue, q) {
 		xsk_map__add_xsk(xsks_map_fd, queues[q], xsks[q]);
 	}
+
+	// push local addresses
+	int ips_fd = bpf_object__find_map_fd_by_name(obj, "local_addrs");
+	if(ips_fd < 0) {
+		exit_with_error(-ips_fd);
+	}
+	int ports_fd = bpf_object__find_map_fd_by_name(obj, "local_ports");
+	if(ports_fd < 0) {
+		exit_with_error(-ips_fd);
+	}
+	FOREACH(local_addr, a) {
+		bpf_map_update_elem(ips_fd, &local_addrs[a].ip, &a, 0);
+		bpf_map_update_elem(ports_fd, &a, &local_addrs[a].port, 0);
+	}
+
+	// push local_ia
+	int ia_fd = bpf_object__find_map_fd_by_name(obj, "local_ia");
+	if(ia_fd < 0) {
+		exit_with_error(-ia_fd);
+	}
+	u32 key = 0;
+	bpf_map_update_elem(ia_fd, &key, &local_ia, 0);
 
 	err = bpf_set_link_xdp_fd(opt_ifindex, prog_fd, opt_xdp_flags);
 	if(err) {
@@ -2182,6 +2203,11 @@ void hercules_init(int ifindex, const ia local_ia_, const struct local_addr *loc
 		);
 		exit_with_error(EINVAL);
 	}
+	if(MAX_NUM_LOCAL_ADDRS <num_local_addrs_) {
+		printf("Too many local addresses: %d provided, only up to %d supported", num_local_addrs_, MAX_NUM_LOCAL_ADDRS);
+		exit_with_error(EINVAL);
+	}
+
 	ether_size = mtu;
 	num_queues = num_queues_;
 	queues = calloc(num_queues, sizeof(*queues));
