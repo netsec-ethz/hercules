@@ -171,7 +171,6 @@ func toCPath(from []*HerculesPathHeader, to *C.struct_hercules_path, replaced, e
 	to.num_headers = C.u8(len(from))
 	to.replaced = C.atomic_bool(replaced)
 	to.enabled = C.atomic_bool(enabled)
-	to.max_bps = 0
 }
 
 func toCLocalAddrs(addrs []*net.UDPAddr) []C.struct_local_addr {

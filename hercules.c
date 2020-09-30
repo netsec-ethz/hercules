@@ -59,7 +59,6 @@
 
 #define RATE_LIMIT_CHECK 1000 // check rate limit every X packets
 						// Maximum burst above target pps allowed
-#define CBR_MI_MS 10 // check rate limit of CBR paths every X ms
 #define PATH_HANDSHAKE_TIMEOUT_NS 100000000 // send a path handshake every X=100 ms until the first response arrives
 
 #define ACK_RATE_TIME_MS 100 // send ACKS after at most X milliseconds
@@ -151,12 +150,6 @@ struct receiver_state {
 	u32 rx_per_path[256];
 };
 
-struct cbr_state {
-	u64 mi_start;
-	u32 mi_npkts;
-	u32 max_pps;
-};
-
 struct sender_state_per_receiver {
 	/** Map chunk_id to path_id */
 	u32 *path_map;
@@ -171,7 +164,6 @@ struct sender_state_per_receiver {
 	struct hercules_app_addr addr;
 	struct hercules_path *paths;
 	struct ccontrol_state *cc_states;
-	struct cbr_state *cbr_states;
 	bool cts_received;
 };
 
@@ -806,7 +798,7 @@ bool tx_handle_handshake_reply(const struct rbudp_initial_pkt *initial, struct s
 				if(rcvr->cc_states != NULL) {
 					u64 now = get_nsecs();
 					for(u32 p = 0; p < rcvr->num_paths; p++) {
-						if(p != initial->path_index && rcvr->paths[p].enabled && rcvr->paths[p].max_bps == 0) {
+						if(p != initial->path_index && rcvr->paths[p].enabled) {
 							rcvr->paths[p].next_handshake_at = now;
 							rcvr->cc_states[p].pcc_mi_duration = DBL_MAX;
 							rcvr->cc_states[p].rtt = DBL_MAX;
@@ -1102,26 +1094,7 @@ static void rate_limit_tx(void)
 	prev_tx_npkts_queued = tx_npkts_queued;
 }
 
-static u32 path_can_send_npkts_cbr(struct cbr_state *cbr_state, u64 now)
-{
-	if(cbr_state->mi_start + CBR_MI_MS * 1000000 < now) {
-		u64 dt = cbr_state->mi_npkts * 1000000000. / cbr_state->max_pps;
-		cbr_state->mi_start = umax64(now, cbr_state->mi_start + dt);
-		cbr_state->mi_npkts = 0;
-	}
-	if(cbr_state->mi_start > now) {
-		// wait until we can send again
-		return 0;
-	} else {
-		if(cbr_state->mi_npkts * 1000 / CBR_MI_MS < cbr_state->max_pps) {
-			return cbr_state->max_pps - cbr_state->mi_npkts * 1000 / CBR_MI_MS;
-		} else {
-			return 0;
-		}
-	}
-}
-
-static u32 path_can_send_npkts_best_effort(struct ccontrol_state *cc_state, u64 now)
+static u32 path_can_send_npkts(struct ccontrol_state *cc_state, u64 now)
 {
 	if(!cc_state->pcc_initialized) {
 		cc_state->pcc_initialized = true;
@@ -1213,27 +1186,24 @@ static void update_hercules_tx_paths(void)
 				// the Go part which is less performance critical
 
 				atomic_store(&receiver->paths[p].next_handshake_at, UINT64_MAX); // by default do not send a new handshake
-				if (p == receiver->return_path_idx) {
+				if(p == receiver->return_path_idx) {
 					atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure handshake_rtt is adapted
 					// don't trigger RTT estimate on other paths, as it will be triggered by the ACK on the new return path
 					replaced_return_path = true;
 				}
-				if(shd_path->max_bps == 0) { // reset PCC state
-					if(!replaced_return_path && receiver->cc_states != NULL) {
-						terminate_ccontrol(&receiver->cc_states[p]);
-						continue_ccontrol(&receiver->cc_states[p]);
-						atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure mi_duration is set
-					}
-				} else { // reset CBR state
-					receiver->cbr_states[p].max_pps = 0; // triggers reset below if necessary
+				// reset PCC state
+				if(!replaced_return_path && receiver->cc_states != NULL) {
+					terminate_ccontrol(&receiver->cc_states[p]);
+					continue_ccontrol(&receiver->cc_states[p]);
+					atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure mi_duration is set
 				}
 			} else {
-				if (p == receiver->return_path_idx) {
+				if(p == receiver->return_path_idx) {
 					atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure handshake_rtt is adapted
 					// don't trigger RTT estimate on other paths, as it will be triggered by the ACK on the new return path
 					replaced_return_path = true;
 				}
-				if(receiver->cc_states != NULL && shd_path->max_bps == 0 && receiver->paths[p].enabled != shd_path->enabled) {
+				if(receiver->cc_states != NULL && receiver->paths[p].enabled != shd_path->enabled) {
 					if(shd_path->enabled) { // reactivate PCC
 						if(receiver->cc_states != NULL) {
 							double rtt = receiver->cc_states[p].rtt;
@@ -1247,17 +1217,6 @@ static void update_hercules_tx_paths(void)
 					}
 				}
 				receiver->paths[p].enabled = shd_path->enabled;
-				receiver->paths[p].max_bps = shd_path->max_bps;
-			}
-
-			u32 max_pps = receiver->paths[p].max_bps / ether_size;
-			if(receiver->cbr_states[p].max_pps != max_pps) {
-				if(receiver->cbr_states[p].max_pps < max_pps) {
-					// We got more bandwidth, start new MI to profit immediately
-					receiver->cbr_states[p].mi_start = get_nsecs();
-					receiver->cbr_states[p].mi_npkts = 0;
-				}
-				receiver->cbr_states[p].max_pps = max_pps;
 			}
 		}
 	}
@@ -1346,8 +1305,8 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 
 		void *pkt = produce_frame(xsk, *frame_nb + i, idx + i, path->framelen);
 		void *rbudp_pkt = mempcpy(pkt, path->headers[hdr_idx].header, path->headerlen);
-		u8 track_path = PCC_NO_PATH; // put path_idx iff PCC is enabled for that path
-		if(path->max_bps == 0 && receiver->cc_states != NULL) {
+		u8 track_path = PCC_NO_PATH; // put path_idx iff PCC is enabled
+		if(receiver->cc_states != NULL) {
 			track_path = unit->paths[i];
 		}
 		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, tx_state->mem + chunk_start, len, path->payloadlen);
@@ -1415,12 +1374,9 @@ u32 compute_max_chunks_per_rcvr(u32 *max_chunks_per_rcvr)
 		if(!tx_state->receiver[r].paths[tx_state->receiver[r].path_index].enabled) {
 			continue; // if a receiver does not have any enabled paths, we can actually end up here ... :(
 		}
-		if(tx_state->receiver[r].paths[tx_state->receiver[r].path_index].max_bps != 0) { // CBR
-			struct cbr_state *cbr_state = &tx_state->receiver[r].cbr_states[tx_state->receiver[r].path_index];
-			max_chunks_per_rcvr[r] = umin32(BATCH_SIZE, path_can_send_npkts_cbr(cbr_state, now));
-		} else if(tx_state->receiver[r].cc_states != NULL) { // use PCC
+		if(tx_state->receiver[r].cc_states != NULL) { // use PCC
 			struct ccontrol_state *cc_state = &tx_state->receiver[r].cc_states[tx_state->receiver[r].path_index];
-			max_chunks_per_rcvr[r] = umin32(BATCH_SIZE, path_can_send_npkts_best_effort(cc_state, now));
+			max_chunks_per_rcvr[r] = umin32(BATCH_SIZE, path_can_send_npkts(cc_state, now));
 		} else { // no path-based limit
 			max_chunks_per_rcvr[r] = BATCH_SIZE;
 		}
@@ -1651,9 +1607,7 @@ static void tx_only()
 			for(u32 r = 0; r < tx_state->num_receivers; r++) {
 				struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
 				u32 path_idx = tx_state->receiver[r].path_index;
-				if(receiver->cbr_states[path_idx].max_pps > 0) {
-					receiver->cbr_states[path_idx].mi_npkts += num_chunks_per_rcvr[r];
-				} else if(receiver->cc_states != NULL) {
+				if(receiver->cc_states != NULL) {
 					receiver->cc_states[path_idx].mi_tx_npkts += num_chunks_per_rcvr[r];
 				}
 			}
@@ -1708,7 +1662,6 @@ init_tx_state(size_t filesize, int chunklen, int max_rate_limit, char *mem, cons
 		receiver->paths = calloc(tx_state->max_paths_per_rcvr, sizeof(struct hercules_path));
 		receiver->addr = dests[d];
 		receiver->cts_received = false;
-		receiver->cbr_states = calloc(tx_state->max_paths_per_rcvr, sizeof(struct cbr_state));
 	}
 	update_hercules_tx_paths();
 }
@@ -1720,7 +1673,6 @@ static void destroy_tx_state()
 		bitset__destroy(&receiver->acked_chunks);
 		free(receiver->path_map);
 		free(receiver->paths);
-		free(receiver->cbr_states);
 	}
 	free(tx_state);
 }
@@ -2245,15 +2197,10 @@ static struct hercules_stats tx_stats(struct sender_state *t)
 		const struct sender_state_per_receiver *receiver = &t->receiver[r];
 		completed_chunks += t->receiver[r].acked_chunks.num_set;
 		for(u8 p = 0; p < receiver->num_paths; p++) {
-			struct hercules_path *path = &receiver->paths[p];
-			if(path->max_bps == 0) { // best-effort
-				if(receiver->cc_states == NULL) { // no path-specific rate-limit
-					rate_limit += t->rate_limit;
-				} else { // PCC provided limit
-					rate_limit += receiver->cc_states[p].curr_rate;
-				}
-			} else { // CBR
-				rate_limit += path->max_bps / ether_size;
+			if(receiver->cc_states == NULL) { // no path-specific rate-limit
+				rate_limit += t->rate_limit;
+			} else { // PCC provided limit
+				rate_limit += receiver->cc_states[p].curr_rate;
 			}
 		}
 	}
@@ -2386,11 +2333,9 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 			debug_printf("[receiver %d] [path 0] handshake_rtt: %fs, MI: %fs",
 						 d, receiver->handshake_rtt / 1e9, receiver->cc_states[0].pcc_mi_duration);
 
-			// make sure tx_only() performs RTT estimation on every best-effort enabled path
+			// make sure tx_only() performs RTT estimation on every enabled path
 			for(u32 p = 1; p < receiver->num_paths; p++) {
-				if(receiver->paths[p].max_bps == 0) {
-					receiver->paths[p].next_handshake_at = now;
-				}
+				receiver->paths[p].next_handshake_at = now;
 			}
 		}
 	}

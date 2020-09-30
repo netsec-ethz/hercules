@@ -20,8 +20,6 @@
 #include <stdatomic.h>
 #include <stdio.h>
 
-#undef NDEBUG
-
 #ifndef NDEBUG
 #define debug_printf(fmt, ...) printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
 #else
@@ -46,18 +44,10 @@ struct hercules_path {
 	int headerlen;
 	int payloadlen;
 	int framelen;	//!< length of ethernet frame; headerlen + payloadlen
-	u64 max_bps;    // bandwidth limit on that path, 0 = no limit
 	struct hercules_path_header *headers; //!< separate header for each destination IP address
 	u8 num_headers; //!< number of different versions available for this path (i.e. different destination host IP addresses)
 	atomic_bool enabled; // e.g. when a path has been revoked and no replacement is available, this will be set to false
 	atomic_bool replaced;
-};
-
-struct rcv_batch_pc {
-	u32 num_empty;
-	u32 num_nonempty;
-	u32 num_full;
-	char padding[52];
 };
 
 // Connection information
