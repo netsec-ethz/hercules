@@ -4,11 +4,12 @@ High speed bulk data transfer application.
 
 This is a proof of concept implementation of file transfer using SCION/UDP (over ethernet/IPv4/UDP).
 To achieve high transmit and receive rates, the `hercules` tool is implemented using `AF_XDP`.
-On suitable hardware, a single instance can achieve >30Gbps transfer rate, and multiple instances can run in parallel on different network interfaces.
+On suitable hardware, a single instance can achieve >98Gbps transfer rate, and multiple instances can run in parallel on different network interfaces.
 
 `hercules` is not a daemon, it performs for only a single file transmission and then stops. 
-There are exactly two hosts involved; the _sender_ transmits data to the _receiver_.
-The receiver waits for the sender to start the transmission.
+There are at least two hosts involved; exactly one of which behaves as a _sender_, the remaining hosts behave as receiver.
+The sender transmits the data to all receivers.
+Each receiver waits for the sender to start the transmission.
 There is no authorization, access control etc. The idea is that this will be integrated in a more generic framework that does all of that (e.g. make this run as an FTP extension).
 
 ## Building
@@ -21,7 +22,7 @@ Option
    Requires:
     - gcc/clang
     - linux kernel headers >= 5.0
-    - go >= 1.14.1
+    - go >= 1.15
 
 
 ## Running
@@ -63,13 +64,16 @@ Option
     sudo numactl -l --cpunodebind=netdev:<device> -- \
         ./hercules -i <device> -q 0 -l <sender addr> -d <receiver addr> -t path/to/file.bin
     ```
-   **Warning**: this command will attempt to send at a rate of 40 Gbps!
-   To start, or if your sender or receiver NIC is not fast enough, use `-p` to set a more reasonable rate-limit.
 
-* Both `<receiver addr>` and `<sender addr>` are SCION/IPv4 addresses with UDP port, e.g. `17-ffaa:0:1102,[172.16.0.1]:10000`
+* Both `<receiver addr>` and `<sender addr>` are SCION/IPv4 addresses with UDP port, e.g. `17-ffaa:0:1102,[172.16.0.1]:10000`.
+* To send data to multiple receivers, just provide `-d` multiple times.
 * The `numactl` is optional but has a huge effect on performance on systems with multiple numa nodes.
-* See source code (or `-h`) for additional options
-* You should be able to omit `-l`
+* The command above will use PCC for congestion control. For benchmarking, you might want to use `-pcc=false` and provide a maximum sending rate using `-p`.
+* For transfer rates >30Gbps, you might need to use multiple networking queues. At the receiver this is currently only possible in combination with multiple IP addresses. 
+* See source code (or `-h`) for additional options.
+* You should be able to omit `-l`.
+* For more sophisticated run configurations (e.g. using multiple paths), it is recommended to use a configuration file.
+* When using 4 or more paths per destination, you might need to specify path preferences to make the path selection more efficient. 
 
 
 ## Protocol
@@ -163,9 +167,5 @@ The receiver replies immediately with the same packet (using the current return 
 	  The congestion control naturally solves this too, but is fairly slow to adapt.
 	  Maybe a simple window size would work.
 * [ ] Abort of transmission not handled (if one side is stopped, the other side will wait forever).
-* [ ] Jumbo frames; requires increasing FRAME_SIZE (but there are additional limitations, since "XDP doesn't support packets spanning more than one memory page.")
-* [ ] (Huge) Move SCION packet parsing & port dispatching to an XDP program;
-      Allows that SCION traffic can go through while hercules is running & allows running multiple instances of hercules on same NIC.
-* [ ] Use multiple paths; some tricky parts may be "load balancing", splitting the congestion control and applying separate rate limits.
 * [ ] Replace paths used for sending before they expire (for very long transmissions)
 * [ ] Optimisations; check sum computations, file write (would be broken for huge files), ...
