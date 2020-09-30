@@ -120,7 +120,7 @@ type HerculesGeneralConfig struct {
 type SiteConfig struct {
 	IA        addr.IA
 	HostAddrs []string
-	NumPaths  int        // TODO implement feature
+	NumPaths  int
 	PathSpec  []PathSpec
 }
 
