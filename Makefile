@@ -10,8 +10,8 @@ endif
 
 hercules: builder hercules.h hercules.go hercules.c bpf_prgm/redirect_userspace.o bpf_prgm/pass.o
 	@# update modification dates in assembly, so that the new version gets loaded
-	@sed -i -e "s/\(load bpf_prgm_pass\)\( \)\?\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\)\?/\1 $$(date -r bpf_prgm/pass.c '+%Y-%m-%d %H:%M:%S')/g" bpf_prgms.s
-	@sed -i -e "s/\(load bpf_prgm_redirect_userspace\)\( \)\?\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\)\?/\1 $$(date -r bpf_prgm/redirect_userspace.c '+%Y-%m-%d %H:%M:%S')/g" bpf_prgms.s
+	@sed -i -e "s/\(load bpf_prgm_pass\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/pass.c | head -c 32)/g" bpf_prgms.s
+	@sed -i -e "s/\(load bpf_prgm_redirect_userspace\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/redirect_userspace.c | head -c 32)/g" bpf_prgms.s
 	@taggedRef=$$(git describe --tags --long --dirty 2>/dev/null) && startupVersion=$$(git rev-parse --abbrev-ref HEAD)"-$${taggedRef}" || \
 		startupVersion=$$(git rev-parse --abbrev-ref HEAD)"-untagged-"$$(git describe --tags --dirty --always); \
 	docker exec hercules-builder go build -ldflags "-X main.startupVersion=$${startupVersion}"
