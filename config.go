@@ -208,8 +208,6 @@ func (config *HerculesSenderConfig) initializeDefaults() {
 		Verbosity:    "",
 	}
 	config.TransmitFile = ""
-	config.EnableReservations = false
-	config.EnableBestEffort = true
 	config.EnablePCC = true
 	config.RateLimit = 3333333
 	config.LocalAddress = ""
@@ -276,8 +274,7 @@ func (config *HerculesSenderConfig) validateLoose() error {
 	return nil
 }
 
-// Validates all configuration parameters, checks presence of mandatory parameters and ensures that at least one of
-// best-effort or SIBRA is enabled.
+// Validates all configuration parameters and checks the presence of mandatory parameters
 func (config *HerculesSenderConfig) validateStrict() error {
 	if err := config.HerculesGeneralConfig.validateStrict(); err != nil {
 		return err
@@ -288,10 +285,6 @@ func (config *HerculesSenderConfig) validateStrict() error {
 
 	if config.TransmitFile == "" {
 		return errors.New("you must specify a file to send")
-	}
-
-	if !config.EnableBestEffort && !config.EnableReservations {
-		return errors.New("best-effort traffic and COLIBRI bandwidth reservations both disabled, don't know how to send data")
 	}
 
 	if config.LocalAddress == "" {
@@ -363,12 +356,6 @@ func (config *HerculesSenderConfig) mergeFlags(flags *Flags) error {
 	}
 	if isFlagPassed("np") {
 		config.NumPathsPerDest = flags.numPaths
-	}
-	if isFlagPassed("be") {
-		config.EnableBestEffort = flags.enableBestEffort
-	}
-	if isFlagPassed("resv") {
-		config.EnableReservations = flags.enableSibra
 	}
 	return nil
 }

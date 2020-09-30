@@ -30,7 +30,6 @@ import (
 	"github.com/scionproto/scion/go/lib/pathmgr"
 	"github.com/scionproto/scion/go/lib/snet"
 	"go.uber.org/atomic"
-	"hercules/mock_sibra/resvmgr" // TODO replace this with real API once it becomes available
 	"net"
 	"time"
 )
@@ -72,8 +71,6 @@ type PathManager struct {
 	cPathsPerDest      []C.struct_hercules_path
 	syncTime           time.Time
 	pathResolver       pathmgr.Resolver
-	sibraMgr           *resvmgr.Mgr
-	useBestEffort      bool
 	maxBps             uint64
 }
 
@@ -82,11 +79,6 @@ type PathMeta struct {
 	fingerprint snet.PathFingerprint
 	enabled     bool // Indicates whether this path can be used at the moment
 	updated     bool // Indicates whether this path needs to be synced to the C path
-
-	// SIBRA related
-	sbrWs      *resvmgr.WatchState
-	sbrEnabled atomic.Bool // Indicates whether the SIBRA extension can be used at the moment (i.e. SIBRA resolver is running)
-	sbrUpdated atomic.Bool // Indicates whether the SIBRA status needs to be synced to the C part
 }
 
 type PathsToDestination struct {
@@ -113,8 +105,6 @@ type Flags struct {
 	outputFilename   string
 	verbose          string
 	numPaths         int
-	enableBestEffort bool
-	enableSibra      bool
 }
 
 type HerculesGeneralConfig struct {
@@ -144,8 +134,6 @@ type HerculesReceiverConfig struct {
 type HerculesSenderConfig struct {
 	HerculesGeneralConfig
 	TransmitFile       string
-	EnableReservations bool
-	EnableBestEffort   bool
 	EnablePCC          bool
 	RateLimit          int
 	LocalAddress       string

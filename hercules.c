@@ -59,7 +59,7 @@
 
 #define RATE_LIMIT_CHECK 1000 // check rate limit every X packets
 						// Maximum burst above target pps allowed
-#define SIBRA_MI_MS 10 // check rate limit of SIBRA paths every X ms
+#define CBR_MI_MS 10 // check rate limit of CBR paths every X ms
 #define PATH_HANDSHAKE_TIMEOUT_NS 100000000 // send a path handshake every X=100 ms until the first response arrives
 
 #define ACK_RATE_TIME_MS 100 // send ACKS after at most X milliseconds
@@ -151,7 +151,7 @@ struct receiver_state {
 	u32 rx_per_path[256];
 };
 
-struct sibra_state {
+struct cbr_state {
 	u64 mi_start;
 	u32 mi_npkts;
 	u32 max_pps;
@@ -171,7 +171,7 @@ struct sender_state_per_receiver {
 	struct hercules_app_addr addr;
 	struct hercules_path *paths;
 	struct ccontrol_state *cc_states;
-	struct sibra_state *sibra_states;
+	struct cbr_state *cbr_states;
 	bool cts_received;
 };
 
@@ -1102,19 +1102,19 @@ static void rate_limit_tx(void)
 	prev_tx_npkts_queued = tx_npkts_queued;
 }
 
-static u32 path_can_send_npkts_sibra(struct sibra_state *sibra_state, u64 now)
+static u32 path_can_send_npkts_cbr(struct cbr_state *cbr_state, u64 now)
 {
-	if(sibra_state->mi_start + SIBRA_MI_MS * 1000000 < now) {
-		u64 dt = sibra_state->mi_npkts * 1000000000. / sibra_state->max_pps;
-		sibra_state->mi_start = umax64(now, sibra_state->mi_start + dt);
-		sibra_state->mi_npkts = 0;
+	if(cbr_state->mi_start + CBR_MI_MS * 1000000 < now) {
+		u64 dt = cbr_state->mi_npkts * 1000000000. / cbr_state->max_pps;
+		cbr_state->mi_start = umax64(now, cbr_state->mi_start + dt);
+		cbr_state->mi_npkts = 0;
 	}
-	if(sibra_state->mi_start > now) {
+	if(cbr_state->mi_start > now) {
 		// wait until we can send again
 		return 0;
 	} else {
-		if(sibra_state->mi_npkts * 1000 / SIBRA_MI_MS < sibra_state->max_pps) {
-			return sibra_state->max_pps - sibra_state->mi_npkts * 1000 / SIBRA_MI_MS;
+		if(cbr_state->mi_npkts * 1000 / CBR_MI_MS < cbr_state->max_pps) {
+			return cbr_state->max_pps - cbr_state->mi_npkts * 1000 / CBR_MI_MS;
 		} else {
 			return 0;
 		}
@@ -1224,8 +1224,8 @@ static void update_hercules_tx_paths(void)
 						continue_ccontrol(&receiver->cc_states[p]);
 						atomic_store(&receiver->paths[p].next_handshake_at, now); // make sure mi_duration is set
 					}
-				} else { // reset SIBRA state
-					receiver->sibra_states[p].max_pps = 0; // triggers reset below if necessary
+				} else { // reset CBR state
+					receiver->cbr_states[p].max_pps = 0; // triggers reset below if necessary
 				}
 			} else {
 				if (p == receiver->return_path_idx) {
@@ -1245,20 +1245,19 @@ static void update_hercules_tx_paths(void)
 					} else { // deactivate PCC
 						terminate_ccontrol(&receiver->cc_states[p]);
 					}
-					// Note: when a path with SIBRA reappears, we always get a new header, hence we can ignore that case here
 				}
 				receiver->paths[p].enabled = shd_path->enabled;
 				receiver->paths[p].max_bps = shd_path->max_bps;
 			}
 
 			u32 max_pps = receiver->paths[p].max_bps / ether_size;
-			if(receiver->sibra_states[p].max_pps != max_pps) {
-				if(receiver->sibra_states[p].max_pps < max_pps) {
+			if(receiver->cbr_states[p].max_pps != max_pps) {
+				if(receiver->cbr_states[p].max_pps < max_pps) {
 					// We got more bandwidth, start new MI to profit immediately
-					receiver->sibra_states[p].mi_start = get_nsecs();
-					receiver->sibra_states[p].mi_npkts = 0;
+					receiver->cbr_states[p].mi_start = get_nsecs();
+					receiver->cbr_states[p].mi_npkts = 0;
 				}
-				receiver->sibra_states[p].max_pps = max_pps;
+				receiver->cbr_states[p].max_pps = max_pps;
 			}
 		}
 	}
@@ -1358,8 +1357,7 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 	submit_batch(xsk, frame_nb, num_chunks_in_unit);
 }
 
-static void
-produce_batch(const u8 *path_by_rcvr, const u32 *chunks, const u8 *rcvr_by_chunk, u32 num_chunks)
+static void produce_batch(const u8 *path_by_rcvr, const u32 *chunks, const u8 *rcvr_by_chunk, u32 num_chunks)
 {
 	u32 chk;
 	u32 num_chunks_in_unit;
@@ -1417,9 +1415,9 @@ u32 compute_max_chunks_per_rcvr(u32 *max_chunks_per_rcvr)
 		if(!tx_state->receiver[r].paths[tx_state->receiver[r].path_index].enabled) {
 			continue; // if a receiver does not have any enabled paths, we can actually end up here ... :(
 		}
-		if(tx_state->receiver[r].paths[tx_state->receiver[r].path_index].max_bps != 0) { // SIBRA provisioned bandwidth limit
-			struct sibra_state *sibra_state = &tx_state->receiver[r].sibra_states[tx_state->receiver[r].path_index];
-			max_chunks_per_rcvr[r] = umin32(BATCH_SIZE, path_can_send_npkts_sibra(sibra_state, now));
+		if(tx_state->receiver[r].paths[tx_state->receiver[r].path_index].max_bps != 0) { // CBR
+			struct cbr_state *cbr_state = &tx_state->receiver[r].cbr_states[tx_state->receiver[r].path_index];
+			max_chunks_per_rcvr[r] = umin32(BATCH_SIZE, path_can_send_npkts_cbr(cbr_state, now));
 		} else if(tx_state->receiver[r].cc_states != NULL) { // use PCC
 			struct ccontrol_state *cc_state = &tx_state->receiver[r].cc_states[tx_state->receiver[r].path_index];
 			max_chunks_per_rcvr[r] = umin32(BATCH_SIZE, path_can_send_npkts_best_effort(cc_state, now));
@@ -1653,8 +1651,8 @@ static void tx_only()
 			for(u32 r = 0; r < tx_state->num_receivers; r++) {
 				struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
 				u32 path_idx = tx_state->receiver[r].path_index;
-				if(receiver->sibra_states[path_idx].max_pps > 0) {
-					receiver->sibra_states[path_idx].mi_npkts += num_chunks_per_rcvr[r];
+				if(receiver->cbr_states[path_idx].max_pps > 0) {
+					receiver->cbr_states[path_idx].mi_npkts += num_chunks_per_rcvr[r];
 				} else if(receiver->cc_states != NULL) {
 					receiver->cc_states[path_idx].mi_tx_npkts += num_chunks_per_rcvr[r];
 				}
@@ -1710,7 +1708,7 @@ init_tx_state(size_t filesize, int chunklen, int max_rate_limit, char *mem, cons
 		receiver->paths = calloc(tx_state->max_paths_per_rcvr, sizeof(struct hercules_path));
 		receiver->addr = dests[d];
 		receiver->cts_received = false;
-		receiver->sibra_states = calloc(tx_state->max_paths_per_rcvr, sizeof(struct sibra_state));
+		receiver->cbr_states = calloc(tx_state->max_paths_per_rcvr, sizeof(struct cbr_state));
 	}
 	update_hercules_tx_paths();
 }
@@ -1722,7 +1720,7 @@ static void destroy_tx_state()
 		bitset__destroy(&receiver->acked_chunks);
 		free(receiver->path_map);
 		free(receiver->paths);
-		free(receiver->sibra_states);
+		free(receiver->cbr_states);
 	}
 	free(tx_state);
 }
@@ -2254,7 +2252,7 @@ static struct hercules_stats tx_stats(struct sender_state *t)
 				} else { // PCC provided limit
 					rate_limit += receiver->cc_states[p].curr_rate;
 				}
-			} else { // SIBRA
+			} else { // CBR
 				rate_limit += path->max_bps / ether_size;
 			}
 		}

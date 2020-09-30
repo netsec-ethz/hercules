@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	maxPathsPerReceiver int = 126 // the maximum path index needs to fit into a uint8; best-effort and SIBRA paths get separate path indices
+	maxPathsPerReceiver int = 255 // the maximum path index needs to fit into a uint8, value 255 is reserved for "don't track"
 )
 
 var (
@@ -96,8 +96,6 @@ func realMain() error {
 	flag.StringVar(&flags.outputFilename, "o", "", "output file (receiver)")
 	flag.StringVar(&flags.verbose, "v", "", "verbose output (from '' to vv)")
 	flag.IntVar(&flags.numPaths, "np", 1, "Maximum number of different paths per destination to use at the same time")
-	flag.BoolVar(&flags.enableBestEffort, "be", true, "Enable best-effort traffic")
-	flag.BoolVar(&flags.enableSibra, "resv", false, "Enable COLIBRI bandwidth reservations")
 	flag.StringVar(&configFile, "c", "", "File to parse configuration from, you may overwrite any configuration using command line arguemnts")
 	flag.IntVar(&flags.mtu, "mtu", 0, "Set the frame size to use")
 	flag.BoolVar(&version, "version", false, "Output version and exit")
@@ -234,8 +232,6 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 		iface,
 		destinations,
 		localAddress,
-		config.EnableBestEffort,
-		config.EnableReservations,
 		uint64(config.RateLimit)*uint64(config.MTU))
 	if err != nil {
 		return err

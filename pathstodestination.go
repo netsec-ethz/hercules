@@ -30,8 +30,6 @@ import (
 	"github.com/scionproto/scion/go/lib/snet"
 	"github.com/scionproto/scion/go/lib/spath/spathmeta"
 	"github.com/scionproto/scion/go/lib/topology"
-	"hercules/mock_sibra/lib/sibra"
-	"hercules/mock_sibra/resvmgr" // TODO replace this with real API once it becomes available
 	"net"
 	"time"
 )
@@ -77,40 +75,24 @@ func (pwd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
 	n := 0
 	slot := 0
 	if pwd.paths == nil {
-		pwd.canSendLocally = pwd.pushBestEffortPath(&PathMeta{updated: true, enabled: true}, 0)
+		pwd.canSendLocally = pwd.pushPath(&PathMeta{updated: true, enabled: true}, 0)
 	} else {
 		for p := range pwd.paths {
 			path := &pwd.paths[p]
-			isUsable := false
-			if pwd.pm.useBestEffort {
-				if path.updated || path.enabled {
-					n = slot
-				}
-				if pwd.pushBestEffortPath(path, firstSlot+slot) {
-					isUsable = true
-				}
-				slot += 1
+			if path.updated || path.enabled {
+				n = slot
 			}
-
-			if pwd.pm.sibraMgr != nil {
-				if path.updated || path.sbrUpdated.Load() || path.sbrWs != nil {
-					n = slot
-				}
-				if pwd.pushSibraPath(path, firstSlot+slot) {
-					isUsable = true
-				}
-				slot += 1
-			}
-			if !isUsable {
+			if !pwd.pushPath(path, firstSlot+slot) {
 				path.enabled = false
 			}
+			slot += 1
 			path.updated = false
 		}
 	}
 	pwd.pm.cNumPathsPerDst[pwdIdx] = C.int(n + 1)
 }
 
-func (pwd *PathsToDestination) pushBestEffortPath(path *PathMeta, slot int) bool {
+func (pwd *PathsToDestination) pushPath(path *PathMeta, slot int) bool {
 	if path.updated {
 		herculesPath, err := pwd.preparePath(&path.path)
 		if err != nil {
@@ -122,36 +104,6 @@ func (pwd *PathsToDestination) pushBestEffortPath(path *PathMeta, slot int) bool
 		toCPath(herculesPath, &pwd.pm.cPathsPerDest[slot], true, path.enabled)
 	} else {
 		pwd.pm.cPathsPerDest[slot].enabled = C.atomic_bool(path.enabled)
-	}
-	return true
-}
-
-func (pwd *PathsToDestination) pushSibraPath(path *PathMeta, slot int) bool {
-	if path.sbrUpdated.Swap(false) || path.updated {
-		herculesPath, err := pwd.preparePath(&path.path)
-		if err != nil {
-			log.Error(err.Error() + " - path disabled")
-			pwd.pm.cPathsPerDest[slot].enabled = false
-			return false
-		}
-		bwCls := sibra.BwCls(0)
-		if path.sbrEnabled.Load() {
-			bwCls = path.sbrWs.SyncResv.Load().Ephemeral.BwCls
-		}
-		// The worst thing that could happen due to decoupling the atomic sbrUpdated from the atomic
-		// reference SyncResv is that we skip one version of the SIBRA Extension and copy the subsequent one
-		// twice. That's fine.
-		if bwCls > 0 { // build path header only if we actually get some bandwidth granted
-			// TODO(sibra) put ws into herculesPath.SibraResv
-			allocateCPathHeaderMemory(herculesPath, &pwd.pm.cPathsPerDest[slot])
-			toCPath(herculesPath, &pwd.pm.cPathsPerDest[slot], true, path.enabled)
-			// TODO(sibra) remove ws again
-			pwd.pm.cPathsPerDest[slot].max_bps = C.u64(bwCls.Bps())
-		} else { // no bandwidth: disable path
-			pwd.pm.cPathsPerDest[slot].enabled = C.atomic_bool(false)
-		}
-	} else {
-		pwd.pm.cPathsPerDest[slot].enabled = C.atomic_bool(path.enabled && path.sbrEnabled.Load())
 	}
 	return true
 }
@@ -205,15 +157,6 @@ func (pwd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool
 					log.Info(fmt.Sprintf("[Destination %s] re-enabling path %d\n", pwd.dst.ia, i))
 					pathMeta.enabled = true
 					updated = true
-
-					if pwd.pm.sibraMgr != nil {
-						err := pwd.initSibraPath(pathMeta, i)
-						if err != nil {
-							log.Error("Could not initialize SIBRA: " + err.Error())
-							pwd.modifyTime = time.Now()
-							return updated
-						}
-					}
 				}
 				(*previousPathAvailable)[i] = true
 				break
@@ -230,14 +173,6 @@ func (pwd *PathsToDestination) disableVanishedPaths(previousPathAvailable *[]boo
 		if inUse == false && pathMeta.enabled {
 			log.Info(fmt.Sprintf("[Destination %s] disabling path %d\n", pwd.dst.ia, i))
 			pathMeta.enabled = false
-			if pwd.pm.sibraMgr != nil && pathMeta.sbrWs != nil {
-				err := pwd.pm.sibraMgr.Unwatch(pathMeta.sbrWs)
-				if err != nil {
-					log.Error(err.Error())
-				}
-				pathMeta.sbrWs = nil
-				pathMeta.sbrEnabled.Store(false)
-			}
 			updated = true
 		}
 	}
@@ -287,15 +222,6 @@ func (pwd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, ava
 		pwd.paths[i].enabled = true
 		pwd.paths[i].updated = true
 		updated = true
-
-		if pwd.pm.sibraMgr != nil {
-			err := pwd.initSibraPath(&pwd.paths[i], i)
-			if err != nil {
-				log.Error("Could not initialize SIBRA: " + err.Error())
-				pwd.modifyTime = time.Now()
-				return updated
-			}
-		}
 	}
 	return updated
 }
@@ -332,50 +258,4 @@ func (pwd *PathsToDestination) preparePath(p *snet.Path) ([]*HerculesPathHeader,
 		paths[i] = path
 	}
 	return paths, nil
-}
-
-func (pwd *PathsToDestination) initSibraPath(path *PathMeta, idx int) error {
-	ctx, cancelTimeout := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancelTimeout()
-	ws, err := pwd.pm.sibraMgr.WatchEphem(ctx, &resvmgr.EphemConf{
-		PathConf: &resvmgr.PathConf{
-			Paths: pwd.sp,
-			Key:   path.fingerprint,
-		},
-		Destination: nil, // TODO(sibra) pass correct address for pwd.ia
-		MinBWCls:    0,
-		MaxBWCls:    sibra.Bps(pwd.pm.maxBps).ToBwCls(false),
-	})
-	if err != nil {
-		return err
-	}
-
-	path.sbrWs = ws
-	path.sbrEnabled.Store(true)
-	path.sbrUpdated.Store(true)
-
-	go pwd.watchSibra(path, idx)
-	return nil
-}
-
-func (pwd *PathsToDestination) watchSibra(path *PathMeta, idx int) {
-	for event := range path.sbrWs.Events {
-		switch event.Code {
-		case resvmgr.Quit:
-			log.Debug(fmt.Sprintf("[Destination %s] Sibra resolver #%d quit", pwd.dst.ia, idx))
-			path.sbrEnabled.Store(false)
-			pwd.ExtnUpdated.Store(true)
-			return
-		case resvmgr.Error:
-			log.Error(fmt.Sprintf("[Destination %s] Sibra resolver on path #%d: %s", pwd.dst.ia, idx, event.Error))
-		case resvmgr.ExtnExpired, resvmgr.ExtnCleaned:
-			log.Debug(fmt.Sprintf("[Destination %s] Sibra resolver #%d: expired or cleaned", pwd.dst.ia, idx))
-			path.sbrEnabled.Store(false)
-			pwd.ExtnUpdated.Store(true)
-		case resvmgr.ExtnUpdated:
-			log.Debug(fmt.Sprintf("[Destination %s] Sibra resolver %d updated path", pwd.dst.ia, idx))
-			path.sbrUpdated.Store(true)
-			pwd.ExtnUpdated.Store(true)
-		}
-	}
 }

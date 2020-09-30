@@ -25,12 +25,9 @@ package main
 import "C"
 import (
 	"context"
-	"fmt"
-	log "github.com/inconshreveable/log15"
 	"github.com/scionproto/scion/go/lib/pathmgr"
 	"github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/snet"
-	"hercules/mock_sibra/resvmgr" // TODO replace this with real API once it becomes available
 	"net"
 	"time"
 )
@@ -44,7 +41,7 @@ func max(a, b int) int {
 	return b
 }
 
-func initNewPathManager(iface *net.Interface, dsts []*Destination, src *snet.UDPAddr, enableBestEffort, enableSibra bool, maxBps uint64) (*PathManager, error) {
+func initNewPathManager(iface *net.Interface, dsts []*Destination, src *snet.UDPAddr, maxBps uint64) (*PathManager, error) {
 	sciondConn, err := sciond.NewService(sciond.DefaultSCIONDAddress).Connect(context.Background())
 	if err != nil {
 		return nil, err
@@ -56,7 +53,6 @@ func initNewPathManager(iface *net.Interface, dsts []*Destination, src *snet.UDP
 		src:           src,
 		dsts:          make([]*PathsToDestination, 0, len(dsts)),
 		syncTime:      time.Unix(0, 0),
-		useBestEffort: enableBestEffort,
 		maxBps:        maxBps,
 		pathResolver:  pathmgr.New(sciondConn, pathmgr.Timers{}, uint16(numPathsResolved)),
 	}
@@ -64,12 +60,6 @@ func initNewPathManager(iface *net.Interface, dsts []*Destination, src *snet.UDP
 	for _, dst := range dsts {
 		var dstState *PathsToDestination
 		if src.IA == dst.ia {
-			if !enableBestEffort {
-				return nil, fmt.Errorf("Can only use best-effort traffic to destination %s", dst)
-			}
-			if enableSibra {
-				log.Warn(fmt.Sprintf("Can not use bandwidth reservation to destination %s", dst))
-			}
 			dstState = initNewPathsToDestinationWithEmptyPath(pm, dst)
 		} else {
 			dstState, err = initNewPathsToDestination(pm, src, dst)
@@ -81,24 +71,11 @@ func initNewPathManager(iface *net.Interface, dsts []*Destination, src *snet.UDP
 		numPathsPerDst = max(numPathsPerDst, dst.numPaths)
 	}
 
-	if enableSibra {
-		// TODO(sibra) make connection
-		// TODO(sibra) make store
-		mgr, err := resvmgr.New(nil, nil, nil, nil)
-		if err != nil {
-			return nil, err
-		}
-		pm.sibraMgr = mgr
-	}
-
 	// allocate memory to pass paths to C
 	pm.numPathSlotsPerDst = numPathsPerDst
-	if enableSibra && enableBestEffort {
-		pm.numPathSlotsPerDst = 2 * numPathsPerDst
-	}
 	pm.cNumPathsPerDst = make([]C.int, len(dsts))
-	pm.cMaxNumPathsPerDst = C.int(pm.numPathSlotsPerDst)
-	pm.cPathsPerDest = make([]C.struct_hercules_path, len(dsts)*pm.numPathSlotsPerDst)
+	pm.cMaxNumPathsPerDst = C.int(numPathsPerDst)
+	pm.cPathsPerDest = make([]C.struct_hercules_path, len(dsts)*numPathsPerDst)
 	return pm, nil
 }
 
