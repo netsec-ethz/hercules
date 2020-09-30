@@ -242,12 +242,11 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 	}
 
 	pm.choosePaths()
+	herculesInit(iface, localAddress.IA, []*net.UDPAddr{localAddress.Host}, config.Queues, config.MTU)
+	pm.pushPaths()
 	if !pm.canSendToAllDests() {
 		return errors.New("some destinations are unreachable, abort")
 	}
-
-	herculesInit(iface, localAddress.IA, []*net.UDPAddr{localAddress.Host}, config.Queues, config.MTU)
-	pm.pushPaths()
 
 	aggregateStats := aggregateStats{}
 	go pm.syncPathsToC()

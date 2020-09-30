@@ -63,7 +63,7 @@ func initNewPathsToDestination(pm *PathManager, src *snet.UDPAddr, dst *Destinat
 
 func (pwd *PathsToDestination) hasUsablePaths() bool {
 	if pwd.paths == nil {
-		return true
+		return pwd.canSendLocally
 	}
 	for _, path := range pwd.paths {
 		if path.enabled {
@@ -77,15 +77,18 @@ func (pwd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
 	n := 0
 	slot := 0
 	if pwd.paths == nil {
-		pwd.pushBestEffortPath(&PathMeta{updated: true, enabled: true}, 0)
+		pwd.canSendLocally = pwd.pushBestEffortPath(&PathMeta{updated: true, enabled: true}, 0)
 	} else {
 		for p := range pwd.paths {
 			path := &pwd.paths[p]
+			isUsable := false
 			if pwd.pm.useBestEffort {
 				if path.updated || path.enabled {
 					n = slot
 				}
-				pwd.pushBestEffortPath(path, firstSlot+slot)
+				if pwd.pushBestEffortPath(path, firstSlot+slot) {
+					isUsable = true
+				}
 				slot += 1
 			}
 
@@ -93,8 +96,13 @@ func (pwd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
 				if path.updated || path.sbrUpdated.Load() || path.sbrWs != nil {
 					n = slot
 				}
-				pwd.pushSibraPath(path, firstSlot+slot)
+				if pwd.pushSibraPath(path, firstSlot+slot) {
+					isUsable = true
+				}
 				slot += 1
+			}
+			if !isUsable {
+				path.enabled = false
 			}
 			path.updated = false
 		}
@@ -102,28 +110,29 @@ func (pwd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
 	pwd.pm.cNumPathsPerDst[pwdIdx] = C.int(n + 1)
 }
 
-func (pwd *PathsToDestination) pushBestEffortPath(path *PathMeta, slot int) {
+func (pwd *PathsToDestination) pushBestEffortPath(path *PathMeta, slot int) bool {
 	if path.updated {
 		herculesPath, err := pwd.preparePath(&path.path)
 		if err != nil {
 			log.Error(err.Error() + " - path disabled")
 			pwd.pm.cPathsPerDest[slot].enabled = false
-			return
+			return false
 		}
 		allocateCPathHeaderMemory(herculesPath, &pwd.pm.cPathsPerDest[slot])
 		toCPath(herculesPath, &pwd.pm.cPathsPerDest[slot], true, path.enabled)
 	} else {
 		pwd.pm.cPathsPerDest[slot].enabled = C.atomic_bool(path.enabled)
 	}
+	return true
 }
 
-func (pwd *PathsToDestination) pushSibraPath(path *PathMeta, slot int) {
+func (pwd *PathsToDestination) pushSibraPath(path *PathMeta, slot int) bool {
 	if path.sbrUpdated.Swap(false) || path.updated {
 		herculesPath, err := pwd.preparePath(&path.path)
 		if err != nil {
 			log.Error(err.Error() + " - path disabled")
 			pwd.pm.cPathsPerDest[slot].enabled = false
-			return
+			return false
 		}
 		bwCls := sibra.BwCls(0)
 		if path.sbrEnabled.Load() {
@@ -144,6 +153,7 @@ func (pwd *PathsToDestination) pushSibraPath(path *PathMeta, slot int) {
 	} else {
 		pwd.pm.cPathsPerDest[slot].enabled = C.atomic_bool(path.enabled && path.sbrEnabled.Load())
 	}
+	return true
 }
 
 func (pwd *PathsToDestination) choosePaths() bool {

@@ -90,12 +90,13 @@ type PathMeta struct {
 }
 
 type PathsToDestination struct {
-	pm          *PathManager
-	dst         *Destination
-	sp          *pathmgr.SyncPaths
-	modifyTime  time.Time
-	ExtnUpdated atomic.Bool
-	paths       []PathMeta // nil indicates that the destination is in the same AS as the sender and we can use an empty path
+	pm             *PathManager
+	dst            *Destination
+	sp             *pathmgr.SyncPaths
+	modifyTime     time.Time
+	ExtnUpdated    atomic.Bool
+	paths          []PathMeta // nil indicates that the destination is in the same AS as the sender and we can use an empty path
+	canSendLocally bool // (only if destination in same AS) indicates if we can send packets
 }
 
 type Flags struct {
