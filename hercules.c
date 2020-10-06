@@ -63,8 +63,6 @@
 
 #define ACK_RATE_TIME_MS 100 // send ACKS after at most X milliseconds
 
-#define FOREACH(type, key) for(int key = 0; key < num_ ## type ## s; key++)
-
 static const int rbudp_headerlen = 5;
 static const u64 tx_handshake_timeout = 5e9;
 #define PCC_NO_PATH UINT8_MAX // tell the receiver not to count the packet on any path
@@ -418,7 +416,7 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 		return NULL;
 	}
 	int addr_idx = -1;
-	FOREACH(local_addr, i) {
+	for(int i = 0; i < num_local_addrs; i++) {
 		if(iph->daddr == local_addrs[i].ip) {
 			addr_idx = i;
 			break;
@@ -1828,7 +1826,7 @@ static void rx_get_rtt_estimate(void *arg)
 static void configure_queues()
 {
 	ethtool_rules = calloc(num_local_addrs, sizeof(int));
-	FOREACH(local_addr, l) {
+	for(int l = 0; l < num_local_addrs; l++) {
 		debug_printf("map UDP4 flow to %d.%d.%d.%d to queue %d",
 					 (u8) (local_addrs[l].ip),
 					 (u8) (local_addrs[l].ip >> 8u),
@@ -1868,7 +1866,7 @@ static void configure_queues()
 }
 
 static void unconfigure_queues() {
-	FOREACH(ethtool_rule, r) {
+	for(int r = 0; r < num_ethtool_rules; r++) {
 		char cmd[1024];
 		int cmd_len = snprintf(cmd, 1024, "ethtool -N %s delete %d", opt_ifname, ethtool_rules[r]);
 		if(cmd_len > 1023) { // This will never happen as the command to configure is strictly longer than this one
@@ -2098,7 +2096,7 @@ static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[])
 		debug_printf("Note that the BPF program assumes a maximum number of 256 queues on the NIC.");
 		exit_with_error(-xsks_map_fd);
 	}
-	FOREACH(queue, q) {
+	for(int q = 0; q < num_queues; q++) {
 		xsk_map__add_xsk(xsks_map_fd, queues[q], xsks[q]);
 	}
 
@@ -2111,7 +2109,7 @@ static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[])
 	if(ports_fd < 0) {
 		exit_with_error(-ips_fd);
 	}
-	FOREACH(local_addr, a) {
+	for(int a = 0; a < num_local_addrs; a++) {
 		bpf_map_update_elem(ips_fd, &local_addrs[a].ip, &a, 0);
 		bpf_map_update_elem(ports_fd, &a, &local_addrs[a].port, 0);
 	}
@@ -2176,7 +2174,7 @@ void hercules_init(int ifindex, const ia local_ia_, const struct local_addr *loc
 	memcpy(local_addrs, local_addrs_, sizeof(*local_addrs) * num_local_addrs);
 
 	debug_printf("ifindex: %i", opt_ifindex);
-	FOREACH(queue, q) {
+	for(int q = 0; q < num_queues; q++) {
 		debug_printf("enabling queue %d", queues[q]);
 	}
 
@@ -2308,7 +2306,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	}
 
 	u32 chunklen = paths_per_dest[0].payloadlen - rbudp_headerlen;
-	FOREACH(dest, d) {
+	for(int d = 0; d < num_dests; d++) {
 		for(int p = 0; p < num_paths[d]; p++) {
 			chunklen = umin32(chunklen, paths_per_dest[d * max_paths + p].payloadlen - rbudp_headerlen);
 		}
@@ -2321,7 +2319,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 
 	if(enable_pcc) {
 		u64 now = get_nsecs();
-		FOREACH(dest, d) {
+		for(int d = 0; d < num_dests; d++) {
 			struct sender_state_per_receiver *receiver = &tx_state->receiver[d];
 			receiver->cc_states = init_ccontrol_state(
 					max_rate_limit,
@@ -2353,7 +2351,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 
 	pthread_t senders[num_queues];
 	struct xsk_socket_info *xsks[num_queues];
-	FOREACH(queue, q) {
+	for(int q = 0; q < num_queues; q++) {
 		xsks[q] = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queues[q], xdp_mode);
 		senders[q] = start_thread(tx_send_p, xsks[q]);
 		submit_initial_rx_frames(xsks[q]->umem);
@@ -2369,7 +2367,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	running = false;
 	join_thread(worker);
 
-	FOREACH(queue, q) {
+	for(int q = 0; q < num_queues; q++) {
 		stop_thread(senders[q]);
 		close_xsk(xsks[q]);
 	}
@@ -2378,7 +2376,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	struct hercules_stats stats = tx_stats(tx_state);
 
 	if(enable_pcc) {
-		FOREACH(dest, d) {
+		for(int d = 0; d < num_dests; d++) {
 			destroy_ccontrol_state(tx_state->receiver[d].cc_states, num_paths[d]);
 		}
 	}
@@ -2416,7 +2414,7 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 	debug_printf("cts_rtt: %fs", rx_state->handshake_rtt / 1e6);
 
 	struct xsk_socket_info *xsks[num_queues];
-	FOREACH(queue, q) {
+	for(int q = 0; q < num_queues; q++) {
 		struct xsk_socket_info *xsk = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queues[q], xdp_mode);
 		xsks[q] = xsk;
 		submit_initial_rx_frames(xsk->umem);
@@ -2428,7 +2426,7 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 	running = true;
 
 	pthread_t worker[num_queues];
-	FOREACH(queue, q) {
+	for(int q = 0; q < num_queues; q++) {
 		worker[q] = start_thread(rx_p, xsks[q]);
 	}
 
@@ -2441,14 +2439,14 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 	running = false;
 
 	join_thread(trickle_pcc);
-	FOREACH(queue, q) {
+	for(int q = 0; q < num_queues; q++) {
 		join_thread(worker[q]);
 	}
 
 	struct hercules_stats stats = rx_stats(rx_state);
 
 	unconfigure_queues();
-	FOREACH(queue, q) {
+	for(int q = 0; q < num_queues; q++) {
 		close_xsk(xsks[q]);
 	}
 	bitset__destroy(&rx_state->received_chunks);
