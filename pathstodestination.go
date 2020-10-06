@@ -19,12 +19,36 @@ import (
 	"context"
 	"fmt"
 	log "github.com/inconshreveable/log15"
+	"github.com/scionproto/scion/go/lib/pathmgr"
 	"github.com/scionproto/scion/go/lib/snet"
 	"github.com/scionproto/scion/go/lib/spath/spathmeta"
 	"github.com/scionproto/scion/go/lib/topology"
+	"go.uber.org/atomic"
 	"net"
 	"time"
 )
+
+type PathsToDestination struct {
+	pm             *PathManager
+	dst            *Destination
+	sp             *pathmgr.SyncPaths
+	modifyTime     time.Time
+	ExtnUpdated    atomic.Bool
+	paths          []PathMeta // nil indicates that the destination is in the same AS as the sender and we can use an empty path
+	canSendLocally bool       // (only if destination in same AS) indicates if we can send packets
+}
+
+type PathMeta struct {
+	path        snet.Path
+	fingerprint snet.PathFingerprint
+	enabled     bool // Indicates whether this path can be used at the moment
+	updated     bool // Indicates whether this path needs to be synced to the C path
+}
+
+type HerculesPathHeader struct {
+	Header          []byte //!< C.HERCULES_MAX_HEADERLEN bytes
+	PartialChecksum uint16 //SCION L4 checksum over header with 0 payload
+}
 
 func initNewPathsToDestinationWithEmptyPath(pm *PathManager, dst *Destination) *PathsToDestination {
 	return &PathsToDestination{

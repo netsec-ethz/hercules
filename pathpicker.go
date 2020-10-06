@@ -19,6 +19,19 @@ import (
 	"github.com/scionproto/scion/go/lib/spath/spathmeta"
 )
 
+type PathSpec []PathInterface
+
+type PathPickDescriptor struct {
+	ruleIndex int
+	pathIndex int
+}
+
+type PathPicker struct {
+	pathSpec        *[]PathSpec
+	availablePaths  []snet.Path
+	currentPathPick []PathPickDescriptor
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

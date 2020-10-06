@@ -22,6 +22,11 @@ import (
 	"github.com/scionproto/scion/go/lib/snet"
 )
 
+type PathInterface struct {
+	ia   addr.IA
+	ifId common.IFIDType
+}
+
 func (iface *PathInterface) ID() common.IFIDType {
 	return iface.ifId
 }

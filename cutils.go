@@ -44,6 +44,17 @@ import (
 	"unsafe"
 )
 
+type CPathManagement struct {
+	numPathsPerDst    []C.int
+	maxNumPathsPerDst C.int
+	pathsPerDest      []C.struct_hercules_path
+}
+
+type layerWithOpts struct {
+	Layer gopacket.SerializableLayer
+	Opts  gopacket.SerializeOptions
+}
+
 const XDP_ZEROCOPY = C.XDP_ZEROCOPY
 const XDP_COPY = C.XDP_COPY
 const minFrameSize = int(C.HERCULES_MAX_HEADERLEN) + 213 // sizeof(struct rbudp_initial_pkt) + rbudp_headerlen

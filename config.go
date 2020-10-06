@@ -30,6 +30,40 @@ import (
 	"time"
 )
 
+type HerculesGeneralConfig struct {
+	Direction    string
+	DumpInterval time.Duration
+	Interface    string
+	Mode         string
+	MTU          int
+	Queues       []int
+	Verbosity    string
+}
+
+type SiteConfig struct {
+	IA        addr.IA
+	HostAddrs []string
+	NumPaths  int
+	PathSpec  []PathSpec
+}
+
+type HerculesReceiverConfig struct {
+	HerculesGeneralConfig
+	OutputFile      string
+	LocalAddresses  SiteConfig
+	ConfigureQueues bool
+}
+
+type HerculesSenderConfig struct {
+	HerculesGeneralConfig
+	TransmitFile    string
+	EnablePCC       bool
+	RateLimit       int
+	LocalAddress    string
+	NumPathsPerDest int
+	Destinations    []SiteConfig
+}
+
 var (
 	localAddrRegexp = regexp.MustCompile(`^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):([0-9]{1,5})$`)
 	configurableInterfaceRegexp = regexp.MustCompile(`^[a-zA-Z0-9]+$`)

@@ -16,12 +16,31 @@ package main
 
 import (
 	"context"
+	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/pathmgr"
 	"github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/snet"
 	"net"
 	"time"
 )
+
+type Destination struct {
+	ia        addr.IA
+	hostAddrs []*net.UDPAddr
+	pathSpec  *[]PathSpec
+	numPaths  int
+}
+
+type PathManager struct {
+	numPathSlotsPerDst int
+	iface              *net.Interface
+	dsts               []*PathsToDestination
+	src                *snet.UDPAddr
+	syncTime           time.Time
+	pathResolver       pathmgr.Resolver
+	maxBps             uint64
+	cStruct            CPathManagement
+}
 
 const numPathsResolved = 20
 

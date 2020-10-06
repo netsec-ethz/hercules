@@ -28,6 +28,24 @@ import (
 	"time"
 )
 
+type arrayFlags []string
+
+type Flags struct {
+	dumpInterval     time.Duration
+	enablePCC        bool
+	ifname           string
+	localAddrs       arrayFlags
+	maxRateLimit     int
+	mode             string
+	mtu              int
+	queueArgs        arrayFlags
+	remoteAddrs      arrayFlags
+	transmitFilename string
+	outputFilename   string
+	verbose          string
+	numPaths         int
+}
+
 const (
 	maxPathsPerReceiver int = 255 // the maximum path index needs to fit into a uint8, value 255 is reserved for "don't track"
 )

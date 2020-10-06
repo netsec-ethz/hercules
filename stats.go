@@ -20,6 +20,29 @@ import (
 	"time"
 )
 
+type herculesStats struct {
+	startTime uint64
+	endTime   uint64
+	now       uint64
+
+	txNpkts uint64
+	rxNpkts uint64
+
+	filesize        uint64
+	frameLen        uint32
+	chunkLen        uint32
+	totalChunks     uint32
+	completedChunks uint32 //!< either number of acked (for sender) or received (for receiver) chunks
+
+	rateLimit uint32
+}
+
+type aggregateStats struct {
+	maxPps     float64
+	maxBpsThru float64
+	maxBpsGood float64
+}
+
 func statsDumper(tx bool, interval time.Duration, aggregate *aggregateStats) {
 	if interval == 0 {
 		return
