@@ -2052,6 +2052,19 @@ static int load_bpf(const void *prgm, ssize_t prgm_size, struct bpf_object **obj
 	return prog_fd;
 }
 
+static void set_bpf_prgm_active(int prog_fd)
+{
+	int err = bpf_set_link_xdp_fd(opt_ifindex, prog_fd, opt_xdp_flags);
+	if(err) {
+		exit_with_error(-err);
+	}
+
+	int ret = bpf_get_link_xdp_id(opt_ifindex, &prog_id, opt_xdp_flags);
+	if(ret) {
+		exit_with_error(-ret);
+	}
+}
+
 // XXX Workaround: the i40e driver (in zc mode) does not seem to allow sending if no program is loaded.
 //	   Load an XDP program that just passes all packets (i.e. does the same thing as no program).
 static int load_xsk_pass()
@@ -2062,10 +2075,7 @@ static int load_xsk_pass()
 		exit_with_error(-prog_fd);
 	}
 
-	err = bpf_set_link_xdp_fd(opt_ifindex, prog_fd, opt_xdp_flags);
-	if(err) {
-		exit_with_error(-err);
-	}
+	set_bpf_prgm_active(prog_fd);
 	return 0;
 }
 
@@ -2121,16 +2131,7 @@ static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[])
 	}
 	u32 key = 0;
 	bpf_map_update_elem(ia_fd, &key, &local_ia, 0);
-
-	err = bpf_set_link_xdp_fd(opt_ifindex, prog_fd, opt_xdp_flags);
-	if(err) {
-		exit_with_error(-err);
-	}
-
-	int ret = bpf_get_link_xdp_id(opt_ifindex, &prog_id, opt_xdp_flags);
-	if(ret) {
-		exit_with_error(-ret);
-	}
+	set_bpf_prgm_active(prog_fd);
 }
 
 static void *tx_p(__attribute__ ((unused)) void *arg)
