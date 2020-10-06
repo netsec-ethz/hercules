@@ -36,9 +36,9 @@
 #include <float.h>
 #include <linux/bpf_util.h>
 
-#include "bpf/libbpf.h"
-#include "bpf/bpf.h"
-#include "bpf/xsk.h"
+#include "bpf/src/libbpf.h"
+#include "bpf/src/bpf.h"
+#include "bpf/src/xsk.h"
 #include "linux/filter.h" // actually linux/tools/include/linux/filter.h
 
 #include "bitset.h"

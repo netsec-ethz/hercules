@@ -8,7 +8,7 @@ ifndef DESTDIR
 endif
 	cp hercules mockules/mockules $(DESTDIR)
 
-hercules: builder hercules.h hercules.go hercules.c bpf_prgm/redirect_userspace.o bpf_prgm/pass.o
+hercules: builder hercules.h hercules.go hercules.c bpf_prgm/redirect_userspace.o bpf_prgm/pass.o bpf/src/libbpf.a
 	@# update modification dates in assembly, so that the new version gets loaded
 	@sed -i -e "s/\(load bpf_prgm_pass\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/pass.c | head -c 32)/g" bpf_prgms.s
 	@sed -i -e "s/\(load bpf_prgm_redirect_userspace\)\( \)\?\([0-9a-f]\{32\}\)\?/\1 $$(md5sum bpf_prgm/redirect_userspace.c | head -c 32)/g" bpf_prgms.s
@@ -33,6 +33,17 @@ bpf_prgm/pass.o: bpf_prgm/pass.ll builder
 
 #bpf_prgm/redirect_userspace.o: bpf_prgm_redirect_userspace.ll builder
 #	docker exec hercules-builder llc -march=bpf -filetype=obj -o $@ $<
+
+bpf/src/libbpf.a: builder
+	@if [ ! -d bpf/src ]; then \
+		echo "Error: Need libbpf submodule"; \
+		echo "May need to run git submodule update --init"; \
+		exit 1; \
+	else \
+		docker exec -w /`basename $(PWD)`/bpf/src hercules-builder $(MAKE) all OBJDIR=.; \
+		mkdir -p build; \
+		docker exec -w /`basename $(PWD)`/bpf/src hercules-builder $(MAKE) install_headers DESTDIR=build OBJDIR=.; \
+	fi
 
 mockules: builder mockules/main.go
 	docker exec -w /`basename $(PWD)`/mockules hercules-builder go build

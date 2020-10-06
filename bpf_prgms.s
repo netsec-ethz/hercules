@@ -1,6 +1,6 @@
  .section ".rodata"
 
-# load bpf_prgm_pass 9cb6f0a0af02c85974557624b8539330
+# load bpf_prgm_pass 35ed2864c814f692a0c7aa875af3039f
  .globl bpf_prgm_pass
  .type bpf_prgm_pass, STT_OBJECT
  .globl bpf_prgm_pass_size
@@ -12,7 +12,7 @@ bpf_prgm_pass:
 bpf_prgm_pass_size:
  .int (.-bpf_prgm_pass-1)
 
-# load bpf_prgm_redirect_userspace 3b544787944cd27e4be3fd2895ebc62f
+# load bpf_prgm_redirect_userspace ae18bda83dc928658656cc53de4cb90f
  .globl bpf_prgm_redirect_userspace
  .type bpf_prgm_redirect_userspace, STT_OBJECT
  .globl bpf_prgm_redirect_userspace_size

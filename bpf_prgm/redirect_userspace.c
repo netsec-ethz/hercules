@@ -12,7 +12,7 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
 
-#include <bpf/bpf_helpers.h>
+#include <bpf/src/bpf_helpers.h>
 
 #pragma GCC diagnostic pop
 
