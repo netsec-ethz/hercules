@@ -14,15 +14,6 @@
 
 package main
 
-// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
-// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread -lz
-// #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
-// #include "hercules.h"
-// #include <linux/if_xdp.h>
-// #include <stdint.h>
-// #include <stdlib.h>
-// #include <string.h>
-import "C"
 import (
 	"fmt"
 	"math"
@@ -59,32 +50,32 @@ func statsDumper(tx bool, interval time.Duration, aggregate *aggregateStats) {
 		)
 	}
 
-	prevStats := C.hercules_get_stats()
+	prevStats := herculesGetStats()
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
 		select {
 		default:
-			stats := C.hercules_get_stats()
+			stats := herculesGetStats()
 
 			// elapsed time in seconds
 			t := stats.now
-			if stats.end_time > 0 {
-				t = stats.end_time
+			if stats.endTime > 0 {
+				t = stats.endTime
 			}
 			dt := float64(t-prevStats.now) / 1e9
-			dttot := float64(t-stats.start_time) / 1e9
+			dttot := float64(t-stats.startTime) / 1e9
 
-			chunklen := float64(stats.chunklen)
-			framelen := float64(stats.framelen)
-			completion := float64(stats.completed_chunks) / float64(stats.total_chunks)
+			chunklen := float64(stats.chunkLen)
+			framelen := float64(stats.frameLen)
+			completion := float64(stats.completedChunks) / float64(stats.totalChunks)
 
 			if tx {
 
-				ppsNow := float64(stats.tx_npkts-prevStats.tx_npkts) / dt
-				ppsAvg := float64(stats.tx_npkts) / dttot
-				ppsTrg := float64(stats.rate_limit)
+				ppsNow := float64(stats.txNpkts-prevStats.txNpkts) / dt
+				ppsAvg := float64(stats.txNpkts) / dttot
+				ppsTrg := float64(stats.rateLimit)
 
 				bpsGoodNow := 8 * chunklen * ppsNow
 				bpsThruNow := 8 * framelen * ppsNow
@@ -101,16 +92,16 @@ func statsDumper(tx bool, interval time.Duration, aggregate *aggregateStats) {
 					humanReadable(ppsTrg, "pps"),
 					humanReadable(bpsThruAvg, "bps"),
 					humanReadable(ppsAvg, "pps"),
-					uint(stats.tx_npkts),
-					uint(stats.rx_npkts),
+					stats.txNpkts,
+					stats.rxNpkts,
 				)
 				aggregate.maxPps = math.Max(aggregate.maxPps, ppsNow)
 				aggregate.maxBpsGood = math.Max(aggregate.maxBpsGood, bpsGoodNow)
 				aggregate.maxBpsThru = math.Max(aggregate.maxBpsThru, bpsThruNow)
 			} else {
 
-				ppsNow := float64(uint(stats.rx_npkts)-uint(prevStats.rx_npkts)) / dt
-				ppsAvg := float64(stats.rx_npkts) / dttot
+				ppsNow := float64(stats.rxNpkts-prevStats.rxNpkts) / dt
+				ppsAvg := float64(stats.rxNpkts) / dttot
 
 				bpsGoodNow := 8 * chunklen * ppsNow
 				bpsThruNow := 8 * framelen * ppsNow
@@ -124,15 +115,15 @@ func statsDumper(tx bool, interval time.Duration, aggregate *aggregateStats) {
 					humanReadable(ppsNow, "pps"),
 					humanReadable(bpsThruAvg, "bps"),
 					humanReadable(ppsAvg, "pps"),
-					uint(stats.rx_npkts),
-					uint(stats.tx_npkts),
+					stats.rxNpkts,
+					stats.txNpkts,
 				)
 				aggregate.maxPps = math.Max(aggregate.maxPps, ppsNow)
 				aggregate.maxBpsGood = math.Max(aggregate.maxBpsGood, bpsGoodNow)
 				aggregate.maxBpsThru = math.Max(aggregate.maxBpsThru, bpsThruNow)
 			}
 
-			if stats.end_time > 0 || stats.start_time == 0 { // explicitly finished or already de-initialized
+			if stats.endTime > 0 || stats.startTime == 0 { // explicitly finished or already de-initialized
 				return
 			}
 			prevStats = stats
@@ -143,8 +134,8 @@ func statsDumper(tx bool, interval time.Duration, aggregate *aggregateStats) {
 // statsAwaitStart busy-waits until hercules_get_stats indicates that the transfer has started.
 func statsAwaitStart() {
 	for {
-		stats := C.hercules_get_stats()
-		if stats.start_time > 0 {
+		stats := herculesGetStats()
+		if stats.startTime > 0 {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -153,15 +144,15 @@ func statsAwaitStart() {
 
 func printSummary(stats herculesStats, aggregate aggregateStats) {
 
-	dttot := float64(stats.end_time-stats.start_time) / 1e9
-	filesize := uint64(stats.filesize)
+	dttot := float64(stats.endTime-stats.startTime) / 1e9
+	filesize := stats.filesize
 	goodputBytePS := float64(filesize) / dttot
 	fmt.Printf("\nTransfer completed:\n  %-12s%10.3fs\n  %-12s%11s\n  %-13s%11s (%s)\n  %-11s%11.3f\n  %-11s%11.3f\n  %-13s%11s (%s)\n  %-13s%11s\n",
 		"Duration:", dttot,
 		"Filesize:", humanReadableSize(filesize, "B"),
 		"Rate:", humanReadable(8*goodputBytePS, "b/s"), humanReadableSize(uint64(goodputBytePS), "B/s"),
-		"Sent/Chunk:", float64(stats.tx_npkts)/float64(stats.total_chunks),
-		"Rcvd/Chunk:", float64(stats.rx_npkts)/float64(stats.total_chunks),
+		"Sent/Chunk:", float64(stats.txNpkts)/float64(stats.totalChunks),
+		"Rcvd/Chunk:", float64(stats.rxNpkts)/float64(stats.totalChunks),
 		"Max thr.put:", humanReadable(aggregate.maxBpsThru, "b/s"), humanReadable(aggregate.maxPps, "P/s"),
 		"Max goodput:", humanReadable(aggregate.maxBpsGood, "b/s"),
 	)

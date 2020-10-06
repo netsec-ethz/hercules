@@ -14,14 +14,6 @@
 
 package main
 
-// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
-// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread -lz
-// #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
-// #include "hercules.h"
-// #include <linux/if_xdp.h>
-// #include <stdint.h>
-// #include <stdlib.h>
-// #include <string.h>
 import "C"
 import (
 	"context"
@@ -69,43 +61,6 @@ func (pwd *PathsToDestination) hasUsablePaths() bool {
 		}
 	}
 	return false
-}
-
-func (pwd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
-	n := 0
-	slot := 0
-	if pwd.paths == nil {
-		pwd.canSendLocally = pwd.pushPath(&PathMeta{updated: true, enabled: true}, 0)
-	} else {
-		for p := range pwd.paths {
-			path := &pwd.paths[p]
-			if path.updated || path.enabled {
-				n = slot
-			}
-			if !pwd.pushPath(path, firstSlot+slot) {
-				path.enabled = false
-			}
-			slot += 1
-			path.updated = false
-		}
-	}
-	pwd.pm.cNumPathsPerDst[pwdIdx] = C.int(n + 1)
-}
-
-func (pwd *PathsToDestination) pushPath(path *PathMeta, slot int) bool {
-	if path.updated {
-		herculesPath, err := pwd.preparePath(&path.path)
-		if err != nil {
-			log.Error(err.Error() + " - path disabled")
-			pwd.pm.cPathsPerDest[slot].enabled = false
-			return false
-		}
-		allocateCPathHeaderMemory(herculesPath, &pwd.pm.cPathsPerDest[slot])
-		toCPath(herculesPath, &pwd.pm.cPathsPerDest[slot], true, path.enabled)
-	} else {
-		pwd.pm.cPathsPerDest[slot].enabled = C.atomic_bool(path.enabled)
-	}
-	return true
 }
 
 func (pwd *PathsToDestination) choosePaths() bool {

@@ -14,29 +14,18 @@
 
 package main
 
-// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
-// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread -lz
-// #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
-// #include "hercules.h"
-// #include <linux/if_xdp.h>
-// #include <stdint.h>
-// #include <stdlib.h>
-// #include <string.h>
-import "C"
 import (
 	"errors"
 	"flag"
 	"fmt"
 	"github.com/BurntSushi/toml"
 	log "github.com/inconshreveable/log15"
-	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/snet"
 	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"time"
-	"unsafe"
 )
 
 const (
@@ -260,14 +249,11 @@ func mainRx(config *HerculesReceiverConfig) error {
 	iface, _ := net.InterfaceByName(config.Interface)
 	localAddresses := config.localAddresses()
 
-	filenamec := C.CString(config.OutputFile)
-	defer C.free(unsafe.Pointer(filenamec))
-
 	herculesInit(iface, config.LocalAddresses.IA, localAddresses, config.Queues, config.MTU)
 	aggregateStats := aggregateStats{}
 	go statsDumper(false, config.DumpInterval, &aggregateStats)
 	go cleanupOnSignal()
-	stats := C.hercules_rx(filenamec, C.int(config.getXDPMode()), C.bool(config.ConfigureQueues))
+	stats := herculesRx(config.OutputFile, config.getXDPMode(), config.ConfigureQueues)
 	printSummary(stats, aggregateStats)
 	return nil
 }
@@ -277,29 +263,6 @@ func cleanupOnSignal() {
 	signal.Notify(c, os.Interrupt, os.Kill)
 	// Block until any signal is received.
 	<-c
-	C.hercules_close()
+	herculesClose()
 	os.Exit(128 + 15) // Customary exit code after SIGTERM
-}
-
-func herculesInit(iface *net.Interface, ia addr.IA, local []*net.UDPAddr, queues []int, MTU int) {
-	localC := toCLocalAddrs(local)
-	queuesC := toCIntArray(queues)
-	iaC := toCIA(ia)
-
-	C.hercules_init(C.int(iface.Index), iaC, &localC[0], C.int(len(local)), &queuesC[0], C.int(len(queues)), C.int(MTU))
-	activeInterface = iface
-}
-
-func herculesTx(filename string, destinations []*Destination, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
-	cFilename := C.CString(filename)
-	defer C.free(unsafe.Pointer(cFilename))
-
-	cDests := make([]C.struct_hercules_app_addr, len(destinations))
-	for d, dest := range destinations {
-		cDests[d].ia = toCIA(dest.ia)
-		localC := toCLocalAddrs(dest.hostAddrs)
-		cDests[d].ip = localC[0].ip
-		cDests[d].port = localC[0].port
-	}
-	return C.hercules_tx(cFilename, &cDests[0], &pm.cPathsPerDest[0], C.int(len(destinations)), &pm.cNumPathsPerDst[0], pm.cMaxNumPathsPerDst, C.int(maxRateLimit), C.bool(enablePCC), C.int(xdpMode))
 }

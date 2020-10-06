@@ -14,15 +14,6 @@
 
 package main
 
-// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
-// #cgo LDFLAGS: ${SRCDIR}/bpf/libbpf.a -lm -lelf -pthread -lz
-// #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
-// #include "hercules.h"
-// #include <linux/if_xdp.h>
-// #include <stdint.h>
-// #include <stdlib.h>
-// #include <string.h>
-import "C"
 import (
 	"context"
 	"github.com/scionproto/scion/go/lib/pathmgr"
@@ -73,9 +64,7 @@ func initNewPathManager(iface *net.Interface, dsts []*Destination, src *snet.UDP
 
 	// allocate memory to pass paths to C
 	pm.numPathSlotsPerDst = numPathsPerDst
-	pm.cNumPathsPerDst = make([]C.int, len(dsts))
-	pm.cMaxNumPathsPerDst = C.int(numPathsPerDst)
-	pm.cPathsPerDest = make([]C.struct_hercules_path, len(dsts)*numPathsPerDst)
+	pm.cStruct.initialize(len(dsts), numPathsPerDst)
 	return pm, nil
 }
 
@@ -86,24 +75,6 @@ func (pm *PathManager) canSendToAllDests() bool {
 		}
 	}
 	return true
-}
-
-func (pm *PathManager) pushPaths() {
-	C.acquire_path_lock()
-	defer C.free_path_lock()
-	syncTime := time.Now()
-
-	// prepare and copy headers to C
-	for d, dst := range pm.dsts {
-		if pm.syncTime.After(dst.modifyTime) {
-			continue
-		}
-
-		dst.pushPaths(d, d*pm.numPathSlotsPerDst)
-	}
-
-	pm.syncTime = syncTime
-	C.push_hercules_tx_paths()
 }
 
 func (pm *PathManager) choosePaths() bool {

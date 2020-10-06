@@ -41,10 +41,31 @@ type HerculesPathHeader struct {
 	PartialChecksum uint16 //SCION L4 checksum over header with 0 payload
 }
 
-type herculesStats = C.struct_hercules_stats
+type herculesStats struct {
+	startTime uint64
+	endTime   uint64
+	now       uint64
+
+	txNpkts uint64
+	rxNpkts uint64
+
+	filesize        uint64
+	frameLen        uint32
+	chunkLen        uint32
+	totalChunks     uint32
+	completedChunks uint32 //!< either number of acked (for sender) or received (for receiver) chunks
+
+	rateLimit uint32
+}
+
+type CPathManagement struct {
+	numPathsPerDst    []C.int
+	maxNumPathsPerDst C.int
+	pathsPerDest      []C.struct_hercules_path
+}
 
 type aggregateStats struct {
-	maxPps float64
+	maxPps     float64
 	maxBpsThru float64
 	maxBpsGood float64
 }
@@ -66,12 +87,10 @@ type PathManager struct {
 	iface              *net.Interface
 	dsts               []*PathsToDestination
 	src                *snet.UDPAddr
-	cNumPathsPerDst    []C.int
-	cMaxNumPathsPerDst C.int
-	cPathsPerDest      []C.struct_hercules_path
 	syncTime           time.Time
 	pathResolver       pathmgr.Resolver
 	maxBps             uint64
+	cStruct            CPathManagement
 }
 
 type PathMeta struct {
@@ -88,7 +107,7 @@ type PathsToDestination struct {
 	modifyTime     time.Time
 	ExtnUpdated    atomic.Bool
 	paths          []PathMeta // nil indicates that the destination is in the same AS as the sender and we can use an empty path
-	canSendLocally bool // (only if destination in same AS) indicates if we can send packets
+	canSendLocally bool       // (only if destination in same AS) indicates if we can send packets
 }
 
 type Flags struct {
@@ -133,12 +152,12 @@ type HerculesReceiverConfig struct {
 
 type HerculesSenderConfig struct {
 	HerculesGeneralConfig
-	TransmitFile       string
-	EnablePCC          bool
-	RateLimit          int
-	LocalAddress       string
-	NumPathsPerDest    int
-	Destinations       []SiteConfig
+	TransmitFile    string
+	EnablePCC       bool
+	RateLimit       int
+	LocalAddress    string
+	NumPathsPerDest int
+	Destinations    []SiteConfig
 }
 
 type PathInterface struct {

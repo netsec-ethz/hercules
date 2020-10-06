@@ -48,6 +48,75 @@ const XDP_ZEROCOPY = C.XDP_ZEROCOPY
 const XDP_COPY = C.XDP_COPY
 const minFrameSize = int(C.HERCULES_MAX_HEADERLEN) + 213 // sizeof(struct rbudp_initial_pkt) + rbudp_headerlen
 
+func herculesInit(iface *net.Interface, ia addr.IA, local []*net.UDPAddr, queues []int, MTU int) {
+	localC := toCLocalAddrs(local)
+	queuesC := toCIntArray(queues)
+	iaC := toCIA(ia)
+
+	C.hercules_init(C.int(iface.Index), iaC, &localC[0], C.int(len(local)), &queuesC[0], C.int(len(queues)), C.int(MTU))
+	activeInterface = iface
+}
+
+func herculesTx(filename string, destinations []*Destination, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
+	cFilename := C.CString(filename)
+	defer C.free(unsafe.Pointer(cFilename))
+
+	cDests := make([]C.struct_hercules_app_addr, len(destinations))
+	for d, dest := range destinations {
+		cDests[d].ia = toCIA(dest.ia)
+		localC := toCLocalAddrs(dest.hostAddrs)
+		cDests[d].ip = localC[0].ip
+		cDests[d].port = localC[0].port
+	}
+	return herculesStatsFromC(C.hercules_tx(
+		cFilename,
+		&cDests[0],
+		&pm.cStruct.pathsPerDest[0],
+		C.int(len(destinations)),
+		&pm.cStruct.numPathsPerDst[0],
+		pm.cStruct.maxNumPathsPerDst,
+		C.int(maxRateLimit),
+		C.bool(enablePCC),
+		C.int(xdpMode),
+	))
+}
+
+func herculesRx(filename string, xdpMode int, configureQueues bool) herculesStats {
+	cFilename := C.CString(filename)
+	defer C.free(unsafe.Pointer(cFilename))
+	return herculesStatsFromC(C.hercules_rx(cFilename, C.int(xdpMode), C.bool(configureQueues)))
+}
+
+func herculesClose() {
+	C.hercules_close()
+}
+
+func herculesGetStats() herculesStats {
+	return herculesStatsFromC(C.hercules_get_stats())
+}
+
+func herculesStatsFromC(stats C.struct_hercules_stats) herculesStats {
+	return herculesStats{
+		startTime:       uint64(stats.start_time),
+		endTime:         uint64(stats.end_time),
+		now:             uint64(stats.now),
+		txNpkts:         uint64(stats.tx_npkts),
+		rxNpkts:         uint64(stats.rx_npkts),
+		filesize:        uint64(stats.filesize),
+		frameLen:        uint32(stats.framelen),
+		chunkLen:        uint32(stats.chunklen),
+		totalChunks:     uint32(stats.total_chunks),
+		completedChunks: uint32(stats.completed_chunks),
+		rateLimit:       uint32(stats.rate_limit),
+	}
+}
+
+func (cpm *CPathManagement) initialize(numDestinations int, numPathsPerDestination int) {
+	cpm.numPathsPerDst = make([]C.int, numDestinations)
+	cpm.maxNumPathsPerDst = C.int(numPathsPerDestination)
+	cpm.pathsPerDest = make([]C.struct_hercules_path, numDestinations*numPathsPerDestination)
+}
+
 // HerculesGetReplyPath creates a reply path header for the packet header in headerPtr with given length.
 // Returns 0 iff successful.
 // This function is exported to C and called to obtain a reply path to send NACKs from the receiver (slow path).
@@ -419,4 +488,62 @@ func sendICMP(iface *net.Interface, srcIP net.IP, dstIP net.IP) (err error) {
 		return err
 	}
 	return nil
+}
+
+// TODO rewrite path pushing: prepare in Go buffers then have a single call where C fetches them
+func (pm *PathManager) pushPaths() {
+	C.acquire_path_lock()
+	defer C.free_path_lock()
+	syncTime := time.Now()
+
+	// prepare and copy headers to C
+	for d, dst := range pm.dsts {
+		if pm.syncTime.After(dst.modifyTime) {
+			continue
+		}
+
+		dst.pushPaths(d, d*pm.numPathSlotsPerDst)
+	}
+
+	pm.syncTime = syncTime
+	C.push_hercules_tx_paths()
+}
+
+// TODO move back to pathstodestination.go
+func (pwd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
+	n := 0
+	slot := 0
+	if pwd.paths == nil {
+		pwd.canSendLocally = pwd.pushPath(&PathMeta{updated: true, enabled: true}, 0)
+	} else {
+		for p := range pwd.paths {
+			path := &pwd.paths[p]
+			if path.updated || path.enabled {
+				n = slot
+			}
+			if !pwd.pushPath(path, firstSlot+slot) {
+				path.enabled = false
+			}
+			slot += 1
+			path.updated = false
+		}
+	}
+	pwd.pm.cStruct.numPathsPerDst[pwdIdx] = C.int(n + 1)
+}
+
+// TODO move back to pathstodestination.go
+func (pwd *PathsToDestination) pushPath(path *PathMeta, slot int) bool {
+	if path.updated {
+		herculesPath, err := pwd.preparePath(&path.path)
+		if err != nil {
+			log.Error(err.Error() + " - path disabled")
+			pwd.pm.cStruct.pathsPerDest[slot].enabled = false
+			return false
+		}
+		allocateCPathHeaderMemory(herculesPath, &pwd.pm.cStruct.pathsPerDest[slot])
+		toCPath(herculesPath, &pwd.pm.cStruct.pathsPerDest[slot], true, path.enabled)
+	} else {
+		pwd.pm.cStruct.pathsPerDest[slot].enabled = C.atomic_bool(path.enabled)
+	}
+	return true
 }
