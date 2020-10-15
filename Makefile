@@ -19,20 +19,12 @@ hercules: builder hercules.h hercules.go hercules.c bpf_prgm/redirect_userspace.
 bpf_prgm/%.ll: bpf_prgm/%.c builder
 	docker exec hercules-builder clang -S -target bpf -D __BPF_TRACING__ -I. -Wall -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Werror -O2 -emit-llvm -c -g -o $@ $<
 
-bpf_prgm/redirect_userspace.o: bpf_prgm/redirect_userspace.ll builder
+bpf_prgm/%.o: bpf_prgm/%.ll builder
 	docker exec hercules-builder llc -march=bpf -filetype=obj -o $@ $<
 
-bpf_prgm/pass.o: bpf_prgm/pass.ll builder
-	docker exec hercules-builder llc -march=bpf -filetype=obj -o $@ $<
-
-#bpf_prgm/redirect_userspace.ll: bpf_prgm/redirect_userspace.c builder
-#	docker exec hercules-builder clang -S -target bpf -D __BPF_TRACING__ -I. -Wall -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Werror -O2 -emit-llvm -c -g -o $@ $<
-
-#bpf_prgm/pass.ll: bpf_prgm/pass.c builder
-#	docker exec hercules-builder clang -S -target bpf -D __BPF_TRACING__ -I. -Wall -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Werror -O2 -emit-llvm -c -g -o $@ $<
-
-#bpf_prgm/redirect_userspace.o: bpf_prgm_redirect_userspace.ll builder
-#	docker exec hercules-builder llc -march=bpf -filetype=obj -o $@ $<
+# explicitly list intermediates for dependency resolution
+bpf_prgm/pass.ll:
+bpf_prgm/redirect_userspace.ll:
 
 bpf/src/libbpf.a: builder
 	@if [ ! -d bpf/src ]; then \
