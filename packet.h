@@ -41,10 +41,35 @@ struct scionaddrhdr_ipv4 {
 	__u32 src_ip;
 };
 
-#pragma pack(pop)
+// Structure of first RBUDP packet sent by sender.
+// Integers all transmitted in little endian (host endianness).
+struct rbudp_initial_pkt {
+	__u8 u8_max;  //!< to distinguish it from an ACK
+	__u64 filesize;
+	__u32 chunklen;
+	__u64 timestamp;
+	__u8 path_index;
+	__u8 flags;
+};
 
-#define MAX_NUM_QUEUES 256
-#define MAX_NUM_LOCAL_ADDRS 2
-#define SCION_ENDHOST_PORT 30041
+#define HANDSHAKE_FLAG_SET_RETURN_PATH 0x1u
+
+// Structure of ACK RBUDP packets sent by the receiver.
+// Integers all transmitted in little endian (host endianness).
+struct rbudp_ack_pkt {
+	__u8 num_acks; //!< number of (valid) entries in `acks` (less than U8_MAX)
+	struct {
+		__u32 begin; //!< index of first chunk that is ACKed with this range
+		__u32 end;   //!< one-past-the-last chunk that is ACKed with this range
+	} acks[256]; //!< list of ranges that are ACKed
+};
+
+struct pcc_feedback {
+	__u8 zero; //!< 0 to be distinguishable from ACK pkt
+	__u8 num_paths;
+	__u32 pkts[256]; //!< count of received packets per path id
+};
+
+#pragma pack(pop)
 
 #endif //HERCULES_SCION_H

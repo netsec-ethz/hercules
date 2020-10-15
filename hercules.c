@@ -7,7 +7,7 @@
 #pragma GCC diagnostic warning "-Wextra"
 
 #include "hercules.h"
-#include "shared_bpf.h"
+#include "packet.h"
 #include <stdatomic.h>
 #include <assert.h>
 #include <errno.h>
@@ -72,40 +72,6 @@ static const u64 tx_handshake_timeout = 5e9;
 // exported from hercules.go
 extern int HerculesGetReplyPath(const char *packetPtr, int length, struct hercules_path *reply_path);
 
-
-#pragma pack(push)
-#pragma pack(1)
-
-// Structure of first RBUDP packet sent by sender.
-// Integers all transmitted in little endian (host endianness).
-struct rbudp_initial_pkt {
-	u8 u8_max;  //!< to distinguish it from an ACK
-	u64 filesize;
-	u32 chunklen;
-	u64 timestamp;
-	u8 path_index;
-	u8 flags;
-};
-
-#define HANDSHAKE_FLAG_SET_RETURN_PATH 0x1u
-
-// Structure of ACK RBUDP packets sent by the receiver.
-// Integers all transmitted in little endian (host endianness).
-struct rbudp_ack_pkt {
-	u8 num_acks; //!< number of (valid) entries in `acks` (less than U8_MAX)
-	struct {
-		u32 begin; //!< index of first chunk that is ACKed with this range
-		u32 end;   //!< one-past-the-last chunk that is ACKed with this range
-	} acks[256]; //!< list of ranges that are ACKed
-};
-
-struct pcc_feedback {
-	u8 zero; //!< 0 to be distinguishable from ACK pkt
-	u8 num_paths;
-	u32 pkts[256]; //!< count of received packets per path id
-};
-
-#pragma pack(pop)
 
 struct xsk_umem_info {
 	struct xsk_ring_prod fq;

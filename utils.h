@@ -20,6 +20,10 @@
 #include <errno.h>
 #include <linux/types.h>
 
+#define MAX_NUM_QUEUES 256
+#define MAX_NUM_LOCAL_ADDRS 256
+#define SCION_ENDHOST_PORT 30041
+
 typedef __u64 u64;
 typedef __u32 u32;
 typedef __u16 u16;

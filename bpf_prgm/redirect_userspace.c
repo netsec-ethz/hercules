@@ -7,7 +7,7 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <stddef.h>
-#include "shared_bpf.h"
+#include "packet.h"
 #include "utils.h"
 
 #include <bpf/src/bpf_helpers.h>
