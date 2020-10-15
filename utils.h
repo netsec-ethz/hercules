@@ -18,6 +18,22 @@
 #include "hercules.h"
 #include <time.h>
 #include <errno.h>
+#include <linux/types.h>
+
+typedef __u64 u64;
+typedef __u32 u32;
+typedef __u16 u16;
+typedef __u8 u8;
+
+#ifndef NDEBUG
+#define debug_printf(fmt, ...) printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
+#else
+#define debug_printf(...) ;
+#endif
+
+#ifndef likely
+# define likely(x)              __builtin_expect(!!(x), 1)
+#endif
 
 inline u32 umin32(u32 a, u32 b)
 {

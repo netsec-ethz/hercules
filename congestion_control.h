@@ -7,7 +7,7 @@
 #define RCTS_INTERVALS 4 // Must be even
 
 // PCC state machine states
-enum pcc_state{pcc_startup, pcc_decision, pcc_adjust, pcc_terminated};
+enum pcc_state{pcc_uninitialized, pcc_startup, pcc_decision, pcc_adjust, pcc_terminated};
 
 struct rct {
 	u32 rate;
@@ -20,6 +20,7 @@ enum rcts_result{increase, decrease, inconclusive};
 struct ccontrol_state {
 	// Cons
 	u32 max_rate_limit; // Max sending rate that the CC algorithm should not exceed
+	u32 num_paths;
 	u32 total_num_paths;
 	_Atomic double pcc_mi_duration;
 	_Atomic double rtt; // Round-trip time in seconds
@@ -40,7 +41,6 @@ struct ccontrol_state {
 	struct rct rcts[RCTS_INTERVALS];
 	int rcts_iter;
 	enum pcc_state state;
-	bool pcc_initialized;
 };
 
 
@@ -51,14 +51,16 @@ struct ccontrol_state {
  * @result	A ccontrol_state struct
 */
 // Initialize congestion control state
-struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, size_t num_paths, size_t total_num_paths);
+struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, size_t num_paths, size_t max_paths, size_t total_num_paths);
 void terminate_ccontrol(struct ccontrol_state *cc_state);
 void continue_ccontrol(struct ccontrol_state *cc_state);
 void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt);
+u32 ccontrol_can_send_npkts(struct ccontrol_state *cc_state, u64 now);
 void kick_ccontrol(struct ccontrol_state *cc_state);
 void destroy_ccontrol_state(struct ccontrol_state *cc_states, size_t num_paths);
 
 // Apply PCC control decision, return new rate
 u32 pcc_control(struct ccontrol_state *cc_state, float throughput, float loss);
+
 
 #endif

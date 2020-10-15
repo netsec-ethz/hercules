@@ -248,7 +248,7 @@ func toCPath(from []*HerculesPathHeader, to *C.struct_hercules_path, replaced, e
 	to.headerlen = C.int(headerLen)
 	to.payloadlen = C.int(etherLen - headerLen) // TODO(matzf): take actual MTU into account, also when building header
 	to.framelen = C.int(etherLen)               // TODO(matzf): "
-	to.num_headers = C.u8(len(from))
+	to.num_headers = C.__u8(len(from))
 	to.replaced = C.atomic_bool(replaced)
 	to.enabled = C.atomic_bool(enabled)
 }

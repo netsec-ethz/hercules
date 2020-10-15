@@ -13,12 +13,13 @@
 
 #define MSS 1460
 
-struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, size_t num_paths, size_t total_num_paths)
+struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, size_t num_paths, size_t max_paths, size_t total_num_paths)
 {
-	struct ccontrol_state *cc_states = calloc(num_paths, sizeof(struct ccontrol_state));
-	for (size_t i = 0; i < num_paths; i++) {
+	struct ccontrol_state *cc_states = calloc(max_paths, sizeof(struct ccontrol_state));
+	for (size_t i = 0; i < max_paths; i++) {
 		struct ccontrol_state *cc_state = &cc_states[i];
 		cc_state->max_rate_limit = max_rate_limit;
+		cc_state->num_paths = num_paths;
 		cc_state->total_num_paths = total_num_paths;
 
 		continue_ccontrol(cc_state);
@@ -29,12 +30,15 @@ struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 total_chunks,
 void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt) {
 	cc_state->rtt = rtt / 1e9;
 
-	float m = (rand() % 6) / 10.f + 1.7; // min [1.7, 2.2]
+	float m = (rand() % 6) / 10.f + 1.7; // m in [1.7, 2.2]
 	cc_state->pcc_mi_duration = m * cc_state->rtt;
 
 	if(!cc_state->curr_rate) {
 		// initial rate should be per-receiver fair
-		u32 initial_rate = umin32((u32) (MSS / cc_state->rtt), cc_state->max_rate_limit / cc_state->total_num_paths / 2);
+		u32 initial_rate = umin32(
+				(u32) (MSS / cc_state->rtt),
+				cc_state->max_rate_limit / (cc_state->num_paths * cc_state->total_num_paths)
+		);
 		cc_state->curr_rate = initial_rate;
 		cc_state->prev_rate = initial_rate;
 	}
@@ -52,9 +56,8 @@ void terminate_ccontrol(struct ccontrol_state *cc_state) {
 }
 
 void continue_ccontrol(struct ccontrol_state *cc_state) {
-	cc_state->pcc_initialized = false;
 	cc_state->prev_rate = cc_state->curr_rate;
-	cc_state->state = pcc_startup;
+	cc_state->state = pcc_uninitialized;
 	cc_state->eps = EPS_MIN;
 	cc_state->sign = 1;
 	cc_state->mi_start = get_nsecs();
@@ -62,6 +65,23 @@ void continue_ccontrol(struct ccontrol_state *cc_state) {
 	cc_state->mi_tx_npkts = 0;
 	cc_state->pcc_mi_duration = DBL_MAX;
 	cc_state->rtt = DBL_MAX;
+}
+
+u32 ccontrol_can_send_npkts(struct ccontrol_state *cc_state, u64 now)
+{
+	if(cc_state->state == pcc_uninitialized) {
+		cc_state->state = pcc_startup;
+		cc_state->mi_start = get_nsecs();
+	}
+	u64 dt = now - cc_state->mi_start;
+
+	dt = umax64(dt, 1);
+	u32 tx_pps = cc_state->mi_tx_npkts * 1000000000. / dt;
+
+	if(tx_pps > cc_state->curr_rate) {
+		return 0;
+	}
+	return cc_state->curr_rate - tx_pps;
 }
 
 void kick_ccontrol(struct ccontrol_state *cc_state) {
@@ -209,7 +229,7 @@ static u32 pcc_control_adjust(struct ccontrol_state *cc_state, float utility)
 
 u32 pcc_control(struct ccontrol_state *cc_state, float throughput, float loss)
 {
-	if (cc_state->state == pcc_terminated) {
+	if (cc_state->state == pcc_uninitialized || cc_state->state == pcc_terminated) {
 		return 0;
 	}
 

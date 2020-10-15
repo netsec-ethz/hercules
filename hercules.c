@@ -7,6 +7,7 @@
 #pragma GCC diagnostic warning "-Wextra"
 
 #include "hercules.h"
+#include "shared_bpf.h"
 #include <stdatomic.h>
 #include <assert.h>
 #include <errno.h>
@@ -558,7 +559,7 @@ static bool handle_rbudp_data_pkt(const char *pkt, size_t length)
 		}
 	}
 	// mark as received in received_chunks bitmap
-	bool prev = bitset__set(&rx_state->received_chunks, chunk_idx);
+	bool prev = bitset__set_mt_safe(&rx_state->received_chunks, chunk_idx);
 	if(!prev) {
 		const char *payload = pkt + rbudp_headerlen;
 		const size_t chunk_start = (size_t) chunk_idx * rx_state->chunklen;
@@ -732,7 +733,7 @@ static void tx_register_acks(const struct rbudp_ack_pkt *ack, struct sender_stat
 			return; // Abort
 		}
 		for(u32 i = begin; i < end; ++i) { // XXX: this can *obviously* be optimized
-			bitset__set_unsafe(&rcvr->acked_chunks, i); // don't need thread-safety here, all updates in same thread
+			bitset__set(&rcvr->acked_chunks, i); // don't need thread-safety here, all updates in same thread
 		}
 	}
 }
@@ -750,7 +751,7 @@ static bool pcc_mi_elapsed(const struct ccontrol_state *cc_state)
 {
 	unsigned long now = get_nsecs();
 	unsigned long dt = now - cc_state->mi_start;
-	return cc_state->pcc_initialized && dt > (cc_state->pcc_mi_duration + cc_state->rtt) * 1e9;
+	return cc_state->state != pcc_uninitialized && dt > (cc_state->pcc_mi_duration + cc_state->rtt) * 1e9;
 }
 
 static void pcc_monitor()
@@ -1092,23 +1093,6 @@ static void rate_limit_tx(void)
 	prev_tx_npkts_queued = tx_npkts_queued;
 }
 
-static u32 path_can_send_npkts(struct ccontrol_state *cc_state, u64 now)
-{
-	if(!cc_state->pcc_initialized) {
-		cc_state->pcc_initialized = true;
-		cc_state->mi_start = get_nsecs();
-	}
-	u64 dt = now - cc_state->mi_start;
-
-	dt = umax64(dt, 1);
-	u32 tx_pps = cc_state->mi_tx_npkts * 1000000000. / dt;
-
-	if(tx_pps > cc_state->curr_rate) {
-		return 0;
-	}
-	return cc_state->curr_rate - tx_pps;
-}
-
 // Fill packet with n bytes from data and pad with zeros to payloadlen.
 static void fill_rbudp_pkt(void *rbudp_pkt, u32 chunk_idx, u8 path_idx, const char *data, size_t n, size_t payloadlen)
 {
@@ -1374,7 +1358,7 @@ u32 compute_max_chunks_per_rcvr(u32 *max_chunks_per_rcvr)
 		}
 		if(tx_state->receiver[r].cc_states != NULL) { // use PCC
 			struct ccontrol_state *cc_state = &tx_state->receiver[r].cc_states[tx_state->receiver[r].path_index];
-			max_chunks_per_rcvr[r] = umin32(BATCH_SIZE, path_can_send_npkts(cc_state, now));
+			max_chunks_per_rcvr[r] = umin32(BATCH_SIZE, ccontrol_can_send_npkts(cc_state, now));
 		} else { // no path-based limit
 			max_chunks_per_rcvr[r] = BATCH_SIZE;
 		}
@@ -1722,10 +1706,13 @@ static char *rx_mmap(const char *pathname, size_t filesize)
 
 static bool rbudp_parse_initial(const char *pkt, size_t len, struct rbudp_initial_pkt *parsed_pkt)
 {
-	if(len < sizeof(*parsed_pkt) || ((struct rbudp_initial_pkt *) pkt)->u8_max != UINT8_MAX) {
+	if(len < sizeof(*parsed_pkt)) {
 		return false;
 	}
 	memcpy(parsed_pkt, pkt, sizeof(*parsed_pkt));
+	if(parsed_pkt->u8_max != UINT8_MAX) {
+		return false;
+	}
 
 	return true;
 }
@@ -2069,7 +2056,7 @@ static void set_bpf_prgm_active(int prog_fd)
 //	   Load an XDP program that just passes all packets (i.e. does the same thing as no program).
 static int load_xsk_pass()
 {
-	int err, prog_fd;
+	int prog_fd;
 	prog_fd = load_bpf(bpf_prgm_pass, bpf_prgm_pass_size, NULL);
 	if(prog_fd < 0) {
 		exit_with_error(-prog_fd);
@@ -2093,7 +2080,6 @@ static void xsk_map__add_xsk(xskmap map, int index, struct xsk_socket_info *xsk)
  */
 static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[])
 {
-	int err;
 	struct bpf_object *obj;
 	int prog_fd = load_bpf(bpf_prgm_redirect_userspace, bpf_prgm_redirect_userspace_size, &obj);
 	if(prog_fd < 0) {
@@ -2325,6 +2311,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 			receiver->cc_states = init_ccontrol_state(
 					max_rate_limit,
 					tx_state->total_chunks,
+					*num_paths,
 					max_paths,
 					max_paths * num_dests
 			);

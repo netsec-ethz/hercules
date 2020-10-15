@@ -16,6 +16,7 @@
 #define __HERCULES_BITSET_H__
 
 #include "hercules.h"
+#include "utils.h"
 #include <assert.h>
 #include <stdbool.h>
 #include <string.h>
@@ -41,7 +42,7 @@ inline bool bitset__check(struct bitset *s, u32 i)
 
 // set bit at index i in bitmap.
 // Returns the previous state of the bit.
-inline bool bitset__set(struct bitset *s, u32 i)
+inline bool bitset__set_mt_safe(struct bitset *s, u32 i)
 {
 	unsigned int bit = 1u << i % HERCULES_BITSET_WORD_BITS;
 	unsigned int prev = atomic_fetch_or(&s->bitmap[i/HERCULES_BITSET_WORD_BITS], bit);
@@ -54,7 +55,7 @@ inline bool bitset__set(struct bitset *s, u32 i)
 
 // set bit at index i in bitmap.
 // This function is not thread-safe.
-inline bool bitset__set_unsafe(struct bitset *s, u32 i)
+inline bool bitset__set(struct bitset *s, u32 i)
 {
 	unsigned int before = s->bitmap[i/HERCULES_BITSET_WORD_BITS];
 	s->bitmap[i/HERCULES_BITSET_WORD_BITS] |= (1u << i % HERCULES_BITSET_WORD_BITS);

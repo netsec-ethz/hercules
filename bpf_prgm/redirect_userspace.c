@@ -8,13 +8,9 @@
 #include <netinet/udp.h>
 #include <stddef.h>
 #include "shared_bpf.h"
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-variable"
+#include "utils.h"
 
 #include <bpf/src/bpf_helpers.h>
-
-#pragma GCC diagnostic pop
 
 
 struct bpf_map_def SEC("maps") xsks_map = {

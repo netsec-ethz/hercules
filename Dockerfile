@@ -130,7 +130,12 @@ RUN set -eux; \
 	\
 	go version
 
-ENV GOPATH /go
+RUN useradd buildboy --create-home --shell /bin/bash
+USER buildboy
+WORKDIR /home/buildboy
+RUN mkdir go
+ENV GOPATH /home/buildboy/go
+
 ENV PATH $GOPATH/bin:$PATH
 RUN mkdir -p "$GOPATH/src" "$GOPATH/bin" && chmod -R 777 "$GOPATH"
 WORKDIR $GOPATH

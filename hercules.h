@@ -15,37 +15,24 @@
 #ifndef __HERCULES_H__
 #define __HERCULES_H__
 
-#include "shared_bpf.h"
 #include <stdbool.h>
 #include <stdatomic.h>
-#include <stdio.h>
-
-#ifndef NDEBUG
-#define debug_printf(fmt, ...) printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
-#else
-#define debug_printf(...) ;
-#endif
-
-#ifndef likely
-# define likely(x)              __builtin_expect(!!(x), 1)
-#endif
-
-#define CACHELINE_SIZE 64
+#include <linux/types.h>
 
 #define HERCULES_MAX_HEADERLEN 256
 struct hercules_path_header {
 	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
-	u16  checksum;	//SCION L4 checksum over header with 0 payload
+	__u16  checksum;	//SCION L4 checksum over header with 0 payload
 };
 
 // Path are specified as ETH/IP/UDP/SCION/UDP headers.
 struct hercules_path {
-	u64 next_handshake_at;
+	__u64 next_handshake_at;
 	int headerlen;
 	int payloadlen;
 	int framelen;	//!< length of ethernet frame; headerlen + payloadlen
 	struct hercules_path_header *headers; //!< separate header for each destination IP address
-	u8 num_headers; //!< number of different versions available for this path (i.e. different destination host IP addresses)
+	__u8 num_headers; //!< number of different versions available for this path (i.e. different destination host IP addresses)
 	atomic_bool enabled; // e.g. when a path has been revoked and no replacement is available, this will be set to false
 	atomic_bool replaced;
 };
@@ -53,19 +40,19 @@ struct hercules_path {
 // Connection information
 struct hercules_app_addr {
 	/** SCION IA. In network byte order. */
-	u64 ia;
+	__u64 ia;
 	/** SCION IP. In network byte order. */
-	u32 ip;
+	__u32 ip;
 	/** SCION/UDP port (L4, application). In network byte order. */
-	u16 port;
+	__u16 port;
 };
 
 struct local_addr { // local as in "relative to the local IA"
-	u32 ip;
-	u16 port;
+	__u32 ip;
+	__u16 port;
 };
 
-typedef u64 ia;
+typedef __u64 ia;
 
 
 void hercules_init(int ifindex, ia ia, const struct local_addr *local_addrs, int num_local_addrs, int queues[],
@@ -73,20 +60,20 @@ void hercules_init(int ifindex, ia ia, const struct local_addr *local_addrs, int
 void hercules_close();
 
 struct hercules_stats {
-  u64 start_time;
-  u64 end_time;
-  u64 now;
+  __u64 start_time;
+  __u64 end_time;
+  __u64 now;
 
-  u64 tx_npkts;
-  u64 rx_npkts;
+  __u64 tx_npkts;
+  __u64 rx_npkts;
 
-  u64 filesize;
-  u32 framelen;
-  u32 chunklen;
-  u32 total_chunks;
-  u32 completed_chunks; //!< either number of acked (for sender) or received (for receiver) chunks
+  __u64 filesize;
+  __u32 framelen;
+  __u32 chunklen;
+  __u32 total_chunks;
+  __u32 completed_chunks; //!< either number of acked (for sender) or received (for receiver) chunks
 
-  u32 rate_limit;
+  __u32 rate_limit;
 };
 
 // Get the current stats of a running transfer.

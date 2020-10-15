@@ -16,7 +16,9 @@
 #define __HERCULES_SEND_QUEUE_H__
 
 #include "hercules.h"
+#include "utils.h"
 
+#define CACHELINE_SIZE 64
 #define SEND_QUEUE_ENTRY_SIZE 6
 #define SEND_QUEUE_ENTRIES_PER_UNIT 7
 
