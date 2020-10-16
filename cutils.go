@@ -525,7 +525,7 @@ func (pwd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
 	n := 0
 	slot := 0
 	if pwd.paths == nil {
-		pwd.canSendLocally = pwd.pushPath(&PathMeta{updated: true, enabled: true}, 0)
+		pwd.canSendLocally = pwd.pushPath(&PathMeta{updated: true, enabled: true}, firstSlot)
 	} else {
 		for p := range pwd.paths {
 			path := &pwd.paths[p]
