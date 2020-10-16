@@ -116,8 +116,12 @@ struct receiver_state {
 };
 
 struct sender_state_per_receiver {
-	/** Map chunk_id to path_id */
-	u32 *path_map;
+	u64 prev_round_start;
+	u64 prev_round_end;
+	u64 prev_slope;
+	u64 ack_wait_duration;
+	u32 prev_chunk_idx;
+	bool finished;
 	/** Next batch should be sent via this path */
 	u8 path_index;
 
@@ -1351,10 +1355,10 @@ u32 compute_max_chunks_per_rcvr(u32 *max_chunks_per_rcvr)
 }
 
 // exclude receivers that have completed the current iteration
-u32 exclude_finished_receivers(u32 *max_chunks_per_rcvr, const bool *finished, u32 total_chunks)
+u32 exclude_finished_receivers(u32 *max_chunks_per_rcvr, u32 total_chunks)
 {
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		if(finished[r]) {
+		if(tx_state->receiver[r].finished) {
 			total_chunks -= max_chunks_per_rcvr[r];
 			max_chunks_per_rcvr[r] = 0;
 		}
@@ -1407,16 +1411,64 @@ static void terminate_cc(const struct sender_state_per_receiver *receiver)
 	}
 }
 
-static void kick_cc(const bool *finished)
+static void kick_cc()
 {
 	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		if(finished[r]) {
+		if(tx_state->receiver[r].finished) {
 			continue;
 		}
 		for(u32 p = 0; p < tx_state->receiver[r].num_paths; p++) {
 			kick_ccontrol(&tx_state->receiver[r].cc_states[p]);
 		}
 	}
+}
+
+// Select batch of un-ACKed chunks for (re)transmit:
+// Batch ends if an un-ACKed chunk is encountered for which we should keep
+// waiting a bit before retransmit.
+//
+// If a chunk can not yet be send, because we need to wait for an ACK, wait_until
+// is set to the timestamp by which that ACK should arrive. Otherwise, wait_until
+// is not modified.
+static u32 prepare_rcvr_chunks(struct sender_state_per_receiver *rcvr, u32 *chunks, u8 *chunk_rcvr, const u64 now,
+		u32 rcvr_idx, u64 *wait_until, u32 num_chunks)
+{
+	u32 num_chunks_prepared = 0;
+	u32 chunk_idx = rcvr->prev_chunk_idx;
+	for(; num_chunks_prepared < num_chunks; num_chunks_prepared++) {
+		chunk_idx = bitset__scan_neg(&rcvr->acked_chunks, chunk_idx);
+		if(chunk_idx == tx_state->total_chunks) {
+			if(rcvr->prev_chunk_idx == 0) { // this receiver has finished
+				rcvr->finished = true;
+				break;
+			}
+
+			// switch round for this receiver:
+			debug_printf("Receiver %d switches to next round", rcvr_idx);
+
+			chunk_idx = 0;
+			rcvr->prev_round_start = rcvr->prev_round_end;
+			rcvr->prev_round_end = get_nsecs();
+			u64 prev_round_dt = rcvr->prev_round_end - rcvr->prev_round_start;
+			rcvr->prev_slope = (prev_round_dt + tx_state->total_chunks - 1) / tx_state->total_chunks; // round up
+			rcvr->ack_wait_duration = 3 * (ACK_RATE_TIME_MS * 1000000UL + rcvr->handshake_rtt);
+			break;
+		}
+
+		const u64 prev_transmit = umin64(rcvr->prev_round_start + rcvr->prev_slope * chunk_idx, rcvr->prev_round_end);
+		const u64 ack_due = prev_transmit + rcvr->ack_wait_duration; // 0 for first round
+		if(now >= ack_due) { // add the chunk to the current batch
+			*chunks = chunk_idx++;
+			*chunk_rcvr = rcvr_idx;
+			chunks++;
+			chunk_rcvr++;
+		} else { // no chunk to send - skip this receiver in the current batch
+			(*wait_until) = ack_due;
+			break;
+		}
+	}
+	rcvr->prev_chunk_idx = chunk_idx;
+	return num_chunks_prepared;
 }
 
 /**
@@ -1449,45 +1501,26 @@ static void kick_cc(const bool *finished)
  */
 static void tx_only()
 {
+	debug_printf("Start transmit round for all receivers");
 	prev_rate_check = get_nsecs();
-	u64 prev_round_start[tx_state->num_receivers];
-	memset(prev_round_start, 0, sizeof(prev_round_start));
-	u64 prev_round_end[tx_state->num_receivers];
-	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		prev_round_end[r] = prev_rate_check;
-	}
-	u64 prev_round_dt[tx_state->num_receivers];
-	u64 slope[tx_state->num_receivers];
-	memset(slope, 0, sizeof(slope)); // set slope to 0 for first round
-	u64 ack_wait_duration_per_rcvr[tx_state->num_receivers]; // timeout after which a chunk is retransmitted. Allows for some lost ACKs.
-	memset(ack_wait_duration_per_rcvr, 0, sizeof(ack_wait_duration_per_rcvr));
-	bool finished[tx_state->num_receivers];
-	memset(finished, false, sizeof(finished));
 	u32 finished_count = 0;
 
-	debug_printf("Start transmit round for all receivers");
-
-#ifndef NDEBUG
-	u32 round[tx_state->num_receivers];
-	memset(round, 0, sizeof(round));
-#endif
 	u32 chunks[BATCH_SIZE];
 	u8 chunk_rcvr[BATCH_SIZE];
 	u32 max_chunks_per_rcvr[tx_state->num_receivers];
-	u32 chunk_idx_per_rcvr[tx_state->num_receivers];
-	memset(chunk_idx_per_rcvr, 0, sizeof(chunk_idx_per_rcvr));
 
 	while(finished_count < tx_state->num_receivers) {
 		send_path_handshakes();
-		u64 chunk_ack_due = 0;
+		u64 next_ack_due = 0;
 		u32 num_chunks_per_rcvr[tx_state->num_receivers];
 		memset(num_chunks_per_rcvr, 0, sizeof(num_chunks_per_rcvr));
 
-		// path rate limits
+		// in each iteration, we send packets on a single path to each receiver
+		// collect the rate limits for each active path
 		u32 total_chunks = compute_max_chunks_per_rcvr(max_chunks_per_rcvr);
-		total_chunks = exclude_finished_receivers(max_chunks_per_rcvr, finished, total_chunks);
+		total_chunks = exclude_finished_receivers(max_chunks_per_rcvr, total_chunks);
 
-		if(total_chunks == 0) { // we hit the rate limits on every path
+		if(total_chunks == 0) { // we hit the rate limits on every path; switch paths
 			if(tx_state->has_new_paths) {
 				update_hercules_tx_paths();
 			}
@@ -1495,69 +1528,33 @@ static void tx_only()
 			continue;
 		}
 
-		// send a max of BATCH_SIZE chunks per iteration
-		total_chunks = shrink_sending_rates(max_chunks_per_rcvr, total_chunks);
+		// sending rates might add up to more than BATCH_SIZE, shrink proportionally, if needed
+		shrink_sending_rates(max_chunks_per_rcvr, total_chunks);
 
-		// Select batch of un-ACKed chunks for retransmit:
-		// Batch ends if an un-ACKed chunk is encountered for which we should keep
-		// waiting a bit before retransmit.
 		const u64 now = get_nsecs();
 		u32 num_chunks = 0;
-		for(u32 r = 0; finished_count < tx_state->num_receivers && num_chunks < total_chunks; r = (r + 1) % tx_state->num_receivers) {
-			if(num_chunks_per_rcvr[r] >= max_chunks_per_rcvr[r] || finished[r]) {
-				continue;
-			}
-
-			u32 prev_chunk_idx = chunk_idx_per_rcvr[r];
-			chunk_idx_per_rcvr[r] = bitset__scan_neg(&tx_state->receiver[r].acked_chunks, chunk_idx_per_rcvr[r]);
-			if(chunk_idx_per_rcvr[r] == tx_state->total_chunks) {
-				if(prev_chunk_idx == 0) { // this receiver has finished
-					debug_printf("receiver %d has finished", r);
-					finished[r] = true;
+		for(u32 r = 0; r < tx_state->num_receivers; r++) {
+			struct sender_state_per_receiver *rcvr = &tx_state->receiver[r];
+			if(!rcvr->finished) {
+				u64 ack_due = 0;
+				// for each receiver, we prepare up to max_chunks_per_rcvr[r] chunks to send
+				num_chunks += prepare_rcvr_chunks(&tx_state->receiver[r], &chunks[num_chunks], &chunk_rcvr[num_chunks],
+									  now, r, &ack_due, max_chunks_per_rcvr[r]);
+				if(rcvr->finished) {
 					finished_count++;
-					total_chunks -= max_chunks_per_rcvr[r] - num_chunks_per_rcvr[r]; // account for unused available bandwidth
-					if(tx_state->receiver[0].cc_states) {
-						terminate_cc(&tx_state->receiver[r]);
-						kick_cc(finished);
-					}
-					continue;
-				}
-
-				// switch round for this receiver:
-				debug_printf("Receiver %d enters retransmit round %u", r, round[r]++);
-
-				chunk_idx_per_rcvr[r] = 0;
-				prev_round_start[r] = prev_round_end[r];
-				prev_round_end[r] = get_nsecs();
-				prev_round_dt[r] = prev_round_end[r] - prev_round_start[r];
-				slope[r] = (prev_round_dt[r] + tx_state->total_chunks - 1) / tx_state->total_chunks; // round up
-				ack_wait_duration_per_rcvr[r] = 3 * (ACK_RATE_TIME_MS * 1000000UL + tx_state->receiver[r].handshake_rtt);
-
-				// try again with this receiver
-				r--;
-				continue;
-			}
-
-			const u64 prev_transmit = umin64(prev_round_start[r] + slope[r] * chunk_idx_per_rcvr[r], prev_round_end[r]);
-			const u64 ack_due = prev_transmit + ack_wait_duration_per_rcvr[r]; // 0 for first round
-			if(now >= ack_due) {
-				tx_state->receiver[r].path_map[chunk_idx_per_rcvr[r]] = tx_state->receiver[r].path_index;
-				chunks[num_chunks] = chunk_idx_per_rcvr[r]++;
-				chunk_rcvr[num_chunks] = r;
-				num_chunks_per_rcvr[r]++;
-				num_chunks++;
-			} else {
-				// skip this receiver in the current batch
-				total_chunks -= max_chunks_per_rcvr[r] - num_chunks_per_rcvr[r];
-				max_chunks_per_rcvr[r] = num_chunks_per_rcvr[r];
-
-				// wait for the nearest ack
-				if(chunk_ack_due) {
-					if(chunk_ack_due > ack_due) {
-						chunk_ack_due = ack_due;
+					if(rcvr->cc_states) {
+						terminate_cc(rcvr);
+						kick_cc();
 					}
 				} else {
-					chunk_ack_due = ack_due;
+					// only wait for the nearest ack
+					if(next_ack_due) {
+						if(next_ack_due > ack_due) {
+							next_ack_due = ack_due;
+						}
+					} else {
+						next_ack_due = ack_due;
+					}
 				}
 			}
 		}
@@ -1569,6 +1566,7 @@ static void tx_only()
 			tx_npkts_queued += num_chunks;
 			rate_limit_tx();
 
+			// update book-keeping
 			for(u32 r = 0; r < tx_state->num_receivers; r++) {
 				struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
 				u32 path_idx = tx_state->receiver[r].path_index;
@@ -1583,8 +1581,8 @@ static void tx_only()
 		}
 		iterate_paths();
 
-		if(now < chunk_ack_due) {
-			sleep_until(chunk_ack_due);
+		if(now < next_ack_due) {
+			sleep_until(next_ack_due);
 		}
 	}
 }
@@ -1620,7 +1618,6 @@ init_tx_state(size_t filesize, int chunklen, int max_rate_limit, char *mem, cons
 	for(u32 d = 0; d < num_dests; d++) {
 		struct sender_state_per_receiver *receiver = &tx_state->receiver[d];
 		bitset__create(&receiver->acked_chunks, tx_state->total_chunks);
-		receiver->path_map = calloc(tx_state->total_chunks, sizeof(size_t));
 		receiver->path_index = 0;
 		receiver->handshake_rtt = 0;
 		receiver->num_paths = num_paths[d];
@@ -1636,7 +1633,6 @@ static void destroy_tx_state()
 	for(u32 d = 0; d < tx_state->num_receivers; d++) {
 		struct sender_state_per_receiver *receiver = &tx_state->receiver[d];
 		bitset__destroy(&receiver->acked_chunks);
-		free(receiver->path_map);
 		free(receiver->paths);
 	}
 	free(tx_state);
