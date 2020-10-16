@@ -44,7 +44,6 @@ struct scionaddrhdr_ipv4 {
 // Structure of first RBUDP packet sent by sender.
 // Integers all transmitted in little endian (host endianness).
 struct rbudp_initial_pkt {
-	__u8 u8_max;  //!< to distinguish it from an ACK
 	__u64 filesize;
 	__u32 chunklen;
 	__u64 timestamp;
@@ -57,7 +56,7 @@ struct rbudp_initial_pkt {
 // Structure of ACK RBUDP packets sent by the receiver.
 // Integers all transmitted in little endian (host endianness).
 struct rbudp_ack_pkt {
-	__u8 num_acks; //!< number of (valid) entries in `acks` (less than U8_MAX)
+	__u8 num_acks; //!< number of (valid) entries in `acks`
 	struct {
 		__u32 begin; //!< index of first chunk that is ACKed with this range
 		__u32 end;   //!< one-past-the-last chunk that is ACKed with this range
@@ -65,9 +64,21 @@ struct rbudp_ack_pkt {
 };
 
 struct pcc_feedback {
-	__u8 zero; //!< 0 to be distinguishable from ACK pkt
 	__u8 num_paths;
 	__u32 pkts[256]; //!< count of received packets per path id
+};
+
+#define CONTROL_PACKET_TYPE_INITIAL 0
+#define CONTROL_PACKET_TYPE_ACK 1
+#define CONTROL_PACKET_TYPE_PCC_FEEDBACK 2
+
+struct hercules_control_packet {
+	__u8 type;
+	union {
+		struct rbudp_initial_pkt initial;
+		struct rbudp_ack_pkt ack;
+		struct pcc_feedback pcc_fbk;
+	} payload;
 };
 
 #pragma pack(pop)

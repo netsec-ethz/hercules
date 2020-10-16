@@ -776,7 +776,7 @@ bool tx_handle_handshake_reply(const struct rbudp_initial_pkt *initial, struct s
 	return updated;
 }
 
-static void tx_recv_acks(int sockfd)
+static void tx_recv_control_messages(int sockfd)
 {
 	struct timeval to = {.tv_sec = 0, .tv_usec = 100};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
@@ -788,25 +788,37 @@ static void tx_recv_acks(int sockfd)
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
 		const struct udphdr *udphdr;
 		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
-			const struct rbudp_ack_pkt *ack = (const struct rbudp_ack_pkt *) payload;
-			if(ack->num_acks == 0) { // received a PCC feedback
-				tx_register_pcc_feedback((struct pcc_feedback *) payload,
-										 &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
-			} else if(ack->num_acks != UINT8_MAX) { // received an ACK
-				if((u32) payloadlen >= ack__len(ack)) {
-					tx_register_acks(ack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
-				}
-			} else { // received a handshake reply
-				if((uint) payloadlen >= sizeof(struct rbudp_initial_pkt)) {
-					int rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
-					struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
-					const struct rbudp_initial_pkt *initial = (const struct rbudp_initial_pkt *) payload;
-					if(tx_handle_handshake_reply(initial, receiver)) {
-						debug_printf("[receiver %d] [path %d] handshake_rtt: %fs, MI: %fs", rcvr_idx,
-									 initial->path_index, receiver->cc_states[initial->path_index].rtt,
-									 receiver->cc_states[initial->path_index].pcc_mi_duration);
+			const struct hercules_control_packet *control_pkt = (const struct hercules_control_packet *) payload;
+			struct pcc_feedback fbk;
+			struct rbudp_ack_pkt ack;
+			struct rbudp_initial_pkt initial;
+			switch(control_pkt->type) {
+				case CONTROL_PACKET_TYPE_PCC_FEEDBACK:
+					if((u32) payloadlen >= sizeof(control_pkt->type) + sizeof(control_pkt->payload.pcc_fbk)) {
+						memcpy(&fbk, &control_pkt->payload.pcc_fbk, sizeof(control_pkt->payload.pcc_fbk));
+						tx_register_pcc_feedback(&fbk, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
 					}
-				}
+					break;
+				case CONTROL_PACKET_TYPE_ACK:
+					if((u32) payloadlen >= sizeof(control_pkt->type) + ack__len(&control_pkt->payload.ack)) {
+						memcpy(&ack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
+						tx_register_acks(&ack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
+					}
+					break;
+				case CONTROL_PACKET_TYPE_INITIAL:
+					if((size_t) payloadlen >= sizeof(control_pkt->type) + sizeof(control_pkt->payload.initial)) {
+						memcpy(&initial, &control_pkt->payload.initial, sizeof(control_pkt->payload.initial));
+						int rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
+						struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
+						if(tx_handle_handshake_reply(&initial, receiver)) {
+							debug_printf("[receiver %d] [path %d] handshake_rtt: %fs, MI: %fs", rcvr_idx,
+										 initial.path_index, receiver->cc_states[initial.path_index].rtt,
+										 receiver->cc_states[initial.path_index].pcc_mi_duration);
+						}
+					}
+					break;
+				default:
+					debug_printf("received a control packet of unknown type %d", control_pkt->type);
 			}
 		}
 
@@ -816,10 +828,13 @@ static void tx_recv_acks(int sockfd)
 	}
 }
 
-static bool tx_handle_cts(const char *cts, u32 rcvr)
+static bool tx_handle_cts(const char *cts, size_t payloadlen, u32 rcvr)
 {
-	const struct rbudp_ack_pkt *ack = (const struct rbudp_ack_pkt *) cts;
-	if(ack->num_acks == 0) {
+	const struct hercules_control_packet *control_pkt = (const struct hercules_control_packet *)cts;
+	if(payloadlen < sizeof(control_pkt->type) + sizeof(control_pkt->payload.ack.num_acks)) {
+		return false;
+	}
+	if(control_pkt->type == CONTROL_PACKET_TYPE_ACK && control_pkt->payload.ack.num_acks == 0) {
 		tx_state->receiver[rcvr].cts_received = true;
 		return true;
 	}
@@ -847,7 +862,7 @@ static bool tx_await_cts(int sockfd)
 	const struct udphdr *udphdr;
 	for(u64 start = get_nsecs(); start + 20e9l > get_nsecs();) {
 		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
-			if(tx_handle_cts(payload, rcvr_by_src_address(scionaddrhdr, udphdr))) {
+			if(tx_handle_cts(payload, payloadlen, rcvr_by_src_address(scionaddrhdr, udphdr))) {
 				received++;
 				if(received >= tx_state->num_receivers) {
 					return true;
@@ -912,7 +927,7 @@ static bool tx_await_rtt_ack(int sockfd, const struct scionaddrhdr_ipv4 **sciona
 			}
 			return true;
 		} else {
-			tx_handle_cts(payload, rcvr);
+			tx_handle_cts(payload, payloadlen, rcvr);
 		}
 	}
 	return false;
@@ -925,15 +940,17 @@ tx_send_initial(int sockfd, const struct hercules_path *path, size_t filesize, u
 	char buf[ether_size];
 	void *rbudp_pkt = mempcpy(buf, path->headers[0].header, path->headerlen);
 
-	struct rbudp_initial_pkt pld = {
-			.u8_max = UINT8_MAX,
-			.filesize = filesize,
-			.chunklen = chunklen,
-			.timestamp =  timestamp,
-			.path_index = path_index,
-			.flags = set_return_path ? HANDSHAKE_FLAG_SET_RETURN_PATH : 0,
+	struct hercules_control_packet pld = {
+			.type = CONTROL_PACKET_TYPE_INITIAL,
+			.payload.initial = {
+				.filesize = filesize,
+				.chunklen = chunklen,
+				.timestamp = timestamp,
+				.path_index = path_index,
+				.flags = set_return_path ? HANDSHAKE_FLAG_SET_RETURN_PATH : 0,
+			},
 	};
-	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, (char *) &pld, sizeof(pld), path->payloadlen);
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, (char *) &pld, sizeof(pld.type) + sizeof(pld.payload.initial), path->payloadlen);
 	stitch_checksum(path, path->headers[0].checksum, buf);
 
 	send_eth_frame(sockfd, buf, path->framelen);
@@ -1672,14 +1689,15 @@ static char *rx_mmap(const char *pathname, size_t filesize)
 
 static bool rbudp_parse_initial(const char *pkt, size_t len, struct rbudp_initial_pkt *parsed_pkt)
 {
-	if(len < sizeof(*parsed_pkt)) {
+	struct hercules_control_packet control_pkt;
+	memcpy(&control_pkt, pkt, len);
+	if(control_pkt.type != CONTROL_PACKET_TYPE_INITIAL) {
 		return false;
 	}
-	memcpy(parsed_pkt, pkt, sizeof(*parsed_pkt));
-	if(parsed_pkt->u8_max != UINT8_MAX) {
+	if(len < sizeof(control_pkt.type) + sizeof(*parsed_pkt)) {
 		return false;
 	}
-
+	memcpy(parsed_pkt, &control_pkt.payload.initial, sizeof(*parsed_pkt));
 	return true;
 }
 
@@ -1721,7 +1739,13 @@ static void rx_send_rtt_ack(int sockfd, struct rbudp_initial_pkt *pld)
 	char buf[ether_size];
 	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
-	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, (char *) pld, sizeof(*pld), path.payloadlen);
+	struct hercules_control_packet control_pkt = {
+			.type = CONTROL_PACKET_TYPE_INITIAL,
+			.payload.initial = *pld,
+	};
+
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, (char *) &control_pkt,
+				   sizeof(control_pkt.type) + sizeof(control_pkt.payload.initial), path.payloadlen);
 	stitch_checksum(&path, path.headers[0].checksum, buf);
 
 	send_eth_frame(sockfd, buf, path.framelen);
@@ -1847,16 +1871,20 @@ static void rx_send_cts_ack(int sockfd)
 	struct hercules_path path;
 	struct hercules_path_header path_header;
 	if(!rx_get_reply_path(&path, &path_header)) {
+		debug_printf("no reply path");
 		return;
 	}
 
 	char buf[ether_size];
 	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
-	struct rbudp_ack_pkt ack;
-	ack.num_acks = 0;
+	struct hercules_control_packet control_pkt = {
+			.type = CONTROL_PACKET_TYPE_ACK,
+			.payload.ack.num_acks = 0,
+	};
 
-	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, (char *) &ack, ack__len(&ack), path.payloadlen);
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, (char *) &control_pkt,
+				sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
 	stitch_checksum(&path, path.headers[0].checksum, buf);
 
 	send_eth_frame(sockfd, buf, path.framelen);
@@ -1877,15 +1905,18 @@ static void rx_send_acks(int sockfd)
 
 	// XXX: could write ack payload directly to buf, but
 	// doesnt work nicely with existing fill_rbudp_pkt helper.
-	struct rbudp_ack_pkt ack;
+	struct hercules_control_packet control_pkt = {
+			.type = CONTROL_PACKET_TYPE_ACK,
+	};
 
-	const size_t max_entries = ack__max_num_entries(path.payloadlen - rbudp_headerlen);
+	const size_t max_entries = ack__max_num_entries(path.payloadlen - rbudp_headerlen - sizeof(control_pkt.type));
 	for(u32 curr = 0; curr < rx_state->total_chunks;) {
 		// Data to send
-		curr = fill_ack_pkt(curr, &ack, max_entries);
-		if(ack.num_acks == 0) break;
+		curr = fill_ack_pkt(curr, &control_pkt.payload.ack, max_entries);
+		if(control_pkt.payload.ack.num_acks == 0) break;
 
-		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, (char *) &ack, ack__len(&ack), path.payloadlen);
+		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, (char *) &control_pkt,
+				 sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
 		stitch_checksum(&path, path.headers[0].checksum, buf);
 
 		send_eth_frame(sockfd, buf, path.framelen);
@@ -1921,14 +1952,16 @@ static void rx_send_pcc_feedback(int sockfd)
 
 	// XXX: could write fbk payload directly to buf, but
 	// doesnt work nicely with existing fill_rbudp_pkt helper.
-	struct pcc_feedback fbk;
-	fbk.zero = 0;
-	fbk.num_paths = num_paths;
-	for(u32 i = 0; i < fbk.num_paths; i++) {
-		fbk.pkts[i] = atomic_load(&rx_state->rx_per_path[i]);
+	struct hercules_control_packet fbk = {
+			.type = CONTROL_PACKET_TYPE_PCC_FEEDBACK,
+			.payload.pcc_fbk.num_paths = num_paths,
+	};
+	for(u32 i = 0; i < fbk.payload.pcc_fbk.num_paths; i++) {
+		fbk.payload.pcc_fbk.pkts[i] = atomic_load(&rx_state->rx_per_path[i]);
 	}
 
-	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, (char *) &fbk, 2 * sizeof(u8) + fbk.num_paths * sizeof(u32), path.payloadlen);
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, (char *) &fbk,
+				   2 * sizeof(u8) + fbk.payload.pcc_fbk.num_paths * sizeof(u32), path.payloadlen);
 	stitch_checksum(&path, path.headers[0].checksum, buf);
 
 	send_eth_frame(sockfd, buf, path.framelen);
@@ -2315,7 +2348,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	running = true;
 	pthread_t worker = start_thread(tx_p, NULL);
 
-	tx_recv_acks(sockfd);
+	tx_recv_control_messages(sockfd);
 
 	tx_state->end_time = get_nsecs();
 	running = false;

@@ -19,6 +19,7 @@
 #include <time.h>
 #include <errno.h>
 #include <linux/types.h>
+#include <stdio.h>
 
 #define MAX_NUM_QUEUES 256
 #define MAX_NUM_LOCAL_ADDRS 256

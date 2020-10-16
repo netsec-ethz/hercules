@@ -96,6 +96,13 @@ All packets have the following basic layout:
 > **NOTE**: Integers are transmitted little endian (host endianness).
 
 For control packets (handshake and acknowledgements, either sender to receiver or receiver to sender), index is `UINT_MAX`.
+For all control packets, the first byte of the payload contains the control packet type.
+The following control packet types exist:
+
+    0: Handshake packet
+    1: ACK packet
+    2: PCC feedback packet
+
 For data packets (sender to receiver), the index field is the index of the chunk being transmitted. This is **not** a packet sequence number, as chunks may be retransmitted.
 
 If path is not `UINT8_MAX`, it is used to account the packet to a specific path.
@@ -142,16 +149,14 @@ The receiver replies immediately with the same packet (using the current return 
   independent packets with identical structure.
 
 
-        | num entries | begin, end | begin, end | begin, end | ...
-        |    u8       |  u32   u32 |  u32   u32 |  u32   u32 | ...
+        | begin, end | begin, end | begin, end | ...
+        |  u32   u32 |  u32   u32 |  u32   u32 | ...
 
 * The receiver sends a PCC feedback two times per RTT.
-  The PCC feedback packet uses the following payload layout, where the zero field is
-  needed to distinguish it from regular ACKs.
+  The PCC feedback packet uses the following payload layout:
    
-   
-        | zero | num paths | pkt count | pkt count | ...
-        |  u8  |    u8     |    u32    |    u32    | ...
+        | num paths | pkt count | pkt count | ...
+        |    u8     |    u32    |    u32    | ...
        
   These PCC feedback packets are not sent, if no paths have been accounted packets for
   (e.g. if no path uses PCC). 
