@@ -5,6 +5,8 @@
 # need the newer kernel headers to build XDP C code against
 
 FROM ubuntu:focal
+ARG UID=1001
+ARG GID=1001
 
 # gcc for cgo
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -130,7 +132,8 @@ RUN set -eux; \
 	\
 	go version
 
-RUN useradd buildboy --create-home --shell /bin/bash
+RUN groupadd --gid $GID --non-unique buildboy
+RUN useradd buildboy --create-home --shell /bin/bash --non-unique --uid $UID --gid $GID
 USER buildboy
 WORKDIR /home/buildboy
 RUN mkdir go

@@ -48,7 +48,7 @@ builder: builder_image
 
 builder_image:
 	@docker images | grep hercules-builder -q || \
-		docker build -t hercules-builder .
+		docker build -t hercules-builder --build-arg UID=$(shell id -u) --build-arg GID=$(shell id -g) .
 
 clean:
 	rm -f hercules mockules/mockules
