@@ -17,6 +17,8 @@ struct rct {
 // RCTs result
 enum rcts_result{increase, decrease, inconclusive};
 
+typedef u32 seqnr;
+
 struct ccontrol_state {
 	// Cons
 	u32 max_rate_limit; // Max sending rate that the CC algorithm should not exceed
@@ -28,6 +30,8 @@ struct ccontrol_state {
 	// Monitoring interval values
 	u32 total_acked_chunks; // Number of chunks that have been acked before the start of the current MI
 	u32 mi_acked_chunks; // Number of chunks that have been acked during the current MI
+
+	seqnr last_sequence_number;
 
 	u32 prev_rate;
 	u32 curr_rate;

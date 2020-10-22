@@ -89,8 +89,8 @@ This is repeated until all chunks are acked.
 
 All packets have the following basic layout:
 
-	|  index  |  path  | payload ... |
-	|   u32   |   u8   |     ...     |
+	|  index  |  path  | seqnr | payload ... |
+	|   u32   |   u8   |  u32  |     ...     |
 
 
 > **NOTE**: Integers are transmitted little endian (host endianness).
@@ -103,7 +103,8 @@ The following control packet types exist:
     1: ACK packet
     2: PCC feedback packet
 
-For data packets (sender to receiver), the index field is the index of the chunk being transmitted. This is **not** a packet sequence number, as chunks may be retransmitted.
+For data packets (sender to receiver), the index field is the index of the chunk being transmitted.
+This is **not** a packet sequence number, as chunks may be retransmitted; hence the separate field `seqnr` contains the per-path sequence number.
 
 If path is not `UINT8_MAX`, it is used to account the packet to a specific path.
 This is used to provide quick feedback to the PCC algorithm, if enabled.
