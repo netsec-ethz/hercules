@@ -110,7 +110,7 @@ static float pcc_utility(float throughput, float loss)
 }
 
 // Startup state
-static u32 pcc_control_startup(struct ccontrol_state *cc_state, float utility)
+static u32 pcc_control_startup(struct ccontrol_state *cc_state, float utility, float loss)
 {
 	if (utility > cc_state->prev_utility) {
 		cc_state->state = pcc_startup;
@@ -118,7 +118,7 @@ static u32 pcc_control_startup(struct ccontrol_state *cc_state, float utility)
 	} else {
 		// Update state: Startup -> Decision
 		cc_state->state =  pcc_decision;
-		return cc_state->prev_rate;
+		return cc_state->prev_rate * (1 - loss);
 	}
 }
 
@@ -241,7 +241,7 @@ u32 pcc_control(struct ccontrol_state *cc_state, float throughput, float loss)
 	enum pcc_state current_pcc_state = cc_state->state;
 	switch (current_pcc_state) {
 		case pcc_startup:
-			new_rate = pcc_control_startup(cc_state, utility);
+			new_rate = pcc_control_startup(cc_state, utility, loss);
 			break;
 		case pcc_decision:
 			new_rate = pcc_control_decision(cc_state, utility);
