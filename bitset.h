@@ -57,13 +57,12 @@ inline bool bitset__set_mt_safe(struct bitset *s, u32 i)
 // This function is not thread-safe.
 inline bool bitset__set(struct bitset *s, u32 i)
 {
-	unsigned int before = s->bitmap[i/HERCULES_BITSET_WORD_BITS];
-	s->bitmap[i/HERCULES_BITSET_WORD_BITS] |= (1u << i % HERCULES_BITSET_WORD_BITS);
-	if(before != s->bitmap[i/HERCULES_BITSET_WORD_BITS]) {
+	const bool prev = bitset__check(s, i);
+	s->bitmap[i/HERCULES_BITSET_WORD_BITS] |= (1 << i % HERCULES_BITSET_WORD_BITS);
+	if(!prev) {
 		s->num_set++;
-		return false;
 	}
-	return true;
+	return prev;
 }
 
 
