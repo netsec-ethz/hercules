@@ -793,36 +793,42 @@ static void tx_recv_control_messages(int sockfd)
 		const struct udphdr *udphdr;
 		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
 			const struct hercules_control_packet *control_pkt = (const struct hercules_control_packet *) payload;
-			struct pcc_feedback fbk;
-			struct rbudp_ack_pkt ack;
-			struct rbudp_initial_pkt initial;
-			switch(control_pkt->type) {
-				case CONTROL_PACKET_TYPE_PCC_FEEDBACK:
-					if((u32) payloadlen >= sizeof(control_pkt->type) + sizeof(control_pkt->payload.pcc_fbk)) {
-						memcpy(&fbk, &control_pkt->payload.pcc_fbk, sizeof(control_pkt->payload.pcc_fbk));
-						tx_register_pcc_feedback(&fbk, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
-					}
-					break;
-				case CONTROL_PACKET_TYPE_ACK:
-					if((u32) payloadlen >= sizeof(control_pkt->type) + ack__len(&control_pkt->payload.ack)) {
-						memcpy(&ack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
-						tx_register_acks(&ack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
-					}
-					break;
-				case CONTROL_PACKET_TYPE_INITIAL:
-					if((size_t) payloadlen >= sizeof(control_pkt->type) + sizeof(control_pkt->payload.initial)) {
-						memcpy(&initial, &control_pkt->payload.initial, sizeof(control_pkt->payload.initial));
-						int rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
-						struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
-						if(tx_handle_handshake_reply(&initial, receiver)) {
-							debug_printf("[receiver %d] [path %d] handshake_rtt: %fs, MI: %fs", rcvr_idx,
-										 initial.path_index, receiver->cc_states[initial.path_index].rtt,
-										 receiver->cc_states[initial.path_index].pcc_mi_duration);
+			if((u32) payloadlen < sizeof(control_pkt->type)) {
+				debug_printf("control packet too short");
+			} else {
+				u32 control_pkt_payloadlen = payloadlen - sizeof(control_pkt->type);
+				switch(control_pkt->type) {
+					case CONTROL_PACKET_TYPE_PCC_FEEDBACK:
+						if(control_pkt_payloadlen >= sizeof(control_pkt->payload.pcc_fbk)) {
+							struct pcc_feedback fbk;
+							memcpy(&fbk, &control_pkt->payload.pcc_fbk, sizeof(control_pkt->payload.pcc_fbk));
+							tx_register_pcc_feedback(&fbk,
+													 &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
 						}
-					}
-					break;
-				default:
-					debug_printf("received a control packet of unknown type %d", control_pkt->type);
+						break;
+					case CONTROL_PACKET_TYPE_ACK:
+						if(control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
+							struct rbudp_ack_pkt ack;
+							memcpy(&ack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
+							tx_register_acks(&ack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
+						}
+						break;
+					case CONTROL_PACKET_TYPE_INITIAL:
+						if(control_pkt_payloadlen >= sizeof(control_pkt->payload.initial)) {
+							struct rbudp_initial_pkt initial;
+							memcpy(&initial, &control_pkt->payload.initial, sizeof(control_pkt->payload.initial));
+							int rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
+							struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
+							if(tx_handle_handshake_reply(&initial, receiver)) {
+								debug_printf("[receiver %d] [path %d] handshake_rtt: %fs, MI: %fs", rcvr_idx,
+											 initial.path_index, receiver->cc_states[initial.path_index].rtt,
+											 receiver->cc_states[initial.path_index].pcc_mi_duration);
+							}
+						}
+						break;
+					default:
+						debug_printf("received a control packet of unknown type %d", control_pkt->type);
+				}
 			}
 		}
 

@@ -12,7 +12,7 @@ bpf_prgm_pass:
 bpf_prgm_pass_size:
  .int (.-bpf_prgm_pass-1)
 
-# load bpf_prgm_redirect_userspace 2b43b81842635c7e0a295c3bb50b7c40
+# load bpf_prgm_redirect_userspace 29299957288a4b614fb31999e2cbe417
  .globl bpf_prgm_redirect_userspace
  .type bpf_prgm_redirect_userspace, STT_OBJECT
  .globl bpf_prgm_redirect_userspace_size

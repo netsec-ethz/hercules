@@ -17,7 +17,7 @@ hercules: builder hercules.h hercules.go hercules.c bpf_prgm/redirect_userspace.
 	docker exec hercules-builder go build -ldflags "-X main.startupVersion=$${startupVersion}"
 
 bpf_prgm/%.ll: bpf_prgm/%.c builder
-	docker exec hercules-builder clang -S -target bpf -D __BPF_TRACING__ -I. -Wall -Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types -Werror -O2 -emit-llvm -c -g -o $@ $<
+	docker exec hercules-builder clang -S -target bpf -D __BPF_TRACING__ -I. -Wall -O2 -emit-llvm -c -g -o $@ $<
 
 bpf_prgm/%.o: bpf_prgm/%.ll builder
 	docker exec hercules-builder llc -march=bpf -filetype=obj -o $@ $<

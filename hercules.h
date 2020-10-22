@@ -19,7 +19,10 @@
 #include <stdatomic.h>
 #include <linux/types.h>
 
+#define MAX_NUM_QUEUES 256
+#define MAX_NUM_LOCAL_ADDRS 256
 #define HERCULES_MAX_HEADERLEN 256
+
 struct hercules_path_header {
 	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
 	__u16  checksum;	//SCION L4 checksum over header with 0 payload

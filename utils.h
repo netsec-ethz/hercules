@@ -15,15 +15,10 @@
 #ifndef __HERCULES_UTILS_H__
 #define __HERCULES_UTILS_H__
 
-#include "hercules.h"
 #include <time.h>
 #include <errno.h>
 #include <linux/types.h>
 #include <stdio.h>
-
-#define MAX_NUM_QUEUES 256
-#define MAX_NUM_LOCAL_ADDRS 256
-#define SCION_ENDHOST_PORT 30041
 
 typedef __u64 u64;
 typedef __u32 u32;

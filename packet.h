@@ -15,6 +15,8 @@
 #ifndef HERCULES_SCION_H
 #define HERCULES_SCION_H
 
+#define SCION_ENDHOST_PORT 30041
+
 #pragma pack(push)
 #pragma pack(1)
 
