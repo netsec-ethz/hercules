@@ -476,7 +476,7 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 }
 
 static bool recv_rbudp_control_pkt(int sockfd, char *buf, size_t buflen, const char **payload, int *payloadlen,
-								   const struct scionaddrhdr_ipv4 **scionaddrh, const struct udphdr **udphdr)
+								   const struct scionaddrhdr_ipv4 **scionaddrh, const struct udphdr **udphdr, u8 *path)
 {
 	ssize_t len = recv(sockfd, buf, buflen, 0); // XXX set timeout
 	if(len == -1) {
@@ -505,6 +505,9 @@ static bool recv_rbudp_control_pkt(int sockfd, char *buf, size_t buflen, const c
 
 	*payload = rbudp_pkt + rbudp_headerlen;
 	*payloadlen = rbudp_len - rbudp_headerlen;
+	if(path != NULL) {
+		memcpy(path, rbudp_pkt + sizeof(u32), sizeof(*path));
+	}
 	return true;
 }
 
@@ -826,7 +829,8 @@ static void tx_recv_control_messages(int sockfd)
 		int payloadlen;
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
 		const struct udphdr *udphdr;
-		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
+		u8 path_idx;
+		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr, &path_idx)) {
 			const struct hercules_control_packet *control_pkt = (const struct hercules_control_packet *) payload;
 			if((u32) payloadlen < sizeof(control_pkt->type)) {
 				debug_printf("control packet too short");
@@ -844,8 +848,6 @@ static void tx_recv_control_messages(int sockfd)
 						if(tx_state->receiver[0].cc_states != NULL &&
 						   control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
 							struct rbudp_ack_pkt nack;
-							// TODO parse this properly
-							u8 path_idx = *(((u8 *)control_pkt)-5);
 							memcpy(&nack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
 							tx_register_nacks(&nack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)].cc_states[path_idx]);
 						}
@@ -908,7 +910,7 @@ static bool tx_await_cts(int sockfd)
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
 	for(u64 start = get_nsecs(); start + 20e9l > get_nsecs();) {
-		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
+		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr, NULL)) {
 			if(tx_handle_cts(payload, payloadlen, rcvr_by_src_address(scionaddrhdr, udphdr))) {
 				received++;
 				if(received >= tx_state->num_receivers) {
@@ -955,7 +957,7 @@ static bool tx_await_rtt_ack(int sockfd, const struct scionaddrhdr_ipv4 **sciona
 	char buf[ether_size];
 	const char *payload;
 	int payloadlen;
-	if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, scionaddrhdr, udphdr)) {
+	if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, scionaddrhdr, udphdr, NULL)) {
 		struct rbudp_initial_pkt parsed_pkt;
 		u32 rcvr = rcvr_by_src_address(*scionaddrhdr, *udphdr);
 		if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
@@ -1819,7 +1821,7 @@ static bool rx_accept(int sockfd)
 	while(true) { // Wait for well formed startup packet
 		const char *payload;
 		int payloadlen;
-		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, NULL, NULL)) {
+		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, NULL, NULL, NULL)) {
 			struct rbudp_initial_pkt parsed_pkt;
 			if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
 				rx_state = make_rx_state(parsed_pkt.filesize, parsed_pkt.chunklen, sockfd);
@@ -1841,7 +1843,7 @@ static void rx_get_rtt_estimate(void *arg)
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
-	if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr)) {
+	if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr, NULL)) {
 		u64 now = get_nsecs();
 		rx_state->handshake_rtt = (now - rx_state->cts_sent_at) / 1000;
 	} else {
