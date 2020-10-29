@@ -55,8 +55,6 @@ void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt) {
 
 	// restart current MI
 	ccontrol_start_monitoring_interval(cc_state);
-	cc_state->total_acked_chunks += cc_state->mi_acked_chunks;
-	cc_state->mi_acked_chunks = 0;
 }
 
 void terminate_ccontrol(struct ccontrol_state *cc_state) {

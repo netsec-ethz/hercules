@@ -757,15 +757,6 @@ static void tx_register_nacks(const struct rbudp_ack_pkt *nack, struct ccontrol_
 	}
 }
 
-static void tx_register_pcc_feedback(const struct pcc_feedback *fbk, struct sender_state_per_receiver *rcvr)
-{
-	if(rcvr->cc_states != NULL) {
-		for(u32 i = 0; i < fbk->num_paths; i++) {
-			rcvr->cc_states[i].mi_acked_chunks = fbk->pkts[i] - rcvr->cc_states[i].total_acked_chunks;
-		}
-	}
-}
-
 static bool pcc_mi_elapsed(const struct ccontrol_state *cc_state)
 {
 	unsigned long now = get_nsecs();
@@ -789,8 +780,6 @@ static void pcc_monitor()
 				pcc_control(cc_state, throughput, loss);
 
 				// Start new MI; only safe because no acks are processed during those updates
-				cc_state->total_acked_chunks += cc_state->mi_acked_chunks;
-				cc_state->mi_acked_chunks = 0;
 				ccontrol_start_monitoring_interval(cc_state);
 			}
 		}
@@ -844,14 +833,6 @@ static void tx_recv_control_messages(int sockfd)
 			} else {
 				u32 control_pkt_payloadlen = payloadlen - sizeof(control_pkt->type);
 				switch(control_pkt->type) {
-					case CONTROL_PACKET_TYPE_PCC_FEEDBACK:
-						if(control_pkt_payloadlen >= sizeof(control_pkt->payload.pcc_fbk)) {
-							struct pcc_feedback fbk;
-							memcpy(&fbk, &control_pkt->payload.pcc_fbk, sizeof(control_pkt->payload.pcc_fbk));
-							tx_register_pcc_feedback(&fbk,
-													 &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
-						}
-						break;
 					case CONTROL_PACKET_TYPE_ACK:
 						if(control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
 							struct rbudp_ack_pkt ack;

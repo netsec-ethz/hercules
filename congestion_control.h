@@ -28,8 +28,6 @@ struct ccontrol_state {
 	_Atomic double rtt; // Round-trip time in seconds
 
 	// Monitoring interval values
-	u32 total_acked_chunks; // Number of chunks that have been acked before the start of the current MI
-	u32 mi_acked_chunks; // Number of chunks that have been acked during the current MI
 	seqnr mi_seq_start;
 	seqnr mi_seq_end;
 	struct bitset mi_nacked;

@@ -65,14 +65,8 @@ struct rbudp_ack_pkt {
 	} acks[256]; //!< list of ranges that are ACKed
 };
 
-struct pcc_feedback {
-	__u8 num_paths;
-	__u32 pkts[256]; //!< count of received packets per path id
-};
-
 #define CONTROL_PACKET_TYPE_INITIAL 0
 #define CONTROL_PACKET_TYPE_ACK 1
-#define CONTROL_PACKET_TYPE_PCC_FEEDBACK 2 // obsolete, TODO remove
 #define CONTROL_PACKET_TYPE_NACK 3
 
 struct hercules_control_packet {
@@ -80,7 +74,6 @@ struct hercules_control_packet {
 	union {
 		struct rbudp_initial_pkt initial;
 		struct rbudp_ack_pkt ack;
-		struct pcc_feedback pcc_fbk;
 	} payload;
 };
 
