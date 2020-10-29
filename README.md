@@ -101,10 +101,12 @@ The following control packet types exist:
 
     0: Handshake packet
     1: ACK packet
-    2: PCC feedback packet
+    2: PCC feedback packet (deprecated)
+    3: NACK packet
 
 For data packets (sender to receiver), the index field is the index of the chunk being transmitted.
 This is **not** a packet sequence number, as chunks may be retransmitted; hence the separate field `seqnr` contains the per-path sequence number.
+A NACK packet is always associated with a path. 
 
 If path is not `UINT8_MAX`, it is used to account the packet to a specific path.
 This is used to provide quick feedback to the PCC algorithm, if enabled.
@@ -153,14 +155,11 @@ The receiver replies immediately with the same packet (using the current return 
         | begin, end | begin, end | begin, end | ...
         |  u32   u32 |  u32   u32 |  u32   u32 | ...
 
-* The receiver sends a PCC feedback two times per RTT.
-  The PCC feedback packet uses the following payload layout:
-   
-        | num paths | pkt count | pkt count | ...
-        |    u8     |    u32    |    u32    | ...
+* The receiver sends a NACK packets four times per RTT to provide timely feedback to congestion control.
+  The NACK packet layout is identical to the ACK packet layout.
        
-  These PCC feedback packets are not sent, if no paths have been accounted packets for
-  (e.g. if no path uses PCC). 
+  NACK packets are only sent if non-empty.
+  Hence, if no path uses PCC, or no recent packet loss has been observed, no NACKs are sent. 
 
 #### Termination
 
