@@ -72,7 +72,8 @@ struct pcc_feedback {
 
 #define CONTROL_PACKET_TYPE_INITIAL 0
 #define CONTROL_PACKET_TYPE_ACK 1
-#define CONTROL_PACKET_TYPE_PCC_FEEDBACK 2
+#define CONTROL_PACKET_TYPE_PCC_FEEDBACK 2 // obsolete, TODO remove
+#define CONTROL_PACKET_TYPE_NACK 3
 
 struct hercules_control_packet {
 	__u8 type;

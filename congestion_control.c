@@ -21,10 +21,20 @@ struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 total_chunks,
 		cc_state->max_rate_limit = max_rate_limit;
 		cc_state->num_paths = num_paths;
 		cc_state->total_num_paths = total_num_paths;
+		bitset__create(&cc_state->mi_nacked, total_chunks);
 
 		continue_ccontrol(cc_state);
 	}
 	return cc_states;
+}
+
+void ccontrol_start_monitoring_interval(struct ccontrol_state *cc_state) {
+	cc_state->mi_start = get_nsecs();
+	cc_state->mi_seq_start = cc_state->last_sequence_number;
+	cc_state->mi_seq_end = cc_state->mi_seq_start + cc_state->curr_rate * cc_state->pcc_mi_duration;
+	atomic_store(&cc_state->mi_tx_npkts, 0);
+	atomic_store(&cc_state->mi_tx_npkts_monitored, 0);
+	bitset__reset(&cc_state->mi_nacked);
 }
 
 void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt) {
@@ -44,8 +54,7 @@ void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt) {
 	}
 
 	// restart current MI
-	cc_state->mi_start = get_nsecs();
-	cc_state->mi_tx_npkts = 0;
+	ccontrol_start_monitoring_interval(cc_state);
 	cc_state->total_acked_chunks += cc_state->mi_acked_chunks;
 	cc_state->mi_acked_chunks = 0;
 }
@@ -60,11 +69,10 @@ void continue_ccontrol(struct ccontrol_state *cc_state) {
 	cc_state->state = pcc_uninitialized;
 	cc_state->eps = EPS_MIN;
 	cc_state->sign = 1;
-	cc_state->mi_start = get_nsecs();
 	cc_state->rcts_iter = -1;
-	cc_state->mi_tx_npkts = 0;
 	cc_state->pcc_mi_duration = DBL_MAX;
 	cc_state->rtt = DBL_MAX;
+	ccontrol_start_monitoring_interval(cc_state);
 }
 
 u32 ccontrol_can_send_npkts(struct ccontrol_state *cc_state, u64 now)
@@ -76,7 +84,7 @@ u32 ccontrol_can_send_npkts(struct ccontrol_state *cc_state, u64 now)
 	u64 dt = now - cc_state->mi_start;
 
 	dt = umax64(dt, 1);
-	u32 tx_pps = cc_state->mi_tx_npkts * 1000000000. / dt;
+	u32 tx_pps = atomic_load(&cc_state->mi_tx_npkts) * 1000000000. / dt;
 
 	if(tx_pps > cc_state->curr_rate) {
 		return 0;

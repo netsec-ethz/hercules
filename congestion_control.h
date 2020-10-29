@@ -30,6 +30,9 @@ struct ccontrol_state {
 	// Monitoring interval values
 	u32 total_acked_chunks; // Number of chunks that have been acked before the start of the current MI
 	u32 mi_acked_chunks; // Number of chunks that have been acked during the current MI
+	seqnr mi_seq_start;
+	seqnr mi_seq_end;
+	struct bitset mi_nacked;
 
 	seqnr last_sequence_number;
 
@@ -41,6 +44,7 @@ struct ccontrol_state {
 	int adjust_iter;
 	unsigned long mi_start;
 	u32 mi_tx_npkts;
+	u32 mi_tx_npkts_monitored;
 
 	struct rct rcts[RCTS_INTERVALS];
 	int rcts_iter;
@@ -62,6 +66,7 @@ void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt);
 u32 ccontrol_can_send_npkts(struct ccontrol_state *cc_state, u64 now);
 void kick_ccontrol(struct ccontrol_state *cc_state);
 void destroy_ccontrol_state(struct ccontrol_state *cc_states, size_t num_paths);
+void ccontrol_start_monitoring_interval(struct ccontrol_state *cc_state);
 
 // Apply PCC control decision, return new rate
 u32 pcc_control(struct ccontrol_state *cc_state, float throughput, float loss);

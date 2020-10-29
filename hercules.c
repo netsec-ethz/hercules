@@ -88,6 +88,12 @@ struct xsk_socket_info {
 	u32 outstanding_tx;
 };
 
+struct receiver_state_per_path {
+	struct bitset seq_rcvd;
+	seqnr nack_end;
+	seqnr prev_nack_end;
+};
+
 struct receiver_state {
 	atomic_uint_least64_t handshake_rtt;
 	/** Filesize in bytes */
@@ -112,7 +118,7 @@ struct receiver_state {
 	u64 cts_sent_at;
 
 	u8 num_tracked_paths;
-	u32 rx_per_path[256];
+	struct receiver_state_per_path path_state[256];
 };
 
 struct sender_state_per_receiver {
@@ -523,9 +529,18 @@ static bool handle_rbudp_data_pkt(const char *pkt, size_t length)
 	u8 path_idx;
 	mempcpy(&path_idx, &pkt[4], sizeof(u8));
 	if (path_idx < PCC_NO_PATH) {
-		// TODO some magic with the sequence number
 		seqnr sequence_number;
 		memcpy(&sequence_number, &pkt[5], sizeof(seqnr));
+		if(rx_state->path_state[path_idx].seq_rcvd.bitmap == NULL) {
+			bitset__create(&rx_state->path_state[path_idx].seq_rcvd, 2 * rx_state->total_chunks);
+			// TODO work out wrap-around
+		}
+		bitset__set_mt_safe(&rx_state->path_state[path_idx].seq_rcvd, sequence_number);
+
+		u8 old_num = atomic_load(&rx_state->num_tracked_paths);
+		while(old_num < path_idx + 1) { // update num_tracked_paths
+			atomic_compare_exchange_strong(&rx_state->num_tracked_paths, &old_num, path_idx + 1);
+		}
 	}
 	// mark as received in received_chunks bitmap
 	bool prev = bitset__set_mt_safe(&rx_state->received_chunks, chunk_idx);
@@ -677,6 +692,25 @@ static u32 fill_ack_pkt(u32 first, struct rbudp_ack_pkt *ack, size_t max_num_ack
 	return curr;
 }
 
+static seqnr fill_nack_pkt(seqnr first, struct rbudp_ack_pkt *ack, size_t max_num_acks, struct bitset *seqs)
+{
+	size_t e = 0;
+	u32 curr = first;
+	for(; e < max_num_acks;) {
+		u32 begin = bitset__scan_neg(seqs, curr);
+		u32 end = bitset__scan(seqs, begin + 1);
+		if(end == seqs->num) {
+			break;
+		}
+		curr = end + 1;
+		ack->acks[e].begin = begin;
+		ack->acks[e].end = end;
+		e++;
+	}
+	ack->num_acks = e;
+	return curr;
+}
+
 static void send_eth_frame(int sockfd, void *buf, size_t len)
 {
 	struct sockaddr_ll addr;
@@ -707,6 +741,22 @@ static void tx_register_acks(const struct rbudp_ack_pkt *ack, struct sender_stat
 	}
 }
 
+static void tx_register_nacks(const struct rbudp_ack_pkt *nack, struct ccontrol_state *cc_state)
+{
+	for(uint16_t e = 0; e < nack->num_acks; ++e) {
+		u32 begin = nack->acks[e].begin;
+		u32 end = nack->acks[e].end;
+		begin = umax32(begin, cc_state->mi_seq_start);
+		end = umin32(end, cc_state->mi_seq_end);
+		if(begin >= end || end > cc_state->mi_nacked.num) {
+			continue;
+		}
+		for(u32 i = begin; i < end; ++i) { // XXX: this can *obviously* be optimized
+			bitset__set(&cc_state->mi_nacked, i); // don't need thread-safety here, all updates in same thread
+		}
+	}
+}
+
 static void tx_register_pcc_feedback(const struct pcc_feedback *fbk, struct sender_state_per_receiver *rcvr)
 {
 	if(rcvr->cc_states != NULL) {
@@ -729,22 +779,19 @@ static void pcc_monitor()
 		for(u32 cur_path = 0; cur_path < tx_state->receiver[r].num_paths; cur_path++) {
 			struct ccontrol_state *cc_state = &tx_state->receiver[r].cc_states[cur_path];
 			if(pcc_mi_elapsed(cc_state)) {
-				u64 now = get_nsecs();
-				u64 mi_duration = now - cc_state->mi_start;
-				u32 throughput = cc_state->curr_rate * mi_duration / 1000000000; // pkts sent in MI
-				u32 acked_mi = cc_state->mi_acked_chunks; // acked pkts from MI
-
-				throughput = umax32(throughput, cc_state->mi_tx_npkts);
+				u32 throughput = cc_state->mi_seq_end - cc_state->mi_seq_start; // pkts sent in MI
 				throughput = umax32(throughput, 1);
-				acked_mi = umin32(acked_mi, throughput);
-				float loss = (float)(throughput - acked_mi) / throughput;
+				int diff = (int)(throughput - atomic_load(&cc_state->mi_tx_npkts_monitored));
+				if(diff < 0) {
+					diff = 0;
+				}
+				float loss = (float)(cc_state->mi_nacked.num_set + diff) / throughput;
 				pcc_control(cc_state, throughput, loss);
 
 				// Start new MI; only safe because no acks are processed during those updates
 				cc_state->total_acked_chunks += cc_state->mi_acked_chunks;
 				cc_state->mi_acked_chunks = 0;
-				cc_state->mi_start = now;
-				cc_state->mi_tx_npkts = 0;
+				ccontrol_start_monitoring_interval(cc_state);
 			}
 		}
 	}
@@ -810,6 +857,16 @@ static void tx_recv_control_messages(int sockfd)
 							struct rbudp_ack_pkt ack;
 							memcpy(&ack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
 							tx_register_acks(&ack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
+						}
+						break;
+					case CONTROL_PACKET_TYPE_NACK:
+						if(tx_state->receiver[0].cc_states != NULL &&
+						   control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
+							struct rbudp_ack_pkt nack;
+							// TODO parse this properly
+							u8 path_idx = *(((u8 *)control_pkt)-5);
+							memcpy(&nack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
+							tx_register_nacks(&nack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)].cc_states[path_idx]);
 						}
 						break;
 					case CONTROL_PACKET_TYPE_INITIAL:
@@ -1547,8 +1604,10 @@ static void tx_only()
 			if(!rcvr->finished) {
 				u64 ack_due = 0;
 				// for each receiver, we prepare up to max_chunks_per_rcvr[r] chunks to send
-				num_chunks += prepare_rcvr_chunks(&tx_state->receiver[r], &chunks[num_chunks], &chunk_rcvr[num_chunks],
-									  now, r, &ack_due, max_chunks_per_rcvr[r]);
+				u32 cur_num_chunks = prepare_rcvr_chunks(&tx_state->receiver[r], &chunks[num_chunks],
+											  &chunk_rcvr[num_chunks], now, r, &ack_due, max_chunks_per_rcvr[r]);
+				num_chunks += cur_num_chunks;
+				num_chunks_per_rcvr[r] += cur_num_chunks;
 				if(rcvr->finished) {
 					finished_count++;
 					if(rcvr->cc_states) {
@@ -1580,7 +1639,11 @@ static void tx_only()
 				struct sender_state_per_receiver *receiver = &tx_state->receiver[r];
 				u32 path_idx = tx_state->receiver[r].path_index;
 				if(receiver->cc_states != NULL) {
-					receiver->cc_states[path_idx].mi_tx_npkts += num_chunks_per_rcvr[r];
+					struct ccontrol_state *cc_state = &receiver->cc_states[path_idx];
+					atomic_fetch_add(&cc_state->mi_tx_npkts, num_chunks_per_rcvr[r]);
+					if(cc_state->mi_start + (u64)((cc_state->pcc_mi_duration) * 1e9) >= now) {
+						atomic_fetch_add(&cc_state->mi_tx_npkts_monitored, num_chunks_per_rcvr[r]);
+					}
 				}
 			}
 		}
@@ -1938,13 +2001,8 @@ static void rx_trickle_acks(int sockfd)
 	}
 }
 
-static void rx_send_pcc_feedback(int sockfd)
+static void rx_send_path_nacks(int sockfd, struct receiver_state_per_path *path_state, u8 path_idx)
 {
-	u8 num_paths = atomic_load(&rx_state->num_tracked_paths);
-	if (num_paths == 0) { // don't send empty feedback
-		return;
-	}
-
 	struct hercules_path path;
 	struct hercules_path_header path_header;
 	if(!rx_get_reply_path(&path, &path_header)) {
@@ -1955,29 +2013,45 @@ static void rx_send_pcc_feedback(int sockfd)
 	char buf[ether_size];
 	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
-	// XXX: could write fbk payload directly to buf, but
+	// XXX: could write ack payload directly to buf, but
 	// doesnt work nicely with existing fill_rbudp_pkt helper.
-	struct hercules_control_packet fbk = {
-			.type = CONTROL_PACKET_TYPE_PCC_FEEDBACK,
-			.payload.pcc_fbk.num_paths = num_paths,
+	struct hercules_control_packet control_pkt = {
+			.type = CONTROL_PACKET_TYPE_NACK,
 	};
-	for(u32 i = 0; i < fbk.payload.pcc_fbk.num_paths; i++) {
-		fbk.payload.pcc_fbk.pkts[i] = atomic_load(&rx_state->rx_per_path[i]);
+	const size_t max_entries = ack__max_num_entries(path.payloadlen - rbudp_headerlen - sizeof(control_pkt.type));
+	seqnr nack_end = path_state->prev_nack_end;
+	for(u32 curr = path_state->prev_nack_end; curr < path_state->seq_rcvd.num;) {
+		// Data to send
+		curr = fill_nack_pkt(curr, &control_pkt.payload.ack, max_entries, &path_state->seq_rcvd);
+		if(control_pkt.payload.ack.num_acks == 0) break;
+
+		nack_end = control_pkt.payload.ack.acks[control_pkt.payload.ack.num_acks - 1].end;
+		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, path_idx, 0, (char *) &control_pkt,
+					   sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
+		stitch_checksum(&path, path.headers[0].checksum, buf);
+
+		send_eth_frame(sockfd, buf, path.framelen);
+		atomic_fetch_add(&tx_npkts, 1);
 	}
-
-	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &fbk,
-				   2 * sizeof(u8) + fbk.payload.pcc_fbk.num_paths * sizeof(u32), path.payloadlen);
-	stitch_checksum(&path, path.headers[0].checksum, buf);
-
-	send_eth_frame(sockfd, buf, path.framelen);
-	atomic_fetch_add(&tx_npkts, 1);
+	// we want to send each NACK range twice, so we store the ends of the two last batches sent
+	path_state->prev_nack_end = path_state->nack_end;
+	path_state->nack_end = nack_end;
 }
 
-static void rx_trickle_pcc_feedback(int sockfd)
+// sends the NACKs used for congestion control by the sender
+static void rx_send_nacks(int sockfd)
+{
+	u8 num_paths = atomic_load(&rx_state->num_tracked_paths);
+	for(u8 p = 0; p < num_paths; p++) {
+		rx_send_path_nacks(sockfd, &rx_state->path_state[p], p);
+	}
+}
+
+static void rx_trickle_nacks(int sockfd)
 {
 	while(!rx_received_all(rx_state)) {
 		u64 ack_round_start = get_nsecs();
-		rx_send_pcc_feedback(sockfd);
+		rx_send_nacks(sockfd);
 		sleep_until(ack_round_start + rx_state->handshake_rtt * 1000 / 4);
 	}
 }
@@ -2423,7 +2497,7 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 	}
 
 	rx_send_cts_ack(sockfd); // send Clear To Send ACK
-	pthread_t trickle_pcc = start_thread(rx_trickle_pcc_feedback, (void *)(u64)sockfd);
+	pthread_t trickle_pcc = start_thread(rx_trickle_nacks, (void *) (u64) sockfd);
 	rx_trickle_acks(sockfd);
 	rx_send_acks(sockfd);
 
