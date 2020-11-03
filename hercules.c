@@ -754,6 +754,8 @@ static void tx_register_nacks(const struct rbudp_ack_pkt *nack, struct ccontrol_
 		if(begin >= end || end > cc_state->mi_nacked.num) {
 			continue;
 		}
+		begin -= cc_state->mi_seq_start;
+		end -= cc_state->mi_seq_start;
 		for(u32 i = begin; i < end; ++i) { // XXX: this can *obviously* be optimized
 			bitset__set(&cc_state->mi_nacked, i); // don't need thread-safety here, all updates in same thread
 		}

@@ -21,7 +21,6 @@ struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 total_chunks,
 		cc_state->max_rate_limit = max_rate_limit;
 		cc_state->num_paths = num_paths;
 		cc_state->total_num_paths = total_num_paths;
-		bitset__create(&cc_state->mi_nacked, total_chunks);
 
 		continue_ccontrol(cc_state);
 	}
@@ -34,7 +33,9 @@ void ccontrol_start_monitoring_interval(struct ccontrol_state *cc_state) {
 	cc_state->mi_seq_end = cc_state->mi_seq_start + cc_state->curr_rate * cc_state->pcc_mi_duration;
 	atomic_store(&cc_state->mi_tx_npkts, 0);
 	atomic_store(&cc_state->mi_tx_npkts_monitored, 0);
-	bitset__reset(&cc_state->mi_nacked);
+	if(cc_state->mi_nacked.bitmap != NULL) {
+		bitset__reset(&cc_state->mi_nacked);
+	}
 }
 
 void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt) {
@@ -42,6 +43,10 @@ void ccontrol_update_rtt(struct ccontrol_state *cc_state, u64 rtt) {
 
 	float m = (rand() % 6) / 10.f + 1.7; // m in [1.7, 2.2]
 	cc_state->pcc_mi_duration = m * cc_state->rtt;
+	if(cc_state->mi_nacked.bitmap != NULL) {
+		bitset__destroy(&cc_state->mi_nacked);
+	}
+	bitset__create(&cc_state->mi_nacked, ceil(cc_state->max_rate_limit * cc_state->pcc_mi_duration));
 
 	if(!cc_state->curr_rate) {
 		// initial rate should be per-receiver fair
