@@ -17,7 +17,7 @@ struct rct {
 // RCTs result
 enum rcts_result{increase, decrease, inconclusive};
 
-typedef u32 seqnr;
+typedef u32 sequence_number;
 
 struct ccontrol_state {
 	// Cons
@@ -28,11 +28,11 @@ struct ccontrol_state {
 	_Atomic double rtt; // Round-trip time in seconds
 
 	// Monitoring interval values
-	seqnr mi_seq_start;
-	seqnr mi_seq_end;
+	sequence_number mi_seq_start;
+	sequence_number mi_seq_end;
 	struct bitset mi_nacked;
 
-	seqnr last_sequence_number;
+	sequence_number last_seqnr;
 
 	u32 prev_rate;
 	u32 curr_rate;

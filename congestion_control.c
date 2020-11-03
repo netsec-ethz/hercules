@@ -30,7 +30,7 @@ struct ccontrol_state *init_ccontrol_state(u32 max_rate_limit, u32 total_chunks,
 
 void ccontrol_start_monitoring_interval(struct ccontrol_state *cc_state) {
 	cc_state->mi_start = get_nsecs();
-	cc_state->mi_seq_start = cc_state->last_sequence_number;
+	cc_state->mi_seq_start = cc_state->last_seqnr;
 	cc_state->mi_seq_end = cc_state->mi_seq_start + cc_state->curr_rate * cc_state->pcc_mi_duration;
 	atomic_store(&cc_state->mi_tx_npkts, 0);
 	atomic_store(&cc_state->mi_tx_npkts_monitored, 0);

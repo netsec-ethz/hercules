@@ -101,8 +101,7 @@ The following control packet types exist:
 
     0: Handshake packet
     1: ACK packet
-    2: PCC feedback packet (deprecated)
-    3: NACK packet
+    2: NACK packet
 
 For data packets (sender to receiver), the index field is the index of the chunk being transmitted.
 This is **not** a packet sequence number, as chunks may be retransmitted; hence the separate field `seqnr` contains the per-path sequence number.
