@@ -174,7 +174,7 @@ typedef int xskmap;
 
 // XXX: cleanup naming: these things are called `opt_XXX` because they corresponded to options in the example application.
 static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
-static char *opt_ifname = "";
+char opt_ifname[IFNAMSIZ];  // same buffer size as libbpf
 static int opt_ifindex;
 static int num_queues;
 static int *queues;
@@ -2229,13 +2229,10 @@ void hercules_init(int ifindex, const ia local_ia_, const struct local_addr *loc
 	num_queues = num_queues_;
 	queues = calloc(num_queues, sizeof(*queues));
 	memcpy(queues, queues_, sizeof(*queues) * num_queues);
-	static char if_name_buf[IF_NAMESIZE];
 	opt_ifindex = ifindex;
 
-	if_indextoname(ifindex, if_name_buf);
-	int ifname_size = strlen(if_name_buf) + 1;
-	opt_ifname = malloc(ifname_size);
-	memcpy(opt_ifname, if_name_buf, ifname_size);
+	if_indextoname(ifindex, opt_ifname);
+	opt_ifname[IFNAMSIZ - 1] = '\0';
 
 	local_ia = local_ia_;
 	num_local_addrs = num_local_addrs_;
