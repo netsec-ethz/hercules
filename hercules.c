@@ -950,7 +950,7 @@ static void tx_send_handshake_ack(int sockfd, u32 rcvr)
 	atomic_fetch_add(&tx_npkts, 1);
 }
 
-static bool tx_await_rtt_ack(int sockfd, const struct scionaddrhdr_ipv4 **scionaddrhdr, const struct udphdr **udphdr)
+static bool tx_await_rtt_ack(int sockfd, char *buf, const struct scionaddrhdr_ipv4 **scionaddrhdr, const struct udphdr **udphdr)
 {
 	const struct scionaddrhdr_ipv4 *scionaddrhdr_fallback;
 	if(scionaddrhdr == NULL) {
@@ -966,7 +966,6 @@ static bool tx_await_rtt_ack(int sockfd, const struct scionaddrhdr_ipv4 **sciona
 	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
-	char buf[ether_size];
 	const char *payload;
 	int payloadlen;
 	if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, scionaddrhdr, udphdr, NULL)) {
@@ -1033,9 +1032,10 @@ static bool tx_handshake(int sockfd)
 			}
 		}
 
+		char buf[ether_size];
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
 		const struct udphdr *udphdr;
-		while(tx_await_rtt_ack(sockfd, &scionaddrhdr, &udphdr)) {
+		while(tx_await_rtt_ack(sockfd, buf, &scionaddrhdr, &udphdr)) {
 			u32 rcvr = rcvr_by_src_address(scionaddrhdr, udphdr);
 			if(rcvr < tx_state->num_receivers && !succeeded[rcvr]) {
 				tx_state->receiver[rcvr].paths[0].next_handshake_at = UINT64_MAX;
