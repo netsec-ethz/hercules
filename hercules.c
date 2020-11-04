@@ -538,6 +538,16 @@ static bool handle_rbudp_data_pkt(const char *pkt, size_t length)
 			bitset__create(&rx_state->path_state[path_idx].seq_rcvd, 2 * rx_state->total_chunks);
 			// TODO work out wrap-around
 		}
+		if(seqnr >= rx_state->path_state[path_idx].seq_rcvd.num) {
+			// XXX: currently we cannot track these sequence numbers, as a consequence congestion control breaks at this
+			// point, abort.
+			if(!running) {
+				return true;
+			} else {
+				fprintf(stderr, "sequence number overflow %d / %d\n", seqnr, rx_state->path_state[path_idx].seq_rcvd.num);
+				exit(EXIT_FAILURE);
+			}
+		}
 		bitset__set_mt_safe(&rx_state->path_state[path_idx].seq_rcvd, seqnr);
 
 		u8 old_num = atomic_load(&rx_state->num_tracked_paths);
