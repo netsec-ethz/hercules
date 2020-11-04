@@ -1387,6 +1387,9 @@ static void tx_send_p(void *arg) {
 		tx_handle_send_queue_unit(xsk, &unit, &frame_nb, &random_seed);
 		if(!send_queue_pop(&send_queue, &unit)) { // queue currently empty
 			while(!send_queue_pop(&send_queue, &unit)) {
+				if(!atomic_load(&running)) {
+					return;
+				}
 				// whenever we're waiting, claim frames back
 				pop_completion_ring(xsk);
 			}
@@ -2333,14 +2336,6 @@ static void join_thread(pthread_t pt)
 	}
 }
 
-static void stop_thread(pthread_t pt)
-{
-	int ret = pthread_cancel(pt);
-	if(ret) {
-		exit_with_error(ret);
-	}
-}
-
 struct hercules_stats
 hercules_tx(const char *filename, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest,
 			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode)
@@ -2435,7 +2430,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	join_thread(worker);
 
 	for(int q = 0; q < num_queues; q++) {
-		stop_thread(senders[q]);
+		join_thread(senders[q]);
 		close_xsk(xsks[q]);
 	}
 	destroy_send_queue(&send_queue);
