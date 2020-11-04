@@ -82,7 +82,8 @@ inline bool bitset__unset(struct bitset *s, u32 i)
 // Unsets all entries in bitmap and reset the number of elements in the set
 inline void bitset__reset(struct bitset *s)
 {
-	memset(s->bitmap, 0, (s->num + HERCULES_BITSET_WORD_BITS - 1)/8);
+	// due to rounding, need to use the same formula as for allocation
+	memset(s->bitmap, 0, ((s->num + HERCULES_BITSET_WORD_BITS - 1) / HERCULES_BITSET_WORD_BITS) * (HERCULES_BITSET_WORD_BITS/8));
 	s->num_set = 0;
 }
 
