@@ -2036,7 +2036,7 @@ static void rx_trickle_acks(int sockfd)
 	// XXX: data races in access to shared rx_state!
 	atomic_store(&rx_state->last_pkt_rcvd, get_nsecs());
 	while(!rx_received_all(rx_state)) {
-		if(atomic_load(&rx_state->last_pkt_rcvd) + 3 * umax64(ACK_RATE_TIME_MS * 1e6, rx_state->handshake_rtt) < get_nsecs()) {
+		if(atomic_load(&rx_state->last_pkt_rcvd) + umax64(30 * ACK_RATE_TIME_MS * 1e6, 3 * rx_state->handshake_rtt) < get_nsecs()) {
 			// Transmission timed out
 			exit_with_error(ETIMEDOUT);
 		}
