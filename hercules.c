@@ -116,6 +116,7 @@ struct receiver_state {
 	u64 start_time;
 	u64 end_time;
 	u64 cts_sent_at;
+	u64 last_pkt_rcvd; // Timeout detection
 
 	u8 num_tracked_paths;
 	struct receiver_state_per_path path_state[256];
@@ -836,7 +837,13 @@ static void tx_recv_control_messages(int sockfd)
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
 	char buf[ether_size];
+	u64 last_pkt_rcvd = get_nsecs();
 	while(!tx_acked_all(tx_state)) {
+		if(last_pkt_rcvd + 3 * ACK_RATE_TIME_MS * 1e6 < get_nsecs()) {
+			// Abort transmission after timeout.
+			exit_with_error(ETIMEDOUT);
+		}
+
 		const char *payload;
 		int payloadlen;
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
@@ -850,6 +857,7 @@ static void tx_recv_control_messages(int sockfd)
 				u32 control_pkt_payloadlen = payloadlen - sizeof(control_pkt->type);
 				switch(control_pkt->type) {
 					case CONTROL_PACKET_TYPE_ACK:
+						last_pkt_rcvd = get_nsecs();
 						if(control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
 							struct rbudp_ack_pkt ack;
 							memcpy(&ack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
@@ -857,6 +865,7 @@ static void tx_recv_control_messages(int sockfd)
 						}
 						break;
 					case CONTROL_PACKET_TYPE_NACK:
+						last_pkt_rcvd = get_nsecs();
 						if(tx_state->receiver[0].cc_states != NULL &&
 						   control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
 							struct rbudp_ack_pkt nack;
@@ -865,6 +874,7 @@ static void tx_recv_control_messages(int sockfd)
 						}
 						break;
 					case CONTROL_PACKET_TYPE_INITIAL:
+						last_pkt_rcvd = get_nsecs();
 						if(control_pkt_payloadlen >= sizeof(control_pkt->payload.initial)) {
 							struct rbudp_initial_pkt initial;
 							memcpy(&initial, &control_pkt->payload.initial, sizeof(control_pkt->payload.initial));
@@ -1078,6 +1088,13 @@ static void rx_receive_batch(struct xsk_socket_info *xsk)
 	size_t rcvd = xsk_ring_cons__peek(&xsk->rx, BATCH_SIZE, &idx_rx);
 	if(!rcvd)
 		return;
+
+	// optimistically update receive timestamp
+	u64 now = get_nsecs();
+	u64 old_last_pkt_rcvd = atomic_load(&rx_state->last_pkt_rcvd);
+	if(old_last_pkt_rcvd < now) {
+		atomic_compare_exchange_strong(&rx_state->last_pkt_rcvd, &old_last_pkt_rcvd, now);
+	}
 
 	size_t reserved = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
 	while(reserved != rcvd) {
@@ -1999,7 +2016,12 @@ static void rx_send_acks(int sockfd)
 static void rx_trickle_acks(int sockfd)
 {
 	// XXX: data races in access to shared rx_state!
+	atomic_store(&rx_state->last_pkt_rcvd, get_nsecs());
 	while(!rx_received_all(rx_state)) {
+		if(atomic_load(&rx_state->last_pkt_rcvd) + 3 * umax64(ACK_RATE_TIME_MS * 1e6, rx_state->handshake_rtt) < get_nsecs()) {
+			// Transmission timed out
+			exit_with_error(ETIMEDOUT);
+		}
 		rx_send_acks(sockfd);
 		sleep_nsecs(ACK_RATE_TIME_MS * 1e6);
 	}
