@@ -922,8 +922,8 @@ static bool tx_await_cts(int sockfd)
 		}
 	}
 
-	// Set 20 second timeout on the socket, wait for receiver to get ready
-	struct timeval to = {.tv_sec = 60, .tv_usec = 0};
+	// Set timeout on the socket
+	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
 	char buf[ether_size];
@@ -931,6 +931,7 @@ static bool tx_await_cts(int sockfd)
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
+	// Wait up to 20 seconds for the receiver to get ready
 	for(u64 start = get_nsecs(); start + 20e9l > get_nsecs();) {
 		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr, NULL)) {
 			if(tx_handle_cts(payload, payloadlen, rcvr_by_src_address(scionaddrhdr, udphdr))) {
