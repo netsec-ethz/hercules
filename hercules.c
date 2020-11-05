@@ -835,13 +835,25 @@ static void tx_recv_control_messages(int sockfd)
 {
 	struct timeval to = {.tv_sec = 0, .tv_usec = 100};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
-
 	char buf[ether_size];
-	u64 last_pkt_rcvd = get_nsecs();
+
+	// packet receive timeouts
+	u64 last_pkt_rcvd[tx_state->num_receivers];
+	for(u32 r = 0; r < tx_state->num_receivers; r++) {
+		// tolerate some delay for first ACK
+		last_pkt_rcvd[r] = get_nsecs()
+				+ 2 * tx_state->receiver[r].handshake_rtt // at startup, tolerate two additional RTTs
+				+ 20 * ACK_RATE_TIME_MS * 1000000; // some drivers experience a short outage after activating XDP
+	}
+
 	while(!tx_acked_all(tx_state)) {
-		if(last_pkt_rcvd + 3 * ACK_RATE_TIME_MS * 1e6 < get_nsecs()) {
-			// Abort transmission after timeout.
-			exit_with_error(ETIMEDOUT);
+		for(u32 r = 0; r < tx_state->num_receivers; r++) {
+			if(last_pkt_rcvd[r] + 3 * ACK_RATE_TIME_MS * 1e6 < get_nsecs()) {
+				// Abort transmission after timeout.
+				debug_printf("receiver %d timed out: last %fs, now %fs", r, last_pkt_rcvd[r] / 1.e9, get_nsecs() / 1.e9);
+				// XXX: this aborts all transmissions, as soon as one times out
+				exit_with_error(ETIMEDOUT);
+			}
 		}
 
 		const char *payload;
@@ -855,40 +867,40 @@ static void tx_recv_control_messages(int sockfd)
 				debug_printf("control packet too short");
 			} else {
 				u32 control_pkt_payloadlen = payloadlen - sizeof(control_pkt->type);
-				switch(control_pkt->type) {
-					case CONTROL_PACKET_TYPE_ACK:
-						last_pkt_rcvd = get_nsecs();
-						if(control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
-							struct rbudp_ack_pkt ack;
-							memcpy(&ack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
-							tx_register_acks(&ack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
-						}
-						break;
-					case CONTROL_PACKET_TYPE_NACK:
-						last_pkt_rcvd = get_nsecs();
-						if(tx_state->receiver[0].cc_states != NULL &&
-						   control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
-							struct rbudp_ack_pkt nack;
-							memcpy(&nack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
-							tx_register_nacks(&nack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)].cc_states[path_idx]);
-						}
-						break;
-					case CONTROL_PACKET_TYPE_INITIAL:
-						last_pkt_rcvd = get_nsecs();
-						if(control_pkt_payloadlen >= sizeof(control_pkt->payload.initial)) {
-							struct rbudp_initial_pkt initial;
-							memcpy(&initial, &control_pkt->payload.initial, sizeof(control_pkt->payload.initial));
-							int rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
-							struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
-							if(tx_handle_handshake_reply(&initial, receiver)) {
-								debug_printf("[receiver %d] [path %d] handshake_rtt: %fs, MI: %fs", rcvr_idx,
-											 initial.path_index, receiver->cc_states[initial.path_index].rtt,
-											 receiver->cc_states[initial.path_index].pcc_mi_duration);
+				u32 rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
+				if(rcvr_idx < tx_state->num_receivers) {
+					last_pkt_rcvd[rcvr_idx] = umax64(last_pkt_rcvd[rcvr_idx], get_nsecs());
+					switch(control_pkt->type) {
+						case CONTROL_PACKET_TYPE_ACK:
+							if(control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
+								struct rbudp_ack_pkt ack;
+								memcpy(&ack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
+								tx_register_acks(&ack, &tx_state->receiver[rcvr_idx]);
 							}
-						}
-						break;
-					default:
-						debug_printf("received a control packet of unknown type %d", control_pkt->type);
+							break;
+						case CONTROL_PACKET_TYPE_NACK:
+							if(tx_state->receiver[0].cc_states != NULL &&
+							   control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
+								struct rbudp_ack_pkt nack;
+								memcpy(&nack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
+								tx_register_nacks(&nack, &tx_state->receiver[rcvr_idx].cc_states[path_idx]);
+							}
+							break;
+						case CONTROL_PACKET_TYPE_INITIAL:
+							if(control_pkt_payloadlen >= sizeof(control_pkt->payload.initial)) {
+								struct rbudp_initial_pkt initial;
+								memcpy(&initial, &control_pkt->payload.initial, sizeof(control_pkt->payload.initial));
+								struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
+								if(tx_handle_handshake_reply(&initial, receiver)) {
+									debug_printf("[receiver %d] [path %d] handshake_rtt: %fs, MI: %fs", rcvr_idx,
+												 initial.path_index, receiver->cc_states[initial.path_index].rtt,
+												 receiver->cc_states[initial.path_index].pcc_mi_duration);
+								}
+							}
+							break;
+						default:
+							debug_printf("received a control packet of unknown type %d", control_pkt->type);
+					}
 				}
 			}
 		}
@@ -2003,10 +2015,12 @@ static void rx_send_acks(int sockfd)
 	};
 
 	const size_t max_entries = ack__max_num_entries(path.payloadlen - rbudp_headerlen - sizeof(control_pkt.type));
+	bool first = true; // send an empty ACK to keep connection alive until first packet arrives
 	for(u32 curr = 0; curr < rx_state->total_chunks;) {
 		// Data to send
 		curr = fill_ack_pkt(curr, &control_pkt.payload.ack, max_entries);
-		if(control_pkt.payload.ack.num_acks == 0) break;
+		if(!first && control_pkt.payload.ack.num_acks == 0) break;
+		first = false;
 
 		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &control_pkt,
 				 sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
