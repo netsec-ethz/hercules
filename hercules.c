@@ -1936,13 +1936,16 @@ static void unconfigure_queues() {
 		char cmd[1024];
 		int cmd_len = snprintf(cmd, 1024, "ethtool -N %s delete %d", opt_ifname, ethtool_rules[r]);
 		if(cmd_len > 1023) { // This will never happen as the command to configure is strictly longer than this one
-			printf("could not unconfigure rule %d - command too long, abort\n", r);
+			printf("could not unconfigure rule %d - command too long\n", r);
+			continue;
 		}
 		int ret = system(cmd);
 		if (ret < 0) {
+			num_ethtool_rules = 0;
 			exit_with_error(-ret);
 		}
 		if (ret > 0) {
+			num_ethtool_rules = 0;
 			exit_with_error(ret);
 		}
 	}
