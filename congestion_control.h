@@ -44,6 +44,7 @@ struct ccontrol_state {
 	u32 mi_tx_npkts;
 	u32 mi_tx_npkts_monitored;
 
+	u32 rate_before_rcts;
 	struct rct rcts[RCTS_INTERVALS];
 	int rcts_iter;
 	enum pcc_state state;

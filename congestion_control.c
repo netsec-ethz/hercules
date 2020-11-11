@@ -149,6 +149,7 @@ static void setup_rcts(struct ccontrol_state *cc_state)
 		cc_state->rcts[i] = trial;
 	}
 	cc_state->rcts_iter = 0;
+	cc_state->rate_before_rcts = cc_state->prev_rate;
 }
 
 // Check if RCTs are conclusive
@@ -211,13 +212,13 @@ static u32 pcc_control_decision(struct ccontrol_state *cc_state, float utility)
 			cc_state->sign = -1.f;
 		}
 		cc_state->state = pcc_adjust;
-		return cc_state->prev_rate * (1 + cc_state->sign * trial_eps);
+		return cc_state->rate_before_rcts * (1 + cc_state->sign * trial_eps);
 	} else {
 		// Return to prev_rate, update eps
 		// (Possible optimization: already setup and start new RCTs here for more reactive behavior)
 		cc_state->eps = fmin(cc_state->eps + EPS_MIN, EPS_MAX);
 		cc_state->state = pcc_decision;
-		return cc_state->prev_rate;
+		return cc_state->rate_before_rcts;
 	}
 }
 
@@ -233,7 +234,7 @@ static u32 pcc_control_adjust(struct ccontrol_state *cc_state, float utility)
 	} else {
 		// Update state: Adjust -> Decision
 		cc_state->state =  pcc_decision;
-		cc_state->adjust_iter = 0;
+		cc_state->adjust_iter = 1;
 		return cc_state->prev_rate;
 	}
 }
