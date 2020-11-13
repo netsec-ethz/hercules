@@ -44,6 +44,7 @@ type Flags struct {
 	outputFilename   string
 	verbose          string
 	numPaths         int
+	acceptTimeout    int
 }
 
 const (
@@ -105,6 +106,7 @@ func realMain() error {
 	flag.IntVar(&flags.numPaths, "np", 1, "Maximum number of different paths per destination to use at the same time")
 	flag.StringVar(&configFile, "c", "", "File to parse configuration from, you may overwrite any configuration using command line arguemnts")
 	flag.IntVar(&flags.mtu, "mtu", 0, "Set the frame size to use")
+	flag.IntVar(&flags.acceptTimeout, "timeout", 0, "Abort accepting connections after this timeout (seconds)")
 	flag.BoolVar(&version, "version", false, "Output version and exit")
 	flag.Parse()
 
@@ -271,7 +273,7 @@ func mainRx(config *HerculesReceiverConfig) error {
 	aggregateStats := aggregateStats{}
 	go statsDumper(false, config.DumpInterval, &aggregateStats)
 	go cleanupOnSignal()
-	stats := herculesRx(config.OutputFile, config.getXDPMode(), config.ConfigureQueues)
+	stats := herculesRx(config.OutputFile, config.getXDPMode(), config.ConfigureQueues, config.AcceptTimeout)
 	printSummary(stats, aggregateStats)
 	return nil
 }

@@ -92,10 +92,10 @@ func herculesTx(filename string, destinations []*Destination, pm *PathManager, m
 	))
 }
 
-func herculesRx(filename string, xdpMode int, configureQueues bool) herculesStats {
+func herculesRx(filename string, xdpMode int, configureQueues bool, acceptTimeout int) herculesStats {
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
-	return herculesStatsFromC(C.hercules_rx(cFilename, C.int(xdpMode), C.bool(configureQueues)))
+	return herculesStatsFromC(C.hercules_rx(cFilename, C.int(xdpMode), C.bool(configureQueues), C.int(acceptTimeout)))
 }
 
 func herculesClose() {
