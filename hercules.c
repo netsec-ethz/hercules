@@ -60,7 +60,7 @@
 
 #define RATE_LIMIT_CHECK 1000 // check rate limit every X packets
 						// Maximum burst above target pps allowed
-#define PATH_HANDSHAKE_TIMEOUT_NS 100000000 // send a path handshake every X=100 ms until the first response arrives
+#define PATH_HANDSHAKE_TIMEOUT_NS 100e6 // send a path handshake every X=100 ms until the first response arrives
 
 #define ACK_RATE_TIME_MS 100 // send ACKS after at most X milliseconds
 
@@ -844,7 +844,7 @@ static void tx_recv_control_messages(int sockfd)
 		// tolerate some delay for first ACK
 		last_pkt_rcvd[r] = get_nsecs()
 				+ 2 * tx_state->receiver[r].handshake_rtt // at startup, tolerate two additional RTTs
-				+ 20 * ACK_RATE_TIME_MS * 1000000; // some drivers experience a short outage after activating XDP
+				+ 20 * ACK_RATE_TIME_MS * 1e6; // some drivers experience a short outage after activating XDP
 	}
 
 	while(!tx_acked_all(tx_state)) {
@@ -1153,10 +1153,10 @@ static void rate_limit_tx(void)
 	u64 d_npkts = tx_npkts_queued - prev_tx_npkts_queued;
 
 	dt = umin64(dt, 1);
-	u32 tx_pps = d_npkts * 1000000000. / dt;
+	u32 tx_pps = d_npkts * 1.e9 / dt;
 
 	if(tx_pps > tx_state->rate_limit) {
-		u64 min_dt = (d_npkts * 1000000000. / tx_state->rate_limit);
+		u64 min_dt = (d_npkts * 1.e9 / tx_state->rate_limit);
 
 		// Busy wait implementation
 		while(now < prev_rate_check + min_dt) {
@@ -1954,13 +1954,9 @@ static void unconfigure_queues() {
 			continue;
 		}
 		int ret = system(cmd);
-		if (ret < 0) {
+		if (ret != 0) {
 			num_ethtool_rules = 0;
-			exit_with_error(-ret);
-		}
-		if (ret > 0) {
-			num_ethtool_rules = 0;
-			exit_with_error(ret);
+			exit_with_error(abs(ret));
 		}
 	}
 }
@@ -1997,6 +1993,18 @@ static void rx_send_cts_ack(int sockfd)
 	atomic_fetch_add(&tx_npkts, 1);
 }
 
+static void rx_send_ack_pkt(int sockfd, struct hercules_control_packet *control_pkt, struct hercules_path *path) {
+	char buf[ether_size];
+	void *rbudp_pkt = mempcpy(buf, path->headers[0].header, path->headerlen);
+
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) control_pkt,
+				   sizeof(control_pkt->type) + ack__len(&control_pkt->payload.ack), path->payloadlen);
+	stitch_checksum(path, path->headers[0].checksum, buf);
+
+	send_eth_frame(sockfd, buf, path->framelen);
+	atomic_fetch_add(&tx_npkts, 1);
+}
+
 static void rx_send_acks(int sockfd)
 {
 	struct hercules_path path;
@@ -2006,9 +2014,6 @@ static void rx_send_acks(int sockfd)
 		return;
 	}
 
-	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
-
 	// XXX: could write ack payload directly to buf, but
 	// doesnt work nicely with existing fill_rbudp_pkt helper.
 	struct hercules_control_packet control_pkt = {
@@ -2016,19 +2021,15 @@ static void rx_send_acks(int sockfd)
 	};
 
 	const size_t max_entries = ack__max_num_entries(path.payloadlen - rbudp_headerlen - sizeof(control_pkt.type));
-	bool first = true; // send an empty ACK to keep connection alive until first packet arrives
-	for(u32 curr = 0; curr < rx_state->total_chunks;) {
-		// Data to send
+
+	// send an empty ACK to keep connection alive until first packet arrives
+	u32 curr = fill_ack_pkt(0, &control_pkt.payload.ack, max_entries);
+	rx_send_ack_pkt(sockfd, &control_pkt, &path);
+
+	for(; curr < rx_state->total_chunks;) {
 		curr = fill_ack_pkt(curr, &control_pkt.payload.ack, max_entries);
-		if(!first && control_pkt.payload.ack.num_acks == 0) break;
-		first = false;
-
-		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &control_pkt,
-				 sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
-		stitch_checksum(&path, path.headers[0].checksum, buf);
-
-		send_eth_frame(sockfd, buf, path.framelen);
-		atomic_fetch_add(&tx_npkts, 1);
+		if(control_pkt.payload.ack.num_acks == 0) break;
+		rx_send_ack_pkt(sockfd, &control_pkt, &path);
 	}
 }
 
