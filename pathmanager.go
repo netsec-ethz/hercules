@@ -16,7 +16,6 @@ package main
 
 import (
 	"context"
-	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/pathmgr"
 	"github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/snet"
@@ -25,10 +24,9 @@ import (
 )
 
 type Destination struct {
-	ia        addr.IA
-	hostAddrs []*net.UDPAddr
-	pathSpec  *[]PathSpec
-	numPaths  int
+	hostAddr *snet.UDPAddr
+	pathSpec *[]PathSpec
+	numPaths int
 }
 
 type PathManager struct {
@@ -69,7 +67,7 @@ func initNewPathManager(iface *net.Interface, dsts []*Destination, src *snet.UDP
 
 	for _, dst := range dsts {
 		var dstState *PathsToDestination
-		if src.IA == dst.ia {
+		if src.IA == dst.hostAddr.IA {
 			dstState = initNewPathsToDestinationWithEmptyPath(pm, dst)
 		} else {
 			dstState, err = initNewPathsToDestination(pm, src, dst)

@@ -177,13 +177,9 @@ typedef int xskmap;
 static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
 char opt_ifname[IFNAMSIZ];  // same buffer size as libbpf
 static int opt_ifindex;
-static int num_queues;
-static int *queues;
-static ia local_ia; // local as in "our IA"
-static int num_local_addrs; // local as in "relative to our IA"
-static struct local_addr *local_addrs;
-static int *ethtool_rules = NULL; // rule IDs configured on receiver side
-static int num_ethtool_rules = 0;
+static int queue;
+static struct hercules_app_addr local_addr;
+static int ethtool_rule = -1; // rule ID configured on receiver side
 
 static u32 prog_id;
 
@@ -263,13 +259,13 @@ static void remove_xdp_program(void)
 		printf("program on interface changed, not removing\n");
 }
 
-static void unconfigure_queues();
+static void unconfigure_queue();
 
 static void __exit_with_error(int error, const char *file, const char *func, int line)
 {
 	fprintf(stderr, "%s:%s:%i: errno: %d/\"%s\"\n", file, func, line, error, strerror(error));
 	remove_xdp_program();
-	unconfigure_queues();
+	unconfigure_queue();
 	exit(EXIT_FAILURE);
 }
 
@@ -394,14 +390,7 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 		debug_printf("not UDP: %u, %zu", iph->protocol, offset);
 		return NULL;
 	}
-	int addr_idx = -1;
-	for(int i = 0; i < num_local_addrs; i++) {
-		if(iph->daddr == local_addrs[i].ip) {
-			addr_idx = i;
-			break;
-		}
-	}
-	if(addr_idx == -1) {
+	if(iph->daddr != local_addr.ip) {
 		debug_printf("not addressed to us (IP overlay)");
 		return NULL;
 	}
@@ -443,11 +432,11 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 		return NULL;
 	}
 	const struct scionaddrhdr_ipv4 *scionaddrh = (const struct scionaddrhdr_ipv4 *) (pkt + offset + sizeof(struct scionhdr));
-	if(scionaddrh->dst_ia != local_ia) {
+	if(scionaddrh->dst_ia != local_addr.ia) {
 		debug_printf("not addressed to us (IA)");
 		return NULL;
 	}
-	if(scionaddrh->dst_ip != local_addrs[addr_idx].ip) {
+	if(scionaddrh->dst_ip != local_addr.ip) {
 		debug_printf("not addressed to us (IP in SCION hdr)");
 		return NULL;
 	}
@@ -461,7 +450,7 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 	}
 
 	const struct udphdr *l4udph = (const struct udphdr *) (pkt + offset);
-	if(l4udph->dest != local_addrs[addr_idx].port) {
+	if(l4udph->dest != local_addr.port) {
 		debug_printf("not addressed to us (L4 UDP port): %u", ntohs(l4udph->dest));
 		return NULL;
 	}
@@ -962,13 +951,13 @@ static void tx_send_handshake_ack(int sockfd, u32 rcvr)
 {
 	char buf[ether_size];
 	struct hercules_path *path = &tx_state->receiver[rcvr].paths[0];
-	void *rbudp_pkt = mempcpy(buf, path->headers[0].header, path->headerlen);
+	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
 
 	struct rbudp_ack_pkt ack;
 	ack.num_acks = 0;
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &ack, ack__len(&ack), path->payloadlen);
-	stitch_checksum(path, path->headers[0].checksum, buf);
+	stitch_checksum(path, path->header.checksum, buf);
 
 	send_eth_frame(sockfd, buf, path->framelen);
 	atomic_fetch_add(&tx_npkts, 1);
@@ -1022,7 +1011,7 @@ tx_send_initial(int sockfd, const struct hercules_path *path, size_t filesize, u
 				u32 path_index, bool set_return_path)
 {
 	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path->headers[0].header, path->headerlen);
+	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
 
 	struct hercules_control_packet pld = {
 			.type = CONTROL_PACKET_TYPE_INITIAL,
@@ -1035,7 +1024,7 @@ tx_send_initial(int sockfd, const struct hercules_path *path, size_t filesize, u
 			},
 	};
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &pld, sizeof(pld.type) + sizeof(pld.payload.initial), path->payloadlen);
-	stitch_checksum(path, path->headers[0].checksum, buf);
+	stitch_checksum(path, path->header.checksum, buf);
 
 	send_eth_frame(sockfd, buf, path->framelen);
 	atomic_fetch_add(&tx_npkts, 1);
@@ -1202,20 +1191,6 @@ void push_hercules_tx_paths()
 	}
 }
 
-void allocate_path_headers(struct hercules_path *path, int num_headers) {
-	// this function is only called in non-performance critical paths, hence we have the time to manage memory
-	if (path->num_headers < num_headers) {
-		if (path->headers != NULL) {
-			free(path->headers); // this should not be necessary: the number of header versions per destination should
-			// not change, as the number of IP addresses per destination is fixed at startup
-		}
-		path->headers = calloc(num_headers, sizeof(*path->headers));
-	} else if(num_headers == 0) {
-		debug_printf("no header versions given, abort");
-		exit_with_error(ENODATA);
-	}
-}
-
 static void update_hercules_tx_paths(void)
 {
 	acquire_path_lock();
@@ -1239,10 +1214,7 @@ static void update_hercules_tx_paths(void)
 					receiver->paths[p].enabled = false;
 					continue;
 				}
-				struct hercules_path_header *old_headers = receiver->paths[p].headers;
 				memcpy(&receiver->paths[p], shd_path, sizeof(struct hercules_path));
-				shd_path->headers = old_headers; // this pushes the memory management for struct hercules_path_header to
-				// the Go part which is less performance critical
 
 				atomic_store(&receiver->paths[p].next_handshake_at, UINT64_MAX); // by default do not send a new handshake
 				if(p == receiver->return_path_idx) {
@@ -1336,8 +1308,7 @@ static void submit_batch(struct xsk_socket_info *xsk, u32 *frame_nb, u32 i)
 	pop_completion_ring(xsk);
 }
 
-static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct send_queue_unit *unit, u32 *frame_nb,
-		u32 *random_seed) {
+static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct send_queue_unit *unit, u32 *frame_nb) {
 	u32 num_chunks_in_unit;
 	for(num_chunks_in_unit = 0; num_chunks_in_unit < SEND_QUEUE_ENTRIES_PER_UNIT; num_chunks_in_unit++) {
 		if(unit->paths[num_chunks_in_unit] == UINT8_MAX) {
@@ -1360,10 +1331,9 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 		const u32 chunk_idx = unit->chunk_idx[i];
 		const size_t chunk_start = (size_t) chunk_idx * tx_state->chunklen;
 		const size_t len = umin64(tx_state->chunklen, tx_state->filesize - chunk_start);
-		u32 hdr_idx = rand_r(random_seed) % path->num_headers; // pick random header version
 
 		void *pkt = produce_frame(xsk, *frame_nb + i, idx + i, path->framelen);
-		void *rbudp_pkt = mempcpy(pkt, path->headers[hdr_idx].header, path->headerlen);
+		void *rbudp_pkt = mempcpy(pkt, path->header.header, path->headerlen);
 		u8 track_path = PCC_NO_PATH; // put path_idx iff PCC is enabled
 		sequence_number seqnr = 0;
 		if(receiver->cc_states != NULL) {
@@ -1371,7 +1341,7 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 			seqnr = atomic_fetch_add(&receiver->cc_states[unit->paths[i]].last_seqnr, 1);
 		}
 		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, seqnr, tx_state->mem + chunk_start, len, path->payloadlen);
-		stitch_checksum(path, path->headers[hdr_idx].checksum, pkt);
+		stitch_checksum(path, path->header.checksum, pkt);
 	}
 
 	submit_batch(xsk, frame_nb, num_chunks_in_unit);
@@ -1413,9 +1383,8 @@ static void tx_send_p(void *arg) {
 	struct send_queue_unit unit;
 	send_queue_pop_wait(&send_queue, &unit);
 	u32 frame_nb = 0;
-	u32 random_seed = (u32) (size_t) arg + pthread_self() + (u32) get_nsecs();
 	while(true) {
-		tx_handle_send_queue_unit(xsk, &unit, &frame_nb, &random_seed);
+		tx_handle_send_queue_unit(xsk, &unit, &frame_nb);
 		if(!send_queue_pop(&send_queue, &unit)) { // queue currently empty
 			while(!send_queue_pop(&send_queue, &unit)) {
 				if(!atomic_load(&running)) {
@@ -1804,7 +1773,7 @@ static bool rbudp_parse_initial(const char *pkt, size_t len, struct rbudp_initia
 	return true;
 }
 
-static bool rx_get_reply_path(struct hercules_path *path, struct hercules_path_header *path_header)
+static bool rx_get_reply_path(struct hercules_path *path)
 {
 	// Get reply path for sending ACKs:
 	//
@@ -1820,10 +1789,6 @@ static bool rx_get_reply_path(struct hercules_path *path, struct hercules_path_h
 	char rx_sample_buf[XSK_UMEM__DEFAULT_FRAME_SIZE];
 	memcpy(rx_sample_buf, rx_state->rx_sample_buf, rx_sample_len);
 
-	// prepare hercules_path
-	path->headers = path_header;
-	path->num_headers = 1;
-
 	int ret = HerculesGetReplyPath(rx_sample_buf, rx_sample_len, path);
 	if(ret) {
 		return false;
@@ -1834,13 +1799,12 @@ static bool rx_get_reply_path(struct hercules_path *path, struct hercules_path_h
 static void rx_send_rtt_ack(int sockfd, struct rbudp_initial_pkt *pld)
 {
 	struct hercules_path path;
-	struct hercules_path_header path_header;
-	if(!rx_get_reply_path(&path, &path_header)) {
+	if(!rx_get_reply_path(&path)) {
 		return;
 	}
 
 	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
+	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
 
 	struct hercules_control_packet control_pkt = {
 			.type = CONTROL_PACKET_TYPE_INITIAL,
@@ -1849,7 +1813,7 @@ static void rx_send_rtt_ack(int sockfd, struct rbudp_initial_pkt *pld)
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &control_pkt,
 				   sizeof(control_pkt.type) + sizeof(control_pkt.payload.initial), path.payloadlen);
-	stitch_checksum(&path, path.headers[0].checksum, buf);
+	stitch_checksum(&path, path.header.checksum, buf);
 
 	send_eth_frame(sockfd, buf, path.framelen);
 	atomic_fetch_add(&tx_npkts, 1);
@@ -1906,59 +1870,54 @@ static void rx_get_rtt_estimate(void *arg)
 	}
 }
 
-static void configure_queues()
+static void configure_queue()
 {
-	ethtool_rules = calloc(num_local_addrs, sizeof(int));
-	for(int l = 0; l < num_local_addrs; l++) {
-		debug_printf("map UDP4 flow to %d.%d.%d.%d to queue %d",
-					 (u8) (local_addrs[l].ip),
-					 (u8) (local_addrs[l].ip >> 8u),
-					 (u8) (local_addrs[l].ip >> 16u),
-					 (u8) (local_addrs[l].ip >> 24u),
-					 queues[l % num_queues]
-		);
+	debug_printf("map UDP4 flow to %d.%d.%d.%d to queue %d",
+				 (u8) (local_addr.ip),
+				 (u8) (local_addr.ip >> 8u),
+				 (u8) (local_addr.ip >> 16u),
+				 (u8) (local_addr.ip >> 24u),
+				 queue
+	);
 
-		char cmd[1024];
-		int cmd_len = snprintf(cmd, 1024, "ethtool -N %s flow-type udp4 dst-ip %d.%d.%d.%d action %d",
-							   opt_ifname,
-							   (u8) (local_addrs[l].ip),
-							   (u8) (local_addrs[l].ip >> 8u),
-							   (u8) (local_addrs[l].ip >> 16u),
-							   (u8) (local_addrs[l].ip >> 24u),
-							   queues[l % num_queues]
-		);
-		if(cmd_len > 1023) {
-			printf("could not configure queue %d - command too long, abort\n", queues[l % num_queues]);
-		}
-
-		FILE *proc = popen(cmd, "r");
-		int rule_id;
-		int num_parsed = fscanf(proc, "Added rule with ID %d", &rule_id);
-		int ret = pclose(proc);
-		if(ret != 0) {
-			printf("could not configure queue %d, abort\n", queues[l % num_queues]);
-			exit_with_error(ret);
-		}
-		if(num_parsed != 1) {
-			printf("could not configure queue %d, abort\n", queues[l % num_queues]);
-			exit_with_error(EXIT_FAILURE);
-		}
-		ethtool_rules[num_ethtool_rules] = rule_id;
-		num_ethtool_rules++;
+	char cmd[1024];
+	int cmd_len = snprintf(cmd, 1024, "ethtool -N %s flow-type udp4 dst-ip %d.%d.%d.%d action %d",
+						   opt_ifname,
+						   (u8) (local_addr.ip),
+						   (u8) (local_addr.ip >> 8u),
+						   (u8) (local_addr.ip >> 16u),
+						   (u8) (local_addr.ip >> 24u),
+						   queue
+	);
+	if(cmd_len > 1023) {
+		printf("could not configure queue %d - command too long, abort\n", queue);
 	}
+
+	FILE *proc = popen(cmd, "r");
+	int rule_id;
+	int num_parsed = fscanf(proc, "Added rule with ID %d", &rule_id);
+	int ret = pclose(proc);
+	if(ret != 0) {
+		printf("could not configure queue %d, abort\n", queue);
+		exit_with_error(ret);
+	}
+	if(num_parsed != 1) {
+		printf("could not configure queue %d, abort\n", queue);
+		exit_with_error(EXIT_FAILURE);
+	}
+	ethtool_rule = rule_id;
 }
 
-static void unconfigure_queues() {
-	for(int r = 0; r < num_ethtool_rules; r++) {
+static void unconfigure_queue() {
+	if (ethtool_rule >= 0) {
 		char cmd[1024];
-		int cmd_len = snprintf(cmd, 1024, "ethtool -N %s delete %d", opt_ifname, ethtool_rules[r]);
+		int cmd_len = snprintf(cmd, 1024, "ethtool -N %s delete %d", opt_ifname, ethtool_rule);
+		ethtool_rule = -1;
 		if(cmd_len > 1023) { // This will never happen as the command to configure is strictly longer than this one
-			printf("could not unconfigure rule %d - command too long\n", r);
-			continue;
+			printf("could not unconfigure ethtool rule - command too long\n");
 		}
 		int ret = system(cmd);
-		if (ret != 0) {
-			num_ethtool_rules = 0;
+		if(ret != 0) {
 			exit_with_error(abs(ret));
 		}
 	}
@@ -1968,20 +1927,19 @@ static void rx_rtt_and_configure(void *arg)
 {
 	rx_get_rtt_estimate(arg);
 	// as soon as we got the RTT estimate, we are ready to set up the queues
-	configure_queues();
+	configure_queue();
 }
 
 static void rx_send_cts_ack(int sockfd)
 {
 	struct hercules_path path;
-	struct hercules_path_header path_header;
-	if(!rx_get_reply_path(&path, &path_header)) {
+	if(!rx_get_reply_path(&path)) {
 		debug_printf("no reply path");
 		return;
 	}
 
 	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
+	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
 
 	struct hercules_control_packet control_pkt = {
 			.type = CONTROL_PACKET_TYPE_ACK,
@@ -1990,7 +1948,7 @@ static void rx_send_cts_ack(int sockfd)
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &control_pkt,
 				sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
-	stitch_checksum(&path, path.headers[0].checksum, buf);
+	stitch_checksum(&path, path.header.checksum, buf);
 
 	send_eth_frame(sockfd, buf, path.framelen);
 	atomic_fetch_add(&tx_npkts, 1);
@@ -1998,11 +1956,11 @@ static void rx_send_cts_ack(int sockfd)
 
 static void rx_send_ack_pkt(int sockfd, struct hercules_control_packet *control_pkt, struct hercules_path *path) {
 	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path->headers[0].header, path->headerlen);
+	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) control_pkt,
 				   sizeof(control_pkt->type) + ack__len(&control_pkt->payload.ack), path->payloadlen);
-	stitch_checksum(path, path->headers[0].checksum, buf);
+	stitch_checksum(path, path->header.checksum, buf);
 
 	send_eth_frame(sockfd, buf, path->framelen);
 	atomic_fetch_add(&tx_npkts, 1);
@@ -2011,8 +1969,7 @@ static void rx_send_ack_pkt(int sockfd, struct hercules_control_packet *control_
 static void rx_send_acks(int sockfd)
 {
 	struct hercules_path path;
-	struct hercules_path_header path_header;
-	if(!rx_get_reply_path(&path, &path_header)) {
+	if(!rx_get_reply_path(&path)) {
 		debug_printf("no reply path");
 		return;
 	}
@@ -2053,14 +2010,13 @@ static void rx_trickle_acks(int sockfd)
 static void rx_send_path_nacks(int sockfd, struct receiver_state_per_path *path_state, u8 path_idx)
 {
 	struct hercules_path path;
-	struct hercules_path_header path_header;
-	if(!rx_get_reply_path(&path, &path_header)) {
+	if(!rx_get_reply_path(&path)) {
 		debug_printf("no reply path");
 		return;
 	}
 
 	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
+	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
 
 	// XXX: could write ack payload directly to buf, but
 	// doesnt work nicely with existing fill_rbudp_pkt helper.
@@ -2077,7 +2033,7 @@ static void rx_send_path_nacks(int sockfd, struct receiver_state_per_path *path_
 		nack_end = control_pkt.payload.ack.acks[control_pkt.payload.ack.num_acks - 1].end;
 		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, path_idx, 0, (char *) &control_pkt,
 					   sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
-		stitch_checksum(&path, path.headers[0].checksum, buf);
+		stitch_checksum(&path, path.header.checksum, buf);
 
 		send_eth_frame(sockfd, buf, path.framelen);
 		atomic_fetch_add(&tx_npkts, 1);
@@ -2205,7 +2161,7 @@ static void xsk_map__add_xsk(xskmap map, int index, struct xsk_socket_info *xsk)
 /*
  * Load a BPF program redirecting IP traffic to the XSK.
  */
-static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[])
+static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[], int num_sockets)
 {
 	struct bpf_object *obj;
 	int prog_fd = load_bpf(bpf_prgm_redirect_userspace, bpf_prgm_redirect_userspace_size, &obj);
@@ -2216,34 +2172,20 @@ static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[])
 	// push XSKs
 	int xsks_map_fd = bpf_object__find_map_fd_by_name(obj, "xsks_map");
 	if(xsks_map_fd < 0) {
-		debug_printf("Note that the BPF program assumes a maximum number of 256 queues on the NIC.");
 		exit_with_error(-xsks_map_fd);
 	}
-	for(int q = 0; q < num_queues; q++) {
-		xsk_map__add_xsk(xsks_map_fd, queues[q], xsks[q]);
+	for(int i = 0; i < num_sockets; i++) {
+		xsk_map__add_xsk(xsks_map_fd, i, xsks[i]);
 	}
 
-	// push local addresses
-	int ips_fd = bpf_object__find_map_fd_by_name(obj, "local_addrs");
-	if(ips_fd < 0) {
-		exit_with_error(-ips_fd);
+	// push local address
+	int local_addr_fd = bpf_object__find_map_fd_by_name(obj, "local_addr");
+	if(local_addr_fd < 0) {
+		exit_with_error(-local_addr_fd);
 	}
-	int ports_fd = bpf_object__find_map_fd_by_name(obj, "local_ports");
-	if(ports_fd < 0) {
-		exit_with_error(-ips_fd);
-	}
-	for(int a = 0; a < num_local_addrs; a++) {
-		bpf_map_update_elem(ips_fd, &local_addrs[a].ip, &a, 0);
-		bpf_map_update_elem(ports_fd, &a, &local_addrs[a].port, 0);
-	}
+	int zero = 0;
+	bpf_map_update_elem(local_addr_fd, &zero, &local_addr, 0);
 
-	// push local_ia
-	int ia_fd = bpf_object__find_map_fd_by_name(obj, "local_ia");
-	if(ia_fd < 0) {
-		exit_with_error(-ia_fd);
-	}
-	u32 key = 0;
-	bpf_map_update_elem(ia_fd, &key, &local_ia, 0);
 	set_bpf_prgm_active(prog_fd);
 }
 
@@ -2255,8 +2197,7 @@ static void *tx_p(__attribute__ ((unused)) void *arg)
 	return NULL;
 }
 
-void hercules_init(int ifindex, const ia local_ia_, const struct local_addr *local_addrs_, int num_local_addrs_,
-				   int queues_[], int num_queues_, int mtu)
+void hercules_init(int ifindex, const struct hercules_app_addr local_addr_, int queue_, int mtu)
 {
 	if(HERCULES_MAX_HEADERLEN + sizeof(struct rbudp_initial_pkt) + rbudp_headerlen > (size_t)mtu) {
 		printf("MTU too small (min: %lu, given: %d)",
@@ -2265,29 +2206,16 @@ void hercules_init(int ifindex, const ia local_ia_, const struct local_addr *loc
 		);
 		exit_with_error(EINVAL);
 	}
-	if(MAX_NUM_LOCAL_ADDRS <num_local_addrs_) {
-		printf("Too many local addresses: %d provided, only up to %d supported", num_local_addrs_, MAX_NUM_LOCAL_ADDRS);
-		exit_with_error(EINVAL);
-	}
 
 	ether_size = mtu;
-	num_queues = num_queues_;
-	queues = calloc(num_queues, sizeof(*queues));
-	memcpy(queues, queues_, sizeof(*queues) * num_queues);
+	queue = queue_;
 	opt_ifindex = ifindex;
 
 	if_indextoname(ifindex, opt_ifname);
 	opt_ifname[IFNAMSIZ - 1] = '\0';
 
-	local_ia = local_ia_;
-	num_local_addrs = num_local_addrs_;
-	local_addrs = calloc(num_local_addrs_, sizeof(*local_addrs));
-	memcpy(local_addrs, local_addrs_, sizeof(*local_addrs) * num_local_addrs);
-
-	debug_printf("ifindex: %i", opt_ifindex);
-	for(int q = 0; q < num_queues; q++) {
-		debug_printf("enabling queue %d", queues[q]);
-	}
+	local_addr = local_addr_;
+	debug_printf("ifindex: %i, queue %i", opt_ifindex, queue);
 
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
 	setlocale(LC_ALL, "");
@@ -2380,7 +2308,8 @@ static void join_thread(pthread_t pt)
 
 struct hercules_stats
 hercules_tx(const char *filename, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest,
-			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode)
+			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode,
+			int num_threads)
 {
 	// Open mmaped send file
 	int f = open(filename, O_RDONLY);
@@ -2453,12 +2382,13 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 
 	init_send_queue(&send_queue, BATCH_SIZE);
 
-	pthread_t senders[num_queues];
-	struct xsk_socket_info *xsks[num_queues];
-	for(int q = 0; q < num_queues; q++) {
-		xsks[q] = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queues[q], xdp_mode);
-		senders[q] = start_thread(tx_send_p, xsks[q]);
-		submit_initial_rx_frames(xsks[q]->umem);
+	num_threads = 1; // XXX temporarily limit number of sockets to reduce commit complexity
+	pthread_t senders[num_threads];
+	struct xsk_socket_info *xsks[num_threads];
+	for(int t = 0; t < num_threads; t++) {
+		xsks[t] = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queue, xdp_mode);
+		senders[t] = start_thread(tx_send_p, xsks[t]);
+		submit_initial_rx_frames(xsks[t]->umem);
 	}
 
 	tx_state->start_time = get_nsecs();
@@ -2471,9 +2401,9 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	running = false;
 	join_thread(worker);
 
-	for(int q = 0; q < num_queues; q++) {
-		join_thread(senders[q]);
-		close_xsk(xsks[q]);
+	for(int t = 0; t < num_threads; t++) {
+		join_thread(senders[t]);
+		close_xsk(xsks[t]);
 	}
 	destroy_send_queue(&send_queue);
 
@@ -2490,7 +2420,8 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	return stats;
 }
 
-struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues, int accept_timeout)
+struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues, int accept_timeout,
+								  int num_threads)
 {
 	// Open RAW socket to receive and send control messages on
 	// Note: this socket will not receive any packets once the XSK has been
@@ -2517,21 +2448,22 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 	join_thread(rtt_estimator);
 	debug_printf("cts_rtt: %fs", rx_state->handshake_rtt / 1e6);
 
-	struct xsk_socket_info *xsks[num_queues];
-	for(int q = 0; q < num_queues; q++) {
-		struct xsk_socket_info *xsk = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queues[q], xdp_mode);
-		xsks[q] = xsk;
+	num_threads = 1; // XXX temporarily limit number of sockets to reduce commit complexity
+	struct xsk_socket_info *xsks[num_threads];
+	for(int t = 0; t < num_threads; t++) {
+		struct xsk_socket_info *xsk = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queue, xdp_mode);
+		xsks[t] = xsk;
 		submit_initial_rx_frames(xsk->umem);
 	}
 
-	load_xsk_redirect_userspace(xsks);
+	load_xsk_redirect_userspace(xsks, num_threads);
 
 	rx_state->start_time = get_nsecs();
 	running = true;
 
-	pthread_t worker[num_queues];
-	for(int q = 0; q < num_queues; q++) {
-		worker[q] = start_thread(rx_p, xsks[q]);
+	pthread_t worker[num_threads];
+	for(int t = 0; t < num_threads; t++) {
+		worker[t] = start_thread(rx_p, xsks[t]);
 	}
 
 	rx_send_cts_ack(sockfd); // send Clear To Send ACK
@@ -2543,15 +2475,15 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 	running = false;
 
 	join_thread(trickle_pcc);
-	for(int q = 0; q < num_queues; q++) {
+	for(int q = 0; q < num_threads; q++) {
 		join_thread(worker[q]);
 	}
 
 	struct hercules_stats stats = rx_stats(rx_state);
 
-	unconfigure_queues();
-	for(int q = 0; q < num_queues; q++) {
-		close_xsk(xsks[q]);
+	unconfigure_queue();
+	for(int t = 0; t < num_threads; t++) {
+		close_xsk(xsks[t]);
 	}
 	bitset__destroy(&rx_state->received_chunks);
 	free(rx_state);
@@ -2563,5 +2495,5 @@ void hercules_close()
 {
 	// Only essential cleanup.
 	remove_xdp_program();
-	unconfigure_queues();
+	unconfigure_queue();
 }
