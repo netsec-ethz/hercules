@@ -20,12 +20,22 @@ struct bpf_map_def SEC("maps") xsks_map = {
 		.max_entries = MAX_NUM_SOCKETS,
 };
 
+struct bpf_map_def SEC("maps") num_xsks = {
+		.type        = BPF_MAP_TYPE_ARRAY,
+		.key_size    = sizeof(__u32),
+		.value_size  = sizeof(__u32),
+		.max_entries = 2,
+};
+
 struct bpf_map_def SEC("maps") local_addr = {
-		.type        = BPF_MAP_TYPE_HASH,
+		.type        = BPF_MAP_TYPE_ARRAY,
 		.key_size    = sizeof(__u32),
 		.value_size  = sizeof(struct hercules_app_addr),
 		.max_entries = 1,
 };
+
+static int redirect_count = 0;
+static __u32 zero = 0;
 
 SEC("xdp")
 int xdp_prog_redirect_userspace(struct xdp_md *ctx)
@@ -51,7 +61,6 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	}
 
 	// get listening address
-	__u32 zero = 0;
 	struct hercules_app_addr *addr = bpf_map_lookup_elem(&local_addr, &zero);
 	if(addr == NULL) {
 		return XDP_PASS; // not listening
@@ -100,7 +109,14 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 
 	// write the payload offset to the first word, so that the user space program can continue from there.
 	*(__u32 *) data = offset;
-	return bpf_redirect_map(&xsks_map, 0, 0); // XXX distribute across multiple sockets, once available
+
+	__u32 *_num_xsks = bpf_map_lookup_elem(&num_xsks, &zero);
+	if(_num_xsks == NULL) {
+		return XDP_PASS;
+	}
+	__sync_fetch_and_add(&redirect_count, 1);
+
+	return bpf_redirect_map(&xsks_map, (redirect_count) % (*_num_xsks), 0); // XXX distribute across multiple sockets, once available
 }
 
 char _license[] SEC("license") = "GPL";

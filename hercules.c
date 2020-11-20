@@ -42,6 +42,7 @@
 #include "bpf/src/xsk.h"
 #include "linux/filter.h" // actually linux/tools/include/linux/filter.h
 
+#include "frame_queue.h"
 #include "bitset.h"
 #include "libscion_checksum.h"
 #include "congestion_control.h"
@@ -76,6 +77,8 @@ extern int HerculesGetReplyPath(const char *packetPtr, int length, struct hercul
 struct xsk_umem_info {
 	struct xsk_ring_prod fq;
 	struct xsk_ring_cons cq;
+	struct frame_queue available_frames;
+	pthread_spinlock_t lock;
 	struct xsk_umem *umem;
 	void *buffer;
 };
@@ -85,7 +88,6 @@ struct xsk_socket_info {
 	struct xsk_ring_prod tx;
 	struct xsk_umem_info *umem;
 	struct xsk_socket *xsk;
-	u32 outstanding_tx;
 };
 
 struct receiver_state_per_path {
@@ -153,6 +155,7 @@ struct sender_state {
 	/** Memory mapped file for receive */
 	char *mem;
 	int control_socket_fd;
+	struct xsk_umem_info *umem;
 
 	_Atomic u32 rate_limit;
 
@@ -273,12 +276,9 @@ static void __exit_with_error(int error, const char *file, const char *func, int
 
 static void close_xsk(struct xsk_socket_info *xsk)
 {
-	struct xsk_umem *umem = xsk->umem->umem;  // umem per socket
 	// Removes socket and frees xsk
 	xsk_socket__delete(xsk->xsk);
 	free(xsk);
-	xsk_umem__delete(umem);
-	remove_xdp_program();
 }
 
 // XXX: from lib/scion/udp.c
@@ -572,7 +572,25 @@ static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
 		exit_with_error(-ret);
 
 	umem->buffer = buffer;
+	// The number of slots in the umem->available_frames queue needs to be larger than the number of frames in the loop,
+	// pushed in submit_initial_tx_frames() (assumption in pop_completion_ring())
+	ret = frame_queue__init(&umem->available_frames, XSK_RING_PROD__DEFAULT_NUM_DESCS);
+	if(ret)
+		exit_with_error(ret);
+	pthread_spin_init(&umem->lock, 0);
 	return umem;
+}
+
+static void kick_tx(struct xsk_socket_info *xsk)
+{
+	int ret;
+	do {
+		ret = sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+	} while(ret < 0 && errno == EAGAIN);
+
+	if(ret < 0 && errno != ENOBUFS && errno != EBUSY) {
+		exit_with_error(errno);
+	}
 }
 
 static void submit_initial_rx_frames(struct xsk_umem_info *umem)
@@ -585,8 +603,24 @@ static void submit_initial_rx_frames(struct xsk_umem_info *umem)
 	if(ret != initial_kernel_rx_frame_count)
 		exit_with_error(-ret);
 	for(int i = 0; i < initial_kernel_rx_frame_count; i++)
-		*xsk_ring_prod__fill_addr(&umem->fq, idx++) = i * XSK_UMEM__DEFAULT_FRAME_SIZE;
+		*xsk_ring_prod__fill_addr(&umem->fq, idx++) = (XSK_RING_PROD__DEFAULT_NUM_DESCS + i) * XSK_UMEM__DEFAULT_FRAME_SIZE;
 	xsk_ring_prod__submit(&umem->fq, initial_kernel_rx_frame_count);
+}
+
+static void submit_initial_tx_frames(struct xsk_umem_info *umem)
+{
+	// This number needs to be smaller than the number of slots in the umem->available_frames queue (initialized in
+	// xsk_configure_umem(); assumption in pop_completion_ring())
+	int initial_tx_frames = XSK_RING_PROD__DEFAULT_NUM_DESCS - BATCH_SIZE;
+	int avail = frame_queue__prod_reserve(&umem->available_frames, initial_tx_frames);
+	if(initial_tx_frames > avail) {
+		debug_printf("trying to push %d initial frames, but only %d slots available", initial_tx_frames, avail);
+		exit_with_error(EINVAL);
+	}
+	for(int i = 0; i < avail; i++) {
+		frame_queue__prod_fill(&umem->available_frames, i, i * XSK_UMEM__DEFAULT_FRAME_SIZE);
+	}
+	frame_queue__push(&umem->available_frames, avail);
 }
 
 static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem, int libbpf_flags, int queue, int bind_flags)
@@ -605,7 +639,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem, 
 	cfg.libbpf_flags = libbpf_flags;
 	cfg.xdp_flags = opt_xdp_flags;
 	cfg.bind_flags = bind_flags;
-	ret = xsk_socket__create(&xsk->xsk, opt_ifname, queue, umem->umem, &xsk->rx, &xsk->tx, &cfg);
+	ret = xsk_socket__create_shared(&xsk->xsk, opt_ifname, queue, umem->umem, &xsk->rx, &xsk->tx, &umem->fq, &umem->cq, &cfg);
 	if(ret)
 		exit_with_error(-ret);
 
@@ -629,37 +663,28 @@ static struct xsk_umem_info *create_umem()
 	return umem;
 }
 
-static struct xsk_socket_info *create_xsk_with_umem(int libbpf_flags, int queue, int bind_flags)
-{
-	struct xsk_umem_info *umem = create_umem();
-	return xsk_configure_socket(umem, libbpf_flags, queue, bind_flags);
+static void destroy_umem(struct xsk_umem_info *umem) {
+	xsk_umem__delete(umem->umem);
+	free(umem->buffer);
+	free(umem);
 }
 
-static void kick_tx(struct xsk_socket_info *xsk)
+// Pop entries from completion ring and store them in umem->available_frames.
+static void pop_completion_ring(struct xsk_umem_info *umem)
 {
-	int ret;
-	do {
-		ret = sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-	} while(ret < 0 && errno == EAGAIN);
-
-	if(ret < 0 && errno != ENOBUFS && errno != EBUSY) {
-		exit_with_error(errno);
-	}
-}
-
-// Pop entries from completion ring.
-// XXX: Here we SHOULD be updating the bookeeping for which frames are safe to be used for sending.
-//      But we currently don't so the only thing this does is freeng up the completion ring.
-static void pop_completion_ring(struct xsk_socket_info *xsk)
-{
-	if(!xsk->outstanding_tx)
-		return;
-
 	u32 idx;
-	size_t entries = xsk_ring_cons__peek(&xsk->umem->cq, SIZE_MAX, &idx);
-	if(likely(entries > 0)) {
-		xsk_ring_cons__release(&xsk->umem->cq, entries);
-		xsk->outstanding_tx -= entries;
+	size_t entries = xsk_ring_cons__peek(&umem->cq, SIZE_MAX, &idx);
+	if(entries > 0) {
+		u16 num = frame_queue__prod_reserve(&umem->available_frames, entries);
+		if(num < entries) { // there are less frames in the loop than the number of slots in frame_queue
+			debug_printf("trying to push %ld frames, only got %d slots in frame_queue", entries, num);
+			exit_with_error(EINVAL);
+		}
+		for(u16 i = 0; i < num; i++) {
+			frame_queue__prod_fill(&umem->available_frames, i, *xsk_ring_cons__comp_addr(&umem->cq, idx + i));
+		}
+		frame_queue__push(&umem->available_frames, num);
+		xsk_ring_cons__release(&umem->cq, entries);
 		atomic_fetch_add(&tx_npkts, entries);
 	}
 }
@@ -1082,12 +1107,30 @@ static void stitch_checksum(const struct hercules_path *path, u16 precomputed_ch
 static void
 rx_handle_initial(int sockfd, struct rbudp_initial_pkt *initial, const char *buf, const char *payload, int payloadlen);
 
+static void submit_rx_frames(struct xsk_umem_info *umem, const u64 *addrs, size_t num_frames) {
+	u32 idx_fq;
+	pthread_spin_lock(&umem->lock);
+	size_t reserved = xsk_ring_prod__reserve(&umem->fq, num_frames, &idx_fq);
+	while(reserved != num_frames) {
+		reserved = xsk_ring_prod__reserve(&umem->fq, num_frames, &idx_fq);
+		if(!running) {
+			pthread_spin_unlock(&umem->lock);
+			return;
+		}
+	}
+
+	for(size_t i = 0; i < num_frames; i++) {
+		*xsk_ring_prod__fill_addr(&umem->fq, idx_fq++) = addrs[i];
+	}
+	xsk_ring_prod__submit(&umem->fq, num_frames);
+	pthread_spin_unlock(&umem->lock);
+}
+
 static void rx_receive_batch(struct xsk_socket_info *xsk)
 {
-	u32 idx_rx = 0, idx_fq = 0;
+	u32 idx_rx = 0;
 	int ignored = 0;
 
-	// XXX: restricting to receiving BATCH_SIZE here seems unnecessary. Change to SIZE_MAX?
 	size_t rcvd = xsk_ring_cons__peek(&xsk->rx, BATCH_SIZE, &idx_rx);
 	if(!rcvd)
 		return;
@@ -1099,15 +1142,10 @@ static void rx_receive_batch(struct xsk_socket_info *xsk)
 		atomic_compare_exchange_strong(&rx_state->last_pkt_rcvd, &old_last_pkt_rcvd, now);
 	}
 
-	size_t reserved = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
-	while(reserved != rcvd) {
-		reserved = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
-		if(!running)
-			return;
-	}
-
+	u64 frame_addrs[BATCH_SIZE];
 	for(size_t i = 0; i < rcvd; i++) {
 		u64 addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->addr;
+		frame_addrs[i] = addr;
 		u32 len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->len;
 		const char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 		const char *rbudp_pkt = parse_pkt_fast_path(pkt, len, true, UINT32_MAX);
@@ -1124,11 +1162,10 @@ static void rx_receive_batch(struct xsk_socket_info *xsk)
 		} else {
 			ignored++;
 		}
-		*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) = addr;
 	}
-	xsk_ring_prod__submit(&xsk->umem->fq, rcvd);
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 	atomic_fetch_add(&rx_npkts, (rcvd - ignored));
+	submit_rx_frames(xsk->umem, frame_addrs, rcvd);
 }
 
 static void rate_limit_tx(void)
@@ -1275,40 +1312,39 @@ void send_path_handshakes()
 }
 
 
-/*!
- * @function	produce_frame
- * @abstract	Fill an entry in the sender transmission ring with frame frame_nb and
- *		return the corresponding umem buffer address.
- * @param	xsk		the socket
- * @param	frame_nb	the frame number of the frame being put in the tx ring
- * @param	prod_tx_idx	index in the tx ring where the frame is being inserted
- * @param	framelen	size of the frame, smaller than XSK_UMEM__DEFAULT_FRAME_SIZE
- * @result	A pointer to the umem buffer corresponding to the frame
-*/
-static char *produce_frame(struct xsk_socket_info *xsk, u32 frame_nb, u32 prod_tx_idx, size_t framelen)
+static void claim_tx_frames(struct xsk_umem_info *umem, u64 *addrs, size_t num_frames) {
+	pthread_spin_lock(&umem->lock);
+	size_t reserved = frame_queue__cons_reserve(&umem->available_frames, num_frames);
+	while(reserved != num_frames) {
+		reserved = frame_queue__cons_reserve(&umem->available_frames, num_frames);
+		if(!running) {
+			pthread_spin_unlock(&umem->lock);
+			return;
+		}
+	}
+
+	for(size_t i = 0; i < num_frames; i++) {
+		addrs[i] = frame_queue__cons_fetch(&umem->available_frames, i);
+	}
+	frame_queue__pop(&umem->available_frames, num_frames);
+	pthread_spin_unlock(&umem->lock);
+}
+
+static char *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_idx, size_t framelen)
 {
-	const u64 addr = frame_nb << XSK_UMEM__DEFAULT_FRAME_SHIFT;
 	xsk_ring_prod__tx_desc(&xsk->tx, prod_tx_idx)->addr = addr;
 	xsk_ring_prod__tx_desc(&xsk->tx, prod_tx_idx)->len = framelen;
 	char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 	return pkt;
 }
 
-static void submit_batch(struct xsk_socket_info *xsk, u32 *frame_nb, u32 i)
+static void submit_batch(struct xsk_socket_info *xsk, u32 i)
 {
 	xsk_ring_prod__submit(&xsk->tx, i);
-
-	xsk->outstanding_tx += i;
-	*frame_nb += i;
-	if(*frame_nb + SEND_QUEUE_ENTRIES_PER_UNIT > NUM_FRAMES) { // Wrap around if next batch would overflow
-		*frame_nb = 0;
-	}
-
 	kick_tx(xsk);
-	pop_completion_ring(xsk);
 }
 
-static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct send_queue_unit *unit, u32 *frame_nb) {
+static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct send_queue_unit *unit) {
 	u32 num_chunks_in_unit;
 	for(num_chunks_in_unit = 0; num_chunks_in_unit < SEND_QUEUE_ENTRIES_PER_UNIT; num_chunks_in_unit++) {
 		if(unit->paths[num_chunks_in_unit] == UINT8_MAX) {
@@ -1316,13 +1352,12 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 		}
 	}
 
+	u64 frame_addrs[SEND_QUEUE_ENTRIES_PER_UNIT];
+	claim_tx_frames(xsk->umem, frame_addrs, num_chunks_in_unit);
+
 	u32 idx;
 	while(xsk_ring_prod__reserve(&xsk->tx, num_chunks_in_unit, &idx) != num_chunks_in_unit) {
 		kick_tx(xsk); // XXX: investigate how sender can still starve without this, it seems it should NOT be necessary
-		// While we're waiting, consume completion ring to avoid that the kernel
-		// could starve on completion ring slots. (ring is smaller than number of
-		// frames)
-		pop_completion_ring(xsk);
 	}
 
 	for(u32 i = 0; i < num_chunks_in_unit; i++) {
@@ -1332,7 +1367,7 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 		const size_t chunk_start = (size_t) chunk_idx * tx_state->chunklen;
 		const size_t len = umin64(tx_state->chunklen, tx_state->filesize - chunk_start);
 
-		void *pkt = produce_frame(xsk, *frame_nb + i, idx + i, path->framelen);
+		void *pkt = prepare_frame(xsk, frame_addrs[i], idx + i, path->framelen);
 		void *rbudp_pkt = mempcpy(pkt, path->header.header, path->headerlen);
 		u8 track_path = PCC_NO_PATH; // put path_idx iff PCC is enabled
 		sequence_number seqnr = 0;
@@ -1344,7 +1379,7 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 		stitch_checksum(path, path->header.checksum, pkt);
 	}
 
-	submit_batch(xsk, frame_nb, num_chunks_in_unit);
+	submit_batch(xsk, num_chunks_in_unit);
 }
 
 static void produce_batch(const u8 *path_by_rcvr, const u32 *chunks, const u8 *rcvr_by_chunk, u32 num_chunks)
@@ -1382,16 +1417,13 @@ static void tx_send_p(void *arg) {
 
 	struct send_queue_unit unit;
 	send_queue_pop_wait(&send_queue, &unit);
-	u32 frame_nb = 0;
 	while(true) {
-		tx_handle_send_queue_unit(xsk, &unit, &frame_nb);
+		tx_handle_send_queue_unit(xsk, &unit);
 		if(!send_queue_pop(&send_queue, &unit)) { // queue currently empty
 			while(!send_queue_pop(&send_queue, &unit)) {
 				if(!atomic_load(&running)) {
 					return;
 				}
-				// whenever we're waiting, claim frames back
-				pop_completion_ring(xsk);
 			}
 		}
 	}
@@ -1580,6 +1612,7 @@ static void tx_only()
 	u32 max_chunks_per_rcvr[tx_state->num_receivers];
 
 	while(finished_count < tx_state->num_receivers) {
+		pop_completion_ring(tx_state->umem);
 		send_path_handshakes();
 		u64 next_ack_due = 0;
 		u32 num_chunks_per_rcvr[tx_state->num_receivers];
@@ -2178,12 +2211,19 @@ static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[], int num_
 		xsk_map__add_xsk(xsks_map_fd, i, xsks[i]);
 	}
 
+	// push XSKs meta
+	int zero = 0;
+	int num_xsks_fd = bpf_object__find_map_fd_by_name(obj, "num_xsks");
+	if(num_xsks_fd < 0) {
+		exit_with_error(-num_xsks_fd);
+	}
+	bpf_map_update_elem(num_xsks_fd, &zero, &num_sockets, 0);
+
 	// push local address
 	int local_addr_fd = bpf_object__find_map_fd_by_name(obj, "local_addr");
 	if(local_addr_fd < 0) {
 		exit_with_error(-local_addr_fd);
 	}
-	int zero = 0;
 	bpf_map_update_elem(local_addr_fd, &zero, &local_addr, 0);
 
 	set_bpf_prgm_active(prog_fd);
@@ -2382,14 +2422,15 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 
 	init_send_queue(&send_queue, BATCH_SIZE);
 
-	num_threads = 1; // XXX temporarily limit number of sockets to reduce commit complexity
 	pthread_t senders[num_threads];
 	struct xsk_socket_info *xsks[num_threads];
+	tx_state->umem = create_umem();
 	for(int t = 0; t < num_threads; t++) {
-		xsks[t] = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queue, xdp_mode);
+		xsks[t] = xsk_configure_socket(tx_state->umem, XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queue, xdp_mode);
 		senders[t] = start_thread(tx_send_p, xsks[t]);
-		submit_initial_rx_frames(xsks[t]->umem);
 	}
+	submit_initial_tx_frames(tx_state->umem);
+	submit_initial_rx_frames(tx_state->umem);
 
 	tx_state->start_time = get_nsecs();
 	running = true;
@@ -2401,10 +2442,12 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	running = false;
 	join_thread(worker);
 
+	remove_xdp_program();
 	for(int t = 0; t < num_threads; t++) {
 		join_thread(senders[t]);
 		close_xsk(xsks[t]);
 	}
+	destroy_umem(tx_state->umem);
 	destroy_send_queue(&send_queue);
 
 	struct hercules_stats stats = tx_stats(tx_state);
@@ -2448,13 +2491,12 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 	join_thread(rtt_estimator);
 	debug_printf("cts_rtt: %fs", rx_state->handshake_rtt / 1e6);
 
-	num_threads = 1; // XXX temporarily limit number of sockets to reduce commit complexity
 	struct xsk_socket_info *xsks[num_threads];
+	struct xsk_umem_info *umem = create_umem();
 	for(int t = 0; t < num_threads; t++) {
-		struct xsk_socket_info *xsk = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queue, xdp_mode);
-		xsks[t] = xsk;
-		submit_initial_rx_frames(xsk->umem);
+		xsks[t] = xsk_configure_socket(umem, XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queue, xdp_mode);
 	}
+	submit_initial_rx_frames(umem);
 
 	load_xsk_redirect_userspace(xsks, num_threads);
 
@@ -2482,9 +2524,11 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 	struct hercules_stats stats = rx_stats(rx_state);
 
 	unconfigure_queue();
+	remove_xdp_program();
 	for(int t = 0; t < num_threads; t++) {
 		close_xsk(xsks[t]);
 	}
+	destroy_umem(umem);
 	bitset__destroy(&rx_state->received_chunks);
 	free(rx_state);
 	close(sockfd);

@@ -64,7 +64,7 @@ func herculesInit(iface *net.Interface, local *snet.UDPAddr, queue int, MTU int)
 	activeInterface = iface
 }
 
-func herculesTx(filename string, destinations []*Destination, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
+func herculesTx(filename string, destinations []*Destination, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int, numThreads int) herculesStats {
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
 
@@ -82,15 +82,15 @@ func herculesTx(filename string, destinations []*Destination, pm *PathManager, m
 		C.int(maxRateLimit),
 		C.bool(enablePCC),
 		C.int(xdpMode),
-		C.int(1),
+		C.int(numThreads),
 	))
 }
 
-func herculesRx(filename string, xdpMode int, configureQueues bool, acceptTimeout int) herculesStats {
+func herculesRx(filename string, xdpMode int, numThreads int, configureQueues bool, acceptTimeout int) herculesStats {
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
 	return herculesStatsFromC(
-		C.hercules_rx(cFilename, C.int(xdpMode), C.bool(configureQueues), C.int(acceptTimeout), C.int(1)),
+		C.hercules_rx(cFilename, C.int(xdpMode), C.bool(configureQueues), C.int(acceptTimeout), C.int(numThreads)),
 	)
 }
 

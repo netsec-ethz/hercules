@@ -35,6 +35,7 @@ type HerculesGeneralConfig struct {
 	Mode         string
 	MTU          int
 	Queue        int
+	NumThreads   int
 	Verbosity    string
 	LocalAddress string
 }
@@ -282,6 +283,7 @@ func (config *HerculesGeneralConfig) initializeDefaults() {
 	config.Interface = ""
 	config.Mode = ""
 	config.MTU = 1500
+	config.NumThreads = 1
 	config.Verbosity = ""
 	config.LocalAddress = ""
 }
@@ -338,6 +340,10 @@ func (config *HerculesGeneralConfig) validateLoose() error {
 		return errors.New("queue number must be non-negative")
 	}
 
+	if config.NumThreads < 1 {
+		return errors.New("must at least use 1 worker thread")
+	}
+
 	if config.Verbosity != "" && config.Verbosity != "v" && config.Verbosity != "vv" {
 		return errors.New("verbosity must be empty or one of 'v', 'vv'")
 	}
@@ -376,6 +382,9 @@ func (config *HerculesGeneralConfig) mergeFlags(flags *Flags) error {
 	}
 	if isFlagPassed("q") {
 		config.Queue = flags.queue
+	}
+	if isFlagPassed("nt") {
+		config.NumThreads = flags.numThreads
 	}
 	if isFlagPassed("v") {
 		config.Verbosity = flags.verbose
