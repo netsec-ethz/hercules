@@ -60,7 +60,7 @@
 
 #define RATE_LIMIT_CHECK 1000 // check rate limit every X packets
 						// Maximum burst above target pps allowed
-#define PATH_HANDSHAKE_TIMEOUT_NS 100000000 // send a path handshake every X=100 ms until the first response arrives
+#define PATH_HANDSHAKE_TIMEOUT_NS 100e6 // send a path handshake every X=100 ms until the first response arrives
 
 #define ACK_RATE_TIME_MS 100 // send ACKS after at most X milliseconds
 
@@ -116,6 +116,7 @@ struct receiver_state {
 	u64 start_time;
 	u64 end_time;
 	u64 cts_sent_at;
+	u64 last_pkt_rcvd; // Timeout detection
 
 	u8 num_tracked_paths;
 	struct receiver_state_per_path path_state[256];
@@ -835,9 +836,27 @@ static void tx_recv_control_messages(int sockfd)
 {
 	struct timeval to = {.tv_sec = 0, .tv_usec = 100};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
-
 	char buf[ether_size];
+
+	// packet receive timeouts
+	u64 last_pkt_rcvd[tx_state->num_receivers];
+	for(u32 r = 0; r < tx_state->num_receivers; r++) {
+		// tolerate some delay for first ACK
+		last_pkt_rcvd[r] = get_nsecs()
+				+ 2 * tx_state->receiver[r].handshake_rtt // at startup, tolerate two additional RTTs
+				+ 20 * ACK_RATE_TIME_MS * 1e6; // some drivers experience a short outage after activating XDP
+	}
+
 	while(!tx_acked_all(tx_state)) {
+		for(u32 r = 0; r < tx_state->num_receivers; r++) {
+			if(last_pkt_rcvd[r] + 3 * ACK_RATE_TIME_MS * 1e6 < get_nsecs()) {
+				// Abort transmission after timeout.
+				debug_printf("receiver %d timed out: last %fs, now %fs", r, last_pkt_rcvd[r] / 1.e9, get_nsecs() / 1.e9);
+				// XXX: this aborts all transmissions, as soon as one times out
+				exit_with_error(ETIMEDOUT);
+			}
+		}
+
 		const char *payload;
 		int payloadlen;
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
@@ -849,37 +868,40 @@ static void tx_recv_control_messages(int sockfd)
 				debug_printf("control packet too short");
 			} else {
 				u32 control_pkt_payloadlen = payloadlen - sizeof(control_pkt->type);
-				switch(control_pkt->type) {
-					case CONTROL_PACKET_TYPE_ACK:
-						if(control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
-							struct rbudp_ack_pkt ack;
-							memcpy(&ack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
-							tx_register_acks(&ack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
-						}
-						break;
-					case CONTROL_PACKET_TYPE_NACK:
-						if(tx_state->receiver[0].cc_states != NULL &&
-						   control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
-							struct rbudp_ack_pkt nack;
-							memcpy(&nack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
-							tx_register_nacks(&nack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)].cc_states[path_idx]);
-						}
-						break;
-					case CONTROL_PACKET_TYPE_INITIAL:
-						if(control_pkt_payloadlen >= sizeof(control_pkt->payload.initial)) {
-							struct rbudp_initial_pkt initial;
-							memcpy(&initial, &control_pkt->payload.initial, sizeof(control_pkt->payload.initial));
-							int rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
-							struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
-							if(tx_handle_handshake_reply(&initial, receiver)) {
-								debug_printf("[receiver %d] [path %d] handshake_rtt: %fs, MI: %fs", rcvr_idx,
-											 initial.path_index, receiver->cc_states[initial.path_index].rtt,
-											 receiver->cc_states[initial.path_index].pcc_mi_duration);
+				u32 rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
+				if(rcvr_idx < tx_state->num_receivers) {
+					last_pkt_rcvd[rcvr_idx] = umax64(last_pkt_rcvd[rcvr_idx], get_nsecs());
+					switch(control_pkt->type) {
+						case CONTROL_PACKET_TYPE_ACK:
+							if(control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
+								struct rbudp_ack_pkt ack;
+								memcpy(&ack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
+								tx_register_acks(&ack, &tx_state->receiver[rcvr_idx]);
 							}
-						}
-						break;
-					default:
-						debug_printf("received a control packet of unknown type %d", control_pkt->type);
+							break;
+						case CONTROL_PACKET_TYPE_NACK:
+							if(tx_state->receiver[0].cc_states != NULL &&
+							   control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
+								struct rbudp_ack_pkt nack;
+								memcpy(&nack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
+								tx_register_nacks(&nack, &tx_state->receiver[rcvr_idx].cc_states[path_idx]);
+							}
+							break;
+						case CONTROL_PACKET_TYPE_INITIAL:
+							if(control_pkt_payloadlen >= sizeof(control_pkt->payload.initial)) {
+								struct rbudp_initial_pkt initial;
+								memcpy(&initial, &control_pkt->payload.initial, sizeof(control_pkt->payload.initial));
+								struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
+								if(tx_handle_handshake_reply(&initial, receiver)) {
+									debug_printf("[receiver %d] [path %d] handshake_rtt: %fs, MI: %fs", rcvr_idx,
+												 initial.path_index, receiver->cc_states[initial.path_index].rtt,
+												 receiver->cc_states[initial.path_index].pcc_mi_duration);
+								}
+							}
+							break;
+						default:
+							debug_printf("received a control packet of unknown type %d", control_pkt->type);
+					}
 				}
 			}
 		}
@@ -913,8 +935,8 @@ static bool tx_await_cts(int sockfd)
 		}
 	}
 
-	// Set 20 second timeout on the socket, wait for receiver to get ready
-	struct timeval to = {.tv_sec = 60, .tv_usec = 0};
+	// Set timeout on the socket
+	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
 	char buf[ether_size];
@@ -922,6 +944,7 @@ static bool tx_await_cts(int sockfd)
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
+	// Wait up to 20 seconds for the receiver to get ready
 	for(u64 start = get_nsecs(); start + 20e9l > get_nsecs();) {
 		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr, NULL)) {
 			if(tx_handle_cts(payload, payloadlen, rcvr_by_src_address(scionaddrhdr, udphdr))) {
@@ -1080,6 +1103,13 @@ static void rx_receive_batch(struct xsk_socket_info *xsk)
 	if(!rcvd)
 		return;
 
+	// optimistically update receive timestamp
+	u64 now = get_nsecs();
+	u64 old_last_pkt_rcvd = atomic_load(&rx_state->last_pkt_rcvd);
+	if(old_last_pkt_rcvd < now) {
+		atomic_compare_exchange_strong(&rx_state->last_pkt_rcvd, &old_last_pkt_rcvd, now);
+	}
+
 	size_t reserved = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
 	while(reserved != rcvd) {
 		reserved = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
@@ -1123,10 +1153,10 @@ static void rate_limit_tx(void)
 	u64 d_npkts = tx_npkts_queued - prev_tx_npkts_queued;
 
 	dt = umin64(dt, 1);
-	u32 tx_pps = d_npkts * 1000000000. / dt;
+	u32 tx_pps = d_npkts * 1.e9 / dt;
 
 	if(tx_pps > tx_state->rate_limit) {
-		u64 min_dt = (d_npkts * 1000000000. / tx_state->rate_limit);
+		u64 min_dt = (d_npkts * 1.e9 / tx_state->rate_limit);
 
 		// Busy wait implementation
 		while(now < prev_rate_check + min_dt) {
@@ -1920,14 +1950,13 @@ static void unconfigure_queues() {
 		char cmd[1024];
 		int cmd_len = snprintf(cmd, 1024, "ethtool -N %s delete %d", opt_ifname, ethtool_rules[r]);
 		if(cmd_len > 1023) { // This will never happen as the command to configure is strictly longer than this one
-			printf("could not unconfigure rule %d - command too long, abort\n", r);
+			printf("could not unconfigure rule %d - command too long\n", r);
+			continue;
 		}
 		int ret = system(cmd);
-		if (ret < 0) {
-			exit_with_error(-ret);
-		}
-		if (ret > 0) {
-			exit_with_error(ret);
+		if (ret != 0) {
+			num_ethtool_rules = 0;
+			exit_with_error(abs(ret));
 		}
 	}
 }
@@ -1964,6 +1993,18 @@ static void rx_send_cts_ack(int sockfd)
 	atomic_fetch_add(&tx_npkts, 1);
 }
 
+static void rx_send_ack_pkt(int sockfd, struct hercules_control_packet *control_pkt, struct hercules_path *path) {
+	char buf[ether_size];
+	void *rbudp_pkt = mempcpy(buf, path->headers[0].header, path->headerlen);
+
+	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) control_pkt,
+				   sizeof(control_pkt->type) + ack__len(&control_pkt->payload.ack), path->payloadlen);
+	stitch_checksum(path, path->headers[0].checksum, buf);
+
+	send_eth_frame(sockfd, buf, path->framelen);
+	atomic_fetch_add(&tx_npkts, 1);
+}
+
 static void rx_send_acks(int sockfd)
 {
 	struct hercules_path path;
@@ -1973,9 +2014,6 @@ static void rx_send_acks(int sockfd)
 		return;
 	}
 
-	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
-
 	// XXX: could write ack payload directly to buf, but
 	// doesnt work nicely with existing fill_rbudp_pkt helper.
 	struct hercules_control_packet control_pkt = {
@@ -1983,24 +2021,27 @@ static void rx_send_acks(int sockfd)
 	};
 
 	const size_t max_entries = ack__max_num_entries(path.payloadlen - rbudp_headerlen - sizeof(control_pkt.type));
-	for(u32 curr = 0; curr < rx_state->total_chunks;) {
-		// Data to send
+
+	// send an empty ACK to keep connection alive until first packet arrives
+	u32 curr = fill_ack_pkt(0, &control_pkt.payload.ack, max_entries);
+	rx_send_ack_pkt(sockfd, &control_pkt, &path);
+
+	for(; curr < rx_state->total_chunks;) {
 		curr = fill_ack_pkt(curr, &control_pkt.payload.ack, max_entries);
 		if(control_pkt.payload.ack.num_acks == 0) break;
-
-		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &control_pkt,
-				 sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
-		stitch_checksum(&path, path.headers[0].checksum, buf);
-
-		send_eth_frame(sockfd, buf, path.framelen);
-		atomic_fetch_add(&tx_npkts, 1);
+		rx_send_ack_pkt(sockfd, &control_pkt, &path);
 	}
 }
 
 static void rx_trickle_acks(int sockfd)
 {
 	// XXX: data races in access to shared rx_state!
+	atomic_store(&rx_state->last_pkt_rcvd, get_nsecs());
 	while(!rx_received_all(rx_state)) {
+		if(atomic_load(&rx_state->last_pkt_rcvd) + umax64(30 * ACK_RATE_TIME_MS * 1e6, 3 * rx_state->handshake_rtt) < get_nsecs()) {
+			// Transmission timed out
+			exit_with_error(ETIMEDOUT);
+		}
 		rx_send_acks(sockfd);
 		sleep_nsecs(ACK_RATE_TIME_MS * 1e6);
 	}
