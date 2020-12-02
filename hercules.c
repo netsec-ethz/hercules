@@ -42,7 +42,6 @@
 #include "bpf/src/xsk.h"
 #include "linux/filter.h" // actually linux/tools/include/linux/filter.h
 
-#include "frame_queue.h"
 #include "bitset.h"
 #include "libscion_checksum.h"
 #include "congestion_control.h"
@@ -61,7 +60,7 @@
 
 #define RATE_LIMIT_CHECK 1000 // check rate limit every X packets
 						// Maximum burst above target pps allowed
-#define PATH_HANDSHAKE_TIMEOUT_NS 100e6 // send a path handshake every X=100 ms until the first response arrives
+#define PATH_HANDSHAKE_TIMEOUT_NS 100000000 // send a path handshake every X=100 ms until the first response arrives
 
 #define ACK_RATE_TIME_MS 100 // send ACKS after at most X milliseconds
 
@@ -77,8 +76,6 @@ extern int HerculesGetReplyPath(const char *packetPtr, int length, struct hercul
 struct xsk_umem_info {
 	struct xsk_ring_prod fq;
 	struct xsk_ring_cons cq;
-	struct frame_queue available_frames;
-	pthread_spinlock_t lock;
 	struct xsk_umem *umem;
 	void *buffer;
 };
@@ -88,6 +85,7 @@ struct xsk_socket_info {
 	struct xsk_ring_prod tx;
 	struct xsk_umem_info *umem;
 	struct xsk_socket *xsk;
+	u32 outstanding_tx;
 };
 
 struct receiver_state_per_path {
@@ -118,7 +116,6 @@ struct receiver_state {
 	u64 start_time;
 	u64 end_time;
 	u64 cts_sent_at;
-	u64 last_pkt_rcvd; // Timeout detection
 
 	u8 num_tracked_paths;
 	struct receiver_state_per_path path_state[256];
@@ -155,7 +152,6 @@ struct sender_state {
 	/** Memory mapped file for receive */
 	char *mem;
 	int control_socket_fd;
-	struct xsk_umem_info *umem;
 
 	_Atomic u32 rate_limit;
 
@@ -180,9 +176,13 @@ typedef int xskmap;
 static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
 char opt_ifname[IFNAMSIZ];  // same buffer size as libbpf
 static int opt_ifindex;
-static int queue;
-static struct hercules_app_addr local_addr;
-static int ethtool_rule = -1; // rule ID configured on receiver side
+static int num_queues;
+static int *queues;
+static ia local_ia; // local as in "our IA"
+static int num_local_addrs; // local as in "relative to our IA"
+static struct local_addr *local_addrs;
+static int *ethtool_rules = NULL; // rule IDs configured on receiver side
+static int num_ethtool_rules = 0;
 
 static u32 prog_id;
 
@@ -262,13 +262,13 @@ static void remove_xdp_program(void)
 		printf("program on interface changed, not removing\n");
 }
 
-static void unconfigure_queue();
+static void unconfigure_queues();
 
 static void __exit_with_error(int error, const char *file, const char *func, int line)
 {
 	fprintf(stderr, "%s:%s:%i: errno: %d/\"%s\"\n", file, func, line, error, strerror(error));
 	remove_xdp_program();
-	unconfigure_queue();
+	unconfigure_queues();
 	exit(EXIT_FAILURE);
 }
 
@@ -276,9 +276,12 @@ static void __exit_with_error(int error, const char *file, const char *func, int
 
 static void close_xsk(struct xsk_socket_info *xsk)
 {
+	struct xsk_umem *umem = xsk->umem->umem;  // umem per socket
 	// Removes socket and frees xsk
 	xsk_socket__delete(xsk->xsk);
 	free(xsk);
+	xsk_umem__delete(umem);
+	remove_xdp_program();
 }
 
 // XXX: from lib/scion/udp.c
@@ -390,7 +393,14 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 		debug_printf("not UDP: %u, %zu", iph->protocol, offset);
 		return NULL;
 	}
-	if(iph->daddr != local_addr.ip) {
+	int addr_idx = -1;
+	for(int i = 0; i < num_local_addrs; i++) {
+		if(iph->daddr == local_addrs[i].ip) {
+			addr_idx = i;
+			break;
+		}
+	}
+	if(addr_idx == -1) {
 		debug_printf("not addressed to us (IP overlay)");
 		return NULL;
 	}
@@ -432,11 +442,11 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 		return NULL;
 	}
 	const struct scionaddrhdr_ipv4 *scionaddrh = (const struct scionaddrhdr_ipv4 *) (pkt + offset + sizeof(struct scionhdr));
-	if(scionaddrh->dst_ia != local_addr.ia) {
+	if(scionaddrh->dst_ia != local_ia) {
 		debug_printf("not addressed to us (IA)");
 		return NULL;
 	}
-	if(scionaddrh->dst_ip != local_addr.ip) {
+	if(scionaddrh->dst_ip != local_addrs[addr_idx].ip) {
 		debug_printf("not addressed to us (IP in SCION hdr)");
 		return NULL;
 	}
@@ -450,7 +460,7 @@ static const char *parse_pkt(const char *pkt, size_t length, bool check, const s
 	}
 
 	const struct udphdr *l4udph = (const struct udphdr *) (pkt + offset);
-	if(l4udph->dest != local_addr.port) {
+	if(l4udph->dest != local_addrs[addr_idx].port) {
 		debug_printf("not addressed to us (L4 UDP port): %u", ntohs(l4udph->dest));
 		return NULL;
 	}
@@ -572,25 +582,7 @@ static struct xsk_umem_info *xsk_configure_umem(void *buffer, u64 size)
 		exit_with_error(-ret);
 
 	umem->buffer = buffer;
-	// The number of slots in the umem->available_frames queue needs to be larger than the number of frames in the loop,
-	// pushed in submit_initial_tx_frames() (assumption in pop_completion_ring())
-	ret = frame_queue__init(&umem->available_frames, XSK_RING_PROD__DEFAULT_NUM_DESCS);
-	if(ret)
-		exit_with_error(ret);
-	pthread_spin_init(&umem->lock, 0);
 	return umem;
-}
-
-static void kick_tx(struct xsk_socket_info *xsk)
-{
-	int ret;
-	do {
-		ret = sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-	} while(ret < 0 && errno == EAGAIN);
-
-	if(ret < 0 && errno != ENOBUFS && errno != EBUSY) {
-		exit_with_error(errno);
-	}
 }
 
 static void submit_initial_rx_frames(struct xsk_umem_info *umem)
@@ -603,24 +595,8 @@ static void submit_initial_rx_frames(struct xsk_umem_info *umem)
 	if(ret != initial_kernel_rx_frame_count)
 		exit_with_error(-ret);
 	for(int i = 0; i < initial_kernel_rx_frame_count; i++)
-		*xsk_ring_prod__fill_addr(&umem->fq, idx++) = (XSK_RING_PROD__DEFAULT_NUM_DESCS + i) * XSK_UMEM__DEFAULT_FRAME_SIZE;
+		*xsk_ring_prod__fill_addr(&umem->fq, idx++) = i * XSK_UMEM__DEFAULT_FRAME_SIZE;
 	xsk_ring_prod__submit(&umem->fq, initial_kernel_rx_frame_count);
-}
-
-static void submit_initial_tx_frames(struct xsk_umem_info *umem)
-{
-	// This number needs to be smaller than the number of slots in the umem->available_frames queue (initialized in
-	// xsk_configure_umem(); assumption in pop_completion_ring())
-	int initial_tx_frames = XSK_RING_PROD__DEFAULT_NUM_DESCS - BATCH_SIZE;
-	int avail = frame_queue__prod_reserve(&umem->available_frames, initial_tx_frames);
-	if(initial_tx_frames > avail) {
-		debug_printf("trying to push %d initial frames, but only %d slots available", initial_tx_frames, avail);
-		exit_with_error(EINVAL);
-	}
-	for(int i = 0; i < avail; i++) {
-		frame_queue__prod_fill(&umem->available_frames, i, i * XSK_UMEM__DEFAULT_FRAME_SIZE);
-	}
-	frame_queue__push(&umem->available_frames, avail);
 }
 
 static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem, int libbpf_flags, int queue, int bind_flags)
@@ -639,7 +615,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem, 
 	cfg.libbpf_flags = libbpf_flags;
 	cfg.xdp_flags = opt_xdp_flags;
 	cfg.bind_flags = bind_flags;
-	ret = xsk_socket__create_shared(&xsk->xsk, opt_ifname, queue, umem->umem, &xsk->rx, &xsk->tx, &umem->fq, &umem->cq, &cfg);
+	ret = xsk_socket__create(&xsk->xsk, opt_ifname, queue, umem->umem, &xsk->rx, &xsk->tx, &cfg);
 	if(ret)
 		exit_with_error(-ret);
 
@@ -663,28 +639,37 @@ static struct xsk_umem_info *create_umem()
 	return umem;
 }
 
-static void destroy_umem(struct xsk_umem_info *umem) {
-	xsk_umem__delete(umem->umem);
-	free(umem->buffer);
-	free(umem);
+static struct xsk_socket_info *create_xsk_with_umem(int libbpf_flags, int queue, int bind_flags)
+{
+	struct xsk_umem_info *umem = create_umem();
+	return xsk_configure_socket(umem, libbpf_flags, queue, bind_flags);
 }
 
-// Pop entries from completion ring and store them in umem->available_frames.
-static void pop_completion_ring(struct xsk_umem_info *umem)
+static void kick_tx(struct xsk_socket_info *xsk)
 {
+	int ret;
+	do {
+		ret = sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+	} while(ret < 0 && errno == EAGAIN);
+
+	if(ret < 0 && errno != ENOBUFS && errno != EBUSY) {
+		exit_with_error(errno);
+	}
+}
+
+// Pop entries from completion ring.
+// XXX: Here we SHOULD be updating the bookeeping for which frames are safe to be used for sending.
+//      But we currently don't so the only thing this does is freeng up the completion ring.
+static void pop_completion_ring(struct xsk_socket_info *xsk)
+{
+	if(!xsk->outstanding_tx)
+		return;
+
 	u32 idx;
-	size_t entries = xsk_ring_cons__peek(&umem->cq, SIZE_MAX, &idx);
-	if(entries > 0) {
-		u16 num = frame_queue__prod_reserve(&umem->available_frames, entries);
-		if(num < entries) { // there are less frames in the loop than the number of slots in frame_queue
-			debug_printf("trying to push %ld frames, only got %d slots in frame_queue", entries, num);
-			exit_with_error(EINVAL);
-		}
-		for(u16 i = 0; i < num; i++) {
-			frame_queue__prod_fill(&umem->available_frames, i, *xsk_ring_cons__comp_addr(&umem->cq, idx + i));
-		}
-		frame_queue__push(&umem->available_frames, num);
-		xsk_ring_cons__release(&umem->cq, entries);
+	size_t entries = xsk_ring_cons__peek(&xsk->umem->cq, SIZE_MAX, &idx);
+	if(likely(entries > 0)) {
+		xsk_ring_cons__release(&xsk->umem->cq, entries);
+		xsk->outstanding_tx -= entries;
 		atomic_fetch_add(&tx_npkts, entries);
 	}
 }
@@ -850,27 +835,9 @@ static void tx_recv_control_messages(int sockfd)
 {
 	struct timeval to = {.tv_sec = 0, .tv_usec = 100};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+
 	char buf[ether_size];
-
-	// packet receive timeouts
-	u64 last_pkt_rcvd[tx_state->num_receivers];
-	for(u32 r = 0; r < tx_state->num_receivers; r++) {
-		// tolerate some delay for first ACK
-		last_pkt_rcvd[r] = get_nsecs()
-				+ 2 * tx_state->receiver[r].handshake_rtt // at startup, tolerate two additional RTTs
-				+ 20 * ACK_RATE_TIME_MS * 1e6; // some drivers experience a short outage after activating XDP
-	}
-
 	while(!tx_acked_all(tx_state)) {
-		for(u32 r = 0; r < tx_state->num_receivers; r++) {
-			if(last_pkt_rcvd[r] + 3 * ACK_RATE_TIME_MS * 1e6 < get_nsecs()) {
-				// Abort transmission after timeout.
-				debug_printf("receiver %d timed out: last %fs, now %fs", r, last_pkt_rcvd[r] / 1.e9, get_nsecs() / 1.e9);
-				// XXX: this aborts all transmissions, as soon as one times out
-				exit_with_error(ETIMEDOUT);
-			}
-		}
-
 		const char *payload;
 		int payloadlen;
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
@@ -882,40 +849,37 @@ static void tx_recv_control_messages(int sockfd)
 				debug_printf("control packet too short");
 			} else {
 				u32 control_pkt_payloadlen = payloadlen - sizeof(control_pkt->type);
-				u32 rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
-				if(rcvr_idx < tx_state->num_receivers) {
-					last_pkt_rcvd[rcvr_idx] = umax64(last_pkt_rcvd[rcvr_idx], get_nsecs());
-					switch(control_pkt->type) {
-						case CONTROL_PACKET_TYPE_ACK:
-							if(control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
-								struct rbudp_ack_pkt ack;
-								memcpy(&ack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
-								tx_register_acks(&ack, &tx_state->receiver[rcvr_idx]);
+				switch(control_pkt->type) {
+					case CONTROL_PACKET_TYPE_ACK:
+						if(control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
+							struct rbudp_ack_pkt ack;
+							memcpy(&ack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
+							tx_register_acks(&ack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)]);
+						}
+						break;
+					case CONTROL_PACKET_TYPE_NACK:
+						if(tx_state->receiver[0].cc_states != NULL &&
+						   control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
+							struct rbudp_ack_pkt nack;
+							memcpy(&nack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
+							tx_register_nacks(&nack, &tx_state->receiver[rcvr_by_src_address(scionaddrhdr, udphdr)].cc_states[path_idx]);
+						}
+						break;
+					case CONTROL_PACKET_TYPE_INITIAL:
+						if(control_pkt_payloadlen >= sizeof(control_pkt->payload.initial)) {
+							struct rbudp_initial_pkt initial;
+							memcpy(&initial, &control_pkt->payload.initial, sizeof(control_pkt->payload.initial));
+							int rcvr_idx = rcvr_by_src_address(scionaddrhdr, udphdr);
+							struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
+							if(tx_handle_handshake_reply(&initial, receiver)) {
+								debug_printf("[receiver %d] [path %d] handshake_rtt: %fs, MI: %fs", rcvr_idx,
+											 initial.path_index, receiver->cc_states[initial.path_index].rtt,
+											 receiver->cc_states[initial.path_index].pcc_mi_duration);
 							}
-							break;
-						case CONTROL_PACKET_TYPE_NACK:
-							if(tx_state->receiver[0].cc_states != NULL &&
-							   control_pkt_payloadlen >= ack__len(&control_pkt->payload.ack)) {
-								struct rbudp_ack_pkt nack;
-								memcpy(&nack, &control_pkt->payload.ack, ack__len(&control_pkt->payload.ack));
-								tx_register_nacks(&nack, &tx_state->receiver[rcvr_idx].cc_states[path_idx]);
-							}
-							break;
-						case CONTROL_PACKET_TYPE_INITIAL:
-							if(control_pkt_payloadlen >= sizeof(control_pkt->payload.initial)) {
-								struct rbudp_initial_pkt initial;
-								memcpy(&initial, &control_pkt->payload.initial, sizeof(control_pkt->payload.initial));
-								struct sender_state_per_receiver *receiver = &tx_state->receiver[rcvr_idx];
-								if(tx_handle_handshake_reply(&initial, receiver)) {
-									debug_printf("[receiver %d] [path %d] handshake_rtt: %fs, MI: %fs", rcvr_idx,
-												 initial.path_index, receiver->cc_states[initial.path_index].rtt,
-												 receiver->cc_states[initial.path_index].pcc_mi_duration);
-								}
-							}
-							break;
-						default:
-							debug_printf("received a control packet of unknown type %d", control_pkt->type);
-					}
+						}
+						break;
+					default:
+						debug_printf("received a control packet of unknown type %d", control_pkt->type);
 				}
 			}
 		}
@@ -949,8 +913,8 @@ static bool tx_await_cts(int sockfd)
 		}
 	}
 
-	// Set timeout on the socket
-	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
+	// Set 20 second timeout on the socket, wait for receiver to get ready
+	struct timeval to = {.tv_sec = 60, .tv_usec = 0};
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
 	char buf[ether_size];
@@ -958,7 +922,6 @@ static bool tx_await_cts(int sockfd)
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
-	// Wait up to 20 seconds for the receiver to get ready
 	for(u64 start = get_nsecs(); start + 20e9l > get_nsecs();) {
 		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr, NULL)) {
 			if(tx_handle_cts(payload, payloadlen, rcvr_by_src_address(scionaddrhdr, udphdr))) {
@@ -976,13 +939,13 @@ static void tx_send_handshake_ack(int sockfd, u32 rcvr)
 {
 	char buf[ether_size];
 	struct hercules_path *path = &tx_state->receiver[rcvr].paths[0];
-	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
+	void *rbudp_pkt = mempcpy(buf, path->headers[0].header, path->headerlen);
 
 	struct rbudp_ack_pkt ack;
 	ack.num_acks = 0;
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &ack, ack__len(&ack), path->payloadlen);
-	stitch_checksum(path, path->header.checksum, buf);
+	stitch_checksum(path, path->headers[0].checksum, buf);
 
 	send_eth_frame(sockfd, buf, path->framelen);
 	atomic_fetch_add(&tx_npkts, 1);
@@ -1036,7 +999,7 @@ tx_send_initial(int sockfd, const struct hercules_path *path, size_t filesize, u
 				u32 path_index, bool set_return_path)
 {
 	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
+	void *rbudp_pkt = mempcpy(buf, path->headers[0].header, path->headerlen);
 
 	struct hercules_control_packet pld = {
 			.type = CONTROL_PACKET_TYPE_INITIAL,
@@ -1049,7 +1012,7 @@ tx_send_initial(int sockfd, const struct hercules_path *path, size_t filesize, u
 			},
 	};
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &pld, sizeof(pld.type) + sizeof(pld.payload.initial), path->payloadlen);
-	stitch_checksum(path, path->header.checksum, buf);
+	stitch_checksum(path, path->headers[0].checksum, buf);
 
 	send_eth_frame(sockfd, buf, path->framelen);
 	atomic_fetch_add(&tx_npkts, 1);
@@ -1107,45 +1070,25 @@ static void stitch_checksum(const struct hercules_path *path, u16 precomputed_ch
 static void
 rx_handle_initial(int sockfd, struct rbudp_initial_pkt *initial, const char *buf, const char *payload, int payloadlen);
 
-static void submit_rx_frames(struct xsk_umem_info *umem, const u64 *addrs, size_t num_frames) {
-	u32 idx_fq;
-	pthread_spin_lock(&umem->lock);
-	size_t reserved = xsk_ring_prod__reserve(&umem->fq, num_frames, &idx_fq);
-	while(reserved != num_frames) {
-		reserved = xsk_ring_prod__reserve(&umem->fq, num_frames, &idx_fq);
-		if(!running) {
-			pthread_spin_unlock(&umem->lock);
-			return;
-		}
-	}
-
-	for(size_t i = 0; i < num_frames; i++) {
-		*xsk_ring_prod__fill_addr(&umem->fq, idx_fq++) = addrs[i];
-	}
-	xsk_ring_prod__submit(&umem->fq, num_frames);
-	pthread_spin_unlock(&umem->lock);
-}
-
 static void rx_receive_batch(struct xsk_socket_info *xsk)
 {
-	u32 idx_rx = 0;
+	u32 idx_rx = 0, idx_fq = 0;
 	int ignored = 0;
 
+	// XXX: restricting to receiving BATCH_SIZE here seems unnecessary. Change to SIZE_MAX?
 	size_t rcvd = xsk_ring_cons__peek(&xsk->rx, BATCH_SIZE, &idx_rx);
 	if(!rcvd)
 		return;
 
-	// optimistically update receive timestamp
-	u64 now = get_nsecs();
-	u64 old_last_pkt_rcvd = atomic_load(&rx_state->last_pkt_rcvd);
-	if(old_last_pkt_rcvd < now) {
-		atomic_compare_exchange_strong(&rx_state->last_pkt_rcvd, &old_last_pkt_rcvd, now);
+	size_t reserved = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
+	while(reserved != rcvd) {
+		reserved = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
+		if(!running)
+			return;
 	}
 
-	u64 frame_addrs[BATCH_SIZE];
 	for(size_t i = 0; i < rcvd; i++) {
 		u64 addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->addr;
-		frame_addrs[i] = addr;
 		u32 len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx + i)->len;
 		const char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 		const char *rbudp_pkt = parse_pkt_fast_path(pkt, len, true, UINT32_MAX);
@@ -1162,10 +1105,11 @@ static void rx_receive_batch(struct xsk_socket_info *xsk)
 		} else {
 			ignored++;
 		}
+		*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) = addr;
 	}
+	xsk_ring_prod__submit(&xsk->umem->fq, rcvd);
 	xsk_ring_cons__release(&xsk->rx, rcvd);
 	atomic_fetch_add(&rx_npkts, (rcvd - ignored));
-	submit_rx_frames(xsk->umem, frame_addrs, rcvd);
 }
 
 static void rate_limit_tx(void)
@@ -1179,10 +1123,10 @@ static void rate_limit_tx(void)
 	u64 d_npkts = tx_npkts_queued - prev_tx_npkts_queued;
 
 	dt = umin64(dt, 1);
-	u32 tx_pps = d_npkts * 1.e9 / dt;
+	u32 tx_pps = d_npkts * 1000000000. / dt;
 
 	if(tx_pps > tx_state->rate_limit) {
-		u64 min_dt = (d_npkts * 1.e9 / tx_state->rate_limit);
+		u64 min_dt = (d_npkts * 1000000000. / tx_state->rate_limit);
 
 		// Busy wait implementation
 		while(now < prev_rate_check + min_dt) {
@@ -1228,6 +1172,20 @@ void push_hercules_tx_paths()
 	}
 }
 
+void allocate_path_headers(struct hercules_path *path, int num_headers) {
+	// this function is only called in non-performance critical paths, hence we have the time to manage memory
+	if (path->num_headers < num_headers) {
+		if (path->headers != NULL) {
+			free(path->headers); // this should not be necessary: the number of header versions per destination should
+			// not change, as the number of IP addresses per destination is fixed at startup
+		}
+		path->headers = calloc(num_headers, sizeof(*path->headers));
+	} else if(num_headers == 0) {
+		debug_printf("no header versions given, abort");
+		exit_with_error(ENODATA);
+	}
+}
+
 static void update_hercules_tx_paths(void)
 {
 	acquire_path_lock();
@@ -1251,7 +1209,10 @@ static void update_hercules_tx_paths(void)
 					receiver->paths[p].enabled = false;
 					continue;
 				}
+				struct hercules_path_header *old_headers = receiver->paths[p].headers;
 				memcpy(&receiver->paths[p], shd_path, sizeof(struct hercules_path));
+				shd_path->headers = old_headers; // this pushes the memory management for struct hercules_path_header to
+				// the Go part which is less performance critical
 
 				atomic_store(&receiver->paths[p].next_handshake_at, UINT64_MAX); // by default do not send a new handshake
 				if(p == receiver->return_path_idx) {
@@ -1312,39 +1273,41 @@ void send_path_handshakes()
 }
 
 
-static void claim_tx_frames(struct xsk_umem_info *umem, u64 *addrs, size_t num_frames) {
-	pthread_spin_lock(&umem->lock);
-	size_t reserved = frame_queue__cons_reserve(&umem->available_frames, num_frames);
-	while(reserved != num_frames) {
-		reserved = frame_queue__cons_reserve(&umem->available_frames, num_frames);
-		if(!running) {
-			pthread_spin_unlock(&umem->lock);
-			return;
-		}
-	}
-
-	for(size_t i = 0; i < num_frames; i++) {
-		addrs[i] = frame_queue__cons_fetch(&umem->available_frames, i);
-	}
-	frame_queue__pop(&umem->available_frames, num_frames);
-	pthread_spin_unlock(&umem->lock);
-}
-
-static char *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_idx, size_t framelen)
+/*!
+ * @function	produce_frame
+ * @abstract	Fill an entry in the sender transmission ring with frame frame_nb and
+ *		return the corresponding umem buffer address.
+ * @param	xsk		the socket
+ * @param	frame_nb	the frame number of the frame being put in the tx ring
+ * @param	prod_tx_idx	index in the tx ring where the frame is being inserted
+ * @param	framelen	size of the frame, smaller than XSK_UMEM__DEFAULT_FRAME_SIZE
+ * @result	A pointer to the umem buffer corresponding to the frame
+*/
+static char *produce_frame(struct xsk_socket_info *xsk, u32 frame_nb, u32 prod_tx_idx, size_t framelen)
 {
+	const u64 addr = frame_nb << XSK_UMEM__DEFAULT_FRAME_SHIFT;
 	xsk_ring_prod__tx_desc(&xsk->tx, prod_tx_idx)->addr = addr;
 	xsk_ring_prod__tx_desc(&xsk->tx, prod_tx_idx)->len = framelen;
 	char *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 	return pkt;
 }
 
-static void submit_batch(struct xsk_socket_info *xsk, u32 i)
+static void submit_batch(struct xsk_socket_info *xsk, u32 *frame_nb, u32 i)
 {
 	xsk_ring_prod__submit(&xsk->tx, i);
+
+	xsk->outstanding_tx += i;
+	*frame_nb += i;
+	if(*frame_nb + SEND_QUEUE_ENTRIES_PER_UNIT > NUM_FRAMES) { // Wrap around if next batch would overflow
+		*frame_nb = 0;
+	}
+
 	kick_tx(xsk);
+	pop_completion_ring(xsk);
 }
 
-static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct send_queue_unit *unit) {
+static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct send_queue_unit *unit, u32 *frame_nb,
+		u32 *random_seed) {
 	u32 num_chunks_in_unit;
 	for(num_chunks_in_unit = 0; num_chunks_in_unit < SEND_QUEUE_ENTRIES_PER_UNIT; num_chunks_in_unit++) {
 		if(unit->paths[num_chunks_in_unit] == UINT8_MAX) {
@@ -1352,12 +1315,13 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 		}
 	}
 
-	u64 frame_addrs[SEND_QUEUE_ENTRIES_PER_UNIT];
-	claim_tx_frames(xsk->umem, frame_addrs, num_chunks_in_unit);
-
 	u32 idx;
 	while(xsk_ring_prod__reserve(&xsk->tx, num_chunks_in_unit, &idx) != num_chunks_in_unit) {
 		kick_tx(xsk); // XXX: investigate how sender can still starve without this, it seems it should NOT be necessary
+		// While we're waiting, consume completion ring to avoid that the kernel
+		// could starve on completion ring slots. (ring is smaller than number of
+		// frames)
+		pop_completion_ring(xsk);
 	}
 
 	for(u32 i = 0; i < num_chunks_in_unit; i++) {
@@ -1366,9 +1330,10 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 		const u32 chunk_idx = unit->chunk_idx[i];
 		const size_t chunk_start = (size_t) chunk_idx * tx_state->chunklen;
 		const size_t len = umin64(tx_state->chunklen, tx_state->filesize - chunk_start);
+		u32 hdr_idx = rand_r(random_seed) % path->num_headers; // pick random header version
 
-		void *pkt = prepare_frame(xsk, frame_addrs[i], idx + i, path->framelen);
-		void *rbudp_pkt = mempcpy(pkt, path->header.header, path->headerlen);
+		void *pkt = produce_frame(xsk, *frame_nb + i, idx + i, path->framelen);
+		void *rbudp_pkt = mempcpy(pkt, path->headers[hdr_idx].header, path->headerlen);
 		u8 track_path = PCC_NO_PATH; // put path_idx iff PCC is enabled
 		sequence_number seqnr = 0;
 		if(receiver->cc_states != NULL) {
@@ -1376,10 +1341,10 @@ static inline void tx_handle_send_queue_unit(struct xsk_socket_info *xsk, struct
 			seqnr = atomic_fetch_add(&receiver->cc_states[unit->paths[i]].last_seqnr, 1);
 		}
 		fill_rbudp_pkt(rbudp_pkt, chunk_idx, track_path, seqnr, tx_state->mem + chunk_start, len, path->payloadlen);
-		stitch_checksum(path, path->header.checksum, pkt);
+		stitch_checksum(path, path->headers[hdr_idx].checksum, pkt);
 	}
 
-	submit_batch(xsk, num_chunks_in_unit);
+	submit_batch(xsk, frame_nb, num_chunks_in_unit);
 }
 
 static void produce_batch(const u8 *path_by_rcvr, const u32 *chunks, const u8 *rcvr_by_chunk, u32 num_chunks)
@@ -1417,13 +1382,17 @@ static void tx_send_p(void *arg) {
 
 	struct send_queue_unit unit;
 	send_queue_pop_wait(&send_queue, &unit);
+	u32 frame_nb = 0;
+	u32 random_seed = (u32) (size_t) arg + pthread_self() + (u32) get_nsecs();
 	while(true) {
-		tx_handle_send_queue_unit(xsk, &unit);
+		tx_handle_send_queue_unit(xsk, &unit, &frame_nb, &random_seed);
 		if(!send_queue_pop(&send_queue, &unit)) { // queue currently empty
 			while(!send_queue_pop(&send_queue, &unit)) {
 				if(!atomic_load(&running)) {
 					return;
 				}
+				// whenever we're waiting, claim frames back
+				pop_completion_ring(xsk);
 			}
 		}
 	}
@@ -1612,7 +1581,6 @@ static void tx_only()
 	u32 max_chunks_per_rcvr[tx_state->num_receivers];
 
 	while(finished_count < tx_state->num_receivers) {
-		pop_completion_ring(tx_state->umem);
 		send_path_handshakes();
 		u64 next_ack_due = 0;
 		u32 num_chunks_per_rcvr[tx_state->num_receivers];
@@ -1806,7 +1774,7 @@ static bool rbudp_parse_initial(const char *pkt, size_t len, struct rbudp_initia
 	return true;
 }
 
-static bool rx_get_reply_path(struct hercules_path *path)
+static bool rx_get_reply_path(struct hercules_path *path, struct hercules_path_header *path_header)
 {
 	// Get reply path for sending ACKs:
 	//
@@ -1822,6 +1790,10 @@ static bool rx_get_reply_path(struct hercules_path *path)
 	char rx_sample_buf[XSK_UMEM__DEFAULT_FRAME_SIZE];
 	memcpy(rx_sample_buf, rx_state->rx_sample_buf, rx_sample_len);
 
+	// prepare hercules_path
+	path->headers = path_header;
+	path->num_headers = 1;
+
 	int ret = HerculesGetReplyPath(rx_sample_buf, rx_sample_len, path);
 	if(ret) {
 		return false;
@@ -1832,12 +1804,13 @@ static bool rx_get_reply_path(struct hercules_path *path)
 static void rx_send_rtt_ack(int sockfd, struct rbudp_initial_pkt *pld)
 {
 	struct hercules_path path;
-	if(!rx_get_reply_path(&path)) {
+	struct hercules_path_header path_header;
+	if(!rx_get_reply_path(&path, &path_header)) {
 		return;
 	}
 
 	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
+	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
 	struct hercules_control_packet control_pkt = {
 			.type = CONTROL_PACKET_TYPE_INITIAL,
@@ -1846,7 +1819,7 @@ static void rx_send_rtt_ack(int sockfd, struct rbudp_initial_pkt *pld)
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &control_pkt,
 				   sizeof(control_pkt.type) + sizeof(control_pkt.payload.initial), path.payloadlen);
-	stitch_checksum(&path, path.header.checksum, buf);
+	stitch_checksum(&path, path.headers[0].checksum, buf);
 
 	send_eth_frame(sockfd, buf, path.framelen);
 	atomic_fetch_add(&tx_npkts, 1);
@@ -1864,27 +1837,24 @@ rx_handle_initial(int sockfd, struct rbudp_initial_pkt *initial, const char *buf
 	rx_state->cts_sent_at = get_nsecs();
 }
 
-static bool rx_accept(int sockfd, int timeout)
+static bool rx_accept(int sockfd)
 {
 	char buf[ether_size];
-	__u64 start_wait = get_nsecs();
-	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
-	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
-
-	// Wait for well formed startup packet
-	while(timeout == 0 || start_wait + timeout * 1e9 > get_nsecs()) {
+	while(true) { // Wait for well formed startup packet
 		const char *payload;
 		int payloadlen;
 		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, NULL, NULL, NULL)) {
 			struct rbudp_initial_pkt parsed_pkt;
 			if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
 				rx_state = make_rx_state(parsed_pkt.filesize, parsed_pkt.chunklen, sockfd);
+				if(!rx_state)
+					return false;
+
 				rx_handle_initial(sockfd, &parsed_pkt, buf, payload, payloadlen);
 				return true;
 			}
 		}
 	}
-	return false;
 }
 
 static void rx_get_rtt_estimate(void *arg)
@@ -1903,55 +1873,61 @@ static void rx_get_rtt_estimate(void *arg)
 	}
 }
 
-static void configure_queue()
+static void configure_queues()
 {
-	debug_printf("map UDP4 flow to %d.%d.%d.%d to queue %d",
-				 (u8) (local_addr.ip),
-				 (u8) (local_addr.ip >> 8u),
-				 (u8) (local_addr.ip >> 16u),
-				 (u8) (local_addr.ip >> 24u),
-				 queue
-	);
+	ethtool_rules = calloc(num_local_addrs, sizeof(int));
+	for(int l = 0; l < num_local_addrs; l++) {
+		debug_printf("map UDP4 flow to %d.%d.%d.%d to queue %d",
+					 (u8) (local_addrs[l].ip),
+					 (u8) (local_addrs[l].ip >> 8u),
+					 (u8) (local_addrs[l].ip >> 16u),
+					 (u8) (local_addrs[l].ip >> 24u),
+					 queues[l % num_queues]
+		);
 
-	char cmd[1024];
-	int cmd_len = snprintf(cmd, 1024, "ethtool -N %s flow-type udp4 dst-ip %d.%d.%d.%d action %d",
-						   opt_ifname,
-						   (u8) (local_addr.ip),
-						   (u8) (local_addr.ip >> 8u),
-						   (u8) (local_addr.ip >> 16u),
-						   (u8) (local_addr.ip >> 24u),
-						   queue
-	);
-	if(cmd_len > 1023) {
-		printf("could not configure queue %d - command too long, abort\n", queue);
-	}
+		char cmd[1024];
+		int cmd_len = snprintf(cmd, 1024, "ethtool -N %s flow-type udp4 dst-ip %d.%d.%d.%d action %d",
+							   opt_ifname,
+							   (u8) (local_addrs[l].ip),
+							   (u8) (local_addrs[l].ip >> 8u),
+							   (u8) (local_addrs[l].ip >> 16u),
+							   (u8) (local_addrs[l].ip >> 24u),
+							   queues[l % num_queues]
+		);
+		if(cmd_len > 1023) {
+			printf("could not configure queue %d - command too long, abort\n", queues[l % num_queues]);
+		}
 
-	FILE *proc = popen(cmd, "r");
-	int rule_id;
-	int num_parsed = fscanf(proc, "Added rule with ID %d", &rule_id);
-	int ret = pclose(proc);
-	if(ret != 0) {
-		printf("could not configure queue %d, abort\n", queue);
-		exit_with_error(ret);
+		FILE *proc = popen(cmd, "r");
+		int rule_id;
+		int num_parsed = fscanf(proc, "Added rule with ID %d", &rule_id);
+		int ret = pclose(proc);
+		if(ret != 0) {
+			printf("could not configure queue %d, abort\n", queues[l % num_queues]);
+			exit_with_error(ret);
+		}
+		if(num_parsed != 1) {
+			printf("could not configure queue %d, abort\n", queues[l % num_queues]);
+			exit_with_error(EXIT_FAILURE);
+		}
+		ethtool_rules[num_ethtool_rules] = rule_id;
+		num_ethtool_rules++;
 	}
-	if(num_parsed != 1) {
-		printf("could not configure queue %d, abort\n", queue);
-		exit_with_error(EXIT_FAILURE);
-	}
-	ethtool_rule = rule_id;
 }
 
-static void unconfigure_queue() {
-	if (ethtool_rule >= 0) {
+static void unconfigure_queues() {
+	for(int r = 0; r < num_ethtool_rules; r++) {
 		char cmd[1024];
-		int cmd_len = snprintf(cmd, 1024, "ethtool -N %s delete %d", opt_ifname, ethtool_rule);
-		ethtool_rule = -1;
+		int cmd_len = snprintf(cmd, 1024, "ethtool -N %s delete %d", opt_ifname, ethtool_rules[r]);
 		if(cmd_len > 1023) { // This will never happen as the command to configure is strictly longer than this one
-			printf("could not unconfigure ethtool rule - command too long\n");
+			printf("could not unconfigure rule %d - command too long, abort\n", r);
 		}
 		int ret = system(cmd);
-		if(ret != 0) {
-			exit_with_error(abs(ret));
+		if (ret < 0) {
+			exit_with_error(-ret);
+		}
+		if (ret > 0) {
+			exit_with_error(ret);
 		}
 	}
 }
@@ -1960,19 +1936,20 @@ static void rx_rtt_and_configure(void *arg)
 {
 	rx_get_rtt_estimate(arg);
 	// as soon as we got the RTT estimate, we are ready to set up the queues
-	configure_queue();
+	configure_queues();
 }
 
 static void rx_send_cts_ack(int sockfd)
 {
 	struct hercules_path path;
-	if(!rx_get_reply_path(&path)) {
+	struct hercules_path_header path_header;
+	if(!rx_get_reply_path(&path, &path_header)) {
 		debug_printf("no reply path");
 		return;
 	}
 
 	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
+	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
 	struct hercules_control_packet control_pkt = {
 			.type = CONTROL_PACKET_TYPE_ACK,
@@ -1981,31 +1958,23 @@ static void rx_send_cts_ack(int sockfd)
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &control_pkt,
 				sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
-	stitch_checksum(&path, path.header.checksum, buf);
+	stitch_checksum(&path, path.headers[0].checksum, buf);
 
 	send_eth_frame(sockfd, buf, path.framelen);
-	atomic_fetch_add(&tx_npkts, 1);
-}
-
-static void rx_send_ack_pkt(int sockfd, struct hercules_control_packet *control_pkt, struct hercules_path *path) {
-	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
-
-	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) control_pkt,
-				   sizeof(control_pkt->type) + ack__len(&control_pkt->payload.ack), path->payloadlen);
-	stitch_checksum(path, path->header.checksum, buf);
-
-	send_eth_frame(sockfd, buf, path->framelen);
 	atomic_fetch_add(&tx_npkts, 1);
 }
 
 static void rx_send_acks(int sockfd)
 {
 	struct hercules_path path;
-	if(!rx_get_reply_path(&path)) {
+	struct hercules_path_header path_header;
+	if(!rx_get_reply_path(&path, &path_header)) {
 		debug_printf("no reply path");
 		return;
 	}
+
+	char buf[ether_size];
+	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
 	// XXX: could write ack payload directly to buf, but
 	// doesnt work nicely with existing fill_rbudp_pkt helper.
@@ -2014,27 +1983,24 @@ static void rx_send_acks(int sockfd)
 	};
 
 	const size_t max_entries = ack__max_num_entries(path.payloadlen - rbudp_headerlen - sizeof(control_pkt.type));
-
-	// send an empty ACK to keep connection alive until first packet arrives
-	u32 curr = fill_ack_pkt(0, &control_pkt.payload.ack, max_entries);
-	rx_send_ack_pkt(sockfd, &control_pkt, &path);
-
-	for(; curr < rx_state->total_chunks;) {
+	for(u32 curr = 0; curr < rx_state->total_chunks;) {
+		// Data to send
 		curr = fill_ack_pkt(curr, &control_pkt.payload.ack, max_entries);
 		if(control_pkt.payload.ack.num_acks == 0) break;
-		rx_send_ack_pkt(sockfd, &control_pkt, &path);
+
+		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *) &control_pkt,
+				 sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
+		stitch_checksum(&path, path.headers[0].checksum, buf);
+
+		send_eth_frame(sockfd, buf, path.framelen);
+		atomic_fetch_add(&tx_npkts, 1);
 	}
 }
 
 static void rx_trickle_acks(int sockfd)
 {
 	// XXX: data races in access to shared rx_state!
-	atomic_store(&rx_state->last_pkt_rcvd, get_nsecs());
 	while(!rx_received_all(rx_state)) {
-		if(atomic_load(&rx_state->last_pkt_rcvd) + umax64(30 * ACK_RATE_TIME_MS * 1e6, 3 * rx_state->handshake_rtt) < get_nsecs()) {
-			// Transmission timed out
-			exit_with_error(ETIMEDOUT);
-		}
 		rx_send_acks(sockfd);
 		sleep_nsecs(ACK_RATE_TIME_MS * 1e6);
 	}
@@ -2043,13 +2009,14 @@ static void rx_trickle_acks(int sockfd)
 static void rx_send_path_nacks(int sockfd, struct receiver_state_per_path *path_state, u8 path_idx)
 {
 	struct hercules_path path;
-	if(!rx_get_reply_path(&path)) {
+	struct hercules_path_header path_header;
+	if(!rx_get_reply_path(&path, &path_header)) {
 		debug_printf("no reply path");
 		return;
 	}
 
 	char buf[ether_size];
-	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
+	void *rbudp_pkt = mempcpy(buf, path.headers[0].header, path.headerlen);
 
 	// XXX: could write ack payload directly to buf, but
 	// doesnt work nicely with existing fill_rbudp_pkt helper.
@@ -2066,7 +2033,7 @@ static void rx_send_path_nacks(int sockfd, struct receiver_state_per_path *path_
 		nack_end = control_pkt.payload.ack.acks[control_pkt.payload.ack.num_acks - 1].end;
 		fill_rbudp_pkt(rbudp_pkt, UINT_MAX, path_idx, 0, (char *) &control_pkt,
 					   sizeof(control_pkt.type) + ack__len(&control_pkt.payload.ack), path.payloadlen);
-		stitch_checksum(&path, path.header.checksum, buf);
+		stitch_checksum(&path, path.headers[0].checksum, buf);
 
 		send_eth_frame(sockfd, buf, path.framelen);
 		atomic_fetch_add(&tx_npkts, 1);
@@ -2194,7 +2161,7 @@ static void xsk_map__add_xsk(xskmap map, int index, struct xsk_socket_info *xsk)
 /*
  * Load a BPF program redirecting IP traffic to the XSK.
  */
-static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[], int num_sockets)
+static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[])
 {
 	struct bpf_object *obj;
 	int prog_fd = load_bpf(bpf_prgm_redirect_userspace, bpf_prgm_redirect_userspace_size, &obj);
@@ -2205,27 +2172,34 @@ static void load_xsk_redirect_userspace(struct xsk_socket_info *xsks[], int num_
 	// push XSKs
 	int xsks_map_fd = bpf_object__find_map_fd_by_name(obj, "xsks_map");
 	if(xsks_map_fd < 0) {
+		debug_printf("Note that the BPF program assumes a maximum number of 256 queues on the NIC.");
 		exit_with_error(-xsks_map_fd);
 	}
-	for(int i = 0; i < num_sockets; i++) {
-		xsk_map__add_xsk(xsks_map_fd, i, xsks[i]);
+	for(int q = 0; q < num_queues; q++) {
+		xsk_map__add_xsk(xsks_map_fd, queues[q], xsks[q]);
 	}
 
-	// push XSKs meta
-	int zero = 0;
-	int num_xsks_fd = bpf_object__find_map_fd_by_name(obj, "num_xsks");
-	if(num_xsks_fd < 0) {
-		exit_with_error(-num_xsks_fd);
+	// push local addresses
+	int ips_fd = bpf_object__find_map_fd_by_name(obj, "local_addrs");
+	if(ips_fd < 0) {
+		exit_with_error(-ips_fd);
 	}
-	bpf_map_update_elem(num_xsks_fd, &zero, &num_sockets, 0);
-
-	// push local address
-	int local_addr_fd = bpf_object__find_map_fd_by_name(obj, "local_addr");
-	if(local_addr_fd < 0) {
-		exit_with_error(-local_addr_fd);
+	int ports_fd = bpf_object__find_map_fd_by_name(obj, "local_ports");
+	if(ports_fd < 0) {
+		exit_with_error(-ips_fd);
 	}
-	bpf_map_update_elem(local_addr_fd, &zero, &local_addr, 0);
+	for(int a = 0; a < num_local_addrs; a++) {
+		bpf_map_update_elem(ips_fd, &local_addrs[a].ip, &a, 0);
+		bpf_map_update_elem(ports_fd, &a, &local_addrs[a].port, 0);
+	}
 
+	// push local_ia
+	int ia_fd = bpf_object__find_map_fd_by_name(obj, "local_ia");
+	if(ia_fd < 0) {
+		exit_with_error(-ia_fd);
+	}
+	u32 key = 0;
+	bpf_map_update_elem(ia_fd, &key, &local_ia, 0);
 	set_bpf_prgm_active(prog_fd);
 }
 
@@ -2237,7 +2211,8 @@ static void *tx_p(__attribute__ ((unused)) void *arg)
 	return NULL;
 }
 
-void hercules_init(int ifindex, const struct hercules_app_addr local_addr_, int queue_, int mtu)
+void hercules_init(int ifindex, const ia local_ia_, const struct local_addr *local_addrs_, int num_local_addrs_,
+				   int queues_[], int num_queues_, int mtu)
 {
 	if(HERCULES_MAX_HEADERLEN + sizeof(struct rbudp_initial_pkt) + rbudp_headerlen > (size_t)mtu) {
 		printf("MTU too small (min: %lu, given: %d)",
@@ -2246,16 +2221,29 @@ void hercules_init(int ifindex, const struct hercules_app_addr local_addr_, int 
 		);
 		exit_with_error(EINVAL);
 	}
+	if(MAX_NUM_LOCAL_ADDRS <num_local_addrs_) {
+		printf("Too many local addresses: %d provided, only up to %d supported", num_local_addrs_, MAX_NUM_LOCAL_ADDRS);
+		exit_with_error(EINVAL);
+	}
 
 	ether_size = mtu;
-	queue = queue_;
+	num_queues = num_queues_;
+	queues = calloc(num_queues, sizeof(*queues));
+	memcpy(queues, queues_, sizeof(*queues) * num_queues);
 	opt_ifindex = ifindex;
 
 	if_indextoname(ifindex, opt_ifname);
 	opt_ifname[IFNAMSIZ - 1] = '\0';
 
-	local_addr = local_addr_;
-	debug_printf("ifindex: %i, queue %i", opt_ifindex, queue);
+	local_ia = local_ia_;
+	num_local_addrs = num_local_addrs_;
+	local_addrs = calloc(num_local_addrs_, sizeof(*local_addrs));
+	memcpy(local_addrs, local_addrs_, sizeof(*local_addrs) * num_local_addrs);
+
+	debug_printf("ifindex: %i", opt_ifindex);
+	for(int q = 0; q < num_queues; q++) {
+		debug_printf("enabling queue %d", queues[q]);
+	}
 
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
 	setlocale(LC_ALL, "");
@@ -2347,9 +2335,9 @@ static void join_thread(pthread_t pt)
 }
 
 struct hercules_stats
-hercules_tx(const char *filename, const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest,
-			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode,
-			int num_threads)
+hercules_tx(const char *filename, int offset, int length,
+			const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest,
+			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode)
 {
 	// Open mmaped send file
 	int f = open(filename, O_RDONLY);
@@ -2362,9 +2350,15 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	if(ret) {
 		exit_with_error(errno);
 	}
-	const size_t filesize = stat.st_size;
+	const size_t filesize = length == -1 ? stat.st_size : length;
+	offset = offset < 0 ? 0 : offset;
 
-	char *mem = mmap(NULL, filesize, PROT_READ, MAP_PRIVATE | MAP_POPULATE, f, 0);
+	if (offset + filesize > (size_t)stat.st_size) {
+		fprintf(stderr, "ERR: offset + length > filesize. Out of bounds\n");
+		exit_with_error(EINVAL);
+	}
+
+	char *mem = mmap(NULL, filesize, PROT_READ, MAP_PRIVATE | MAP_POPULATE, f, offset);
 	if(mem == MAP_FAILED) {
 		fprintf(stderr, "ERR: memory mapping failed\n");
 		exit_with_error(errno);
@@ -2422,15 +2416,13 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 
 	init_send_queue(&send_queue, BATCH_SIZE);
 
-	pthread_t senders[num_threads];
-	struct xsk_socket_info *xsks[num_threads];
-	tx_state->umem = create_umem();
-	for(int t = 0; t < num_threads; t++) {
-		xsks[t] = xsk_configure_socket(tx_state->umem, XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queue, xdp_mode);
-		senders[t] = start_thread(tx_send_p, xsks[t]);
+	pthread_t senders[num_queues];
+	struct xsk_socket_info *xsks[num_queues];
+	for(int q = 0; q < num_queues; q++) {
+		xsks[q] = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queues[q], xdp_mode);
+		senders[q] = start_thread(tx_send_p, xsks[q]);
+		submit_initial_rx_frames(xsks[q]->umem);
 	}
-	submit_initial_tx_frames(tx_state->umem);
-	submit_initial_rx_frames(tx_state->umem);
 
 	tx_state->start_time = get_nsecs();
 	running = true;
@@ -2442,12 +2434,10 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	running = false;
 	join_thread(worker);
 
-	remove_xdp_program();
-	for(int t = 0; t < num_threads; t++) {
-		join_thread(senders[t]);
-		close_xsk(xsks[t]);
+	for(int q = 0; q < num_queues; q++) {
+		join_thread(senders[q]);
+		close_xsk(xsks[q]);
 	}
-	destroy_umem(tx_state->umem);
 	destroy_send_queue(&send_queue);
 
 	struct hercules_stats stats = tx_stats(tx_state);
@@ -2463,8 +2453,7 @@ hercules_tx(const char *filename, const struct hercules_app_addr *destinations, 
 	return stats;
 }
 
-struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues, int accept_timeout,
-								  int num_threads)
+struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues)
 {
 	// Open RAW socket to receive and send control messages on
 	// Note: this socket will not receive any packets once the XSK has been
@@ -2474,8 +2463,8 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 		exit_with_error(errno);
 	}
 
-	if(!rx_accept(sockfd, accept_timeout)) {
-		exit_with_error(ETIMEDOUT);
+	if(!rx_accept(sockfd)) {
+		exit_with_error(EBADMSG);
 	}
 	pthread_t rtt_estimator;
 	if(configure_queues) {
@@ -2491,21 +2480,21 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 	join_thread(rtt_estimator);
 	debug_printf("cts_rtt: %fs", rx_state->handshake_rtt / 1e6);
 
-	struct xsk_socket_info *xsks[num_threads];
-	struct xsk_umem_info *umem = create_umem();
-	for(int t = 0; t < num_threads; t++) {
-		xsks[t] = xsk_configure_socket(umem, XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queue, xdp_mode);
+	struct xsk_socket_info *xsks[num_queues];
+	for(int q = 0; q < num_queues; q++) {
+		struct xsk_socket_info *xsk = create_xsk_with_umem(XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, queues[q], xdp_mode);
+		xsks[q] = xsk;
+		submit_initial_rx_frames(xsk->umem);
 	}
-	submit_initial_rx_frames(umem);
 
-	load_xsk_redirect_userspace(xsks, num_threads);
+	load_xsk_redirect_userspace(xsks);
 
 	rx_state->start_time = get_nsecs();
 	running = true;
 
-	pthread_t worker[num_threads];
-	for(int t = 0; t < num_threads; t++) {
-		worker[t] = start_thread(rx_p, xsks[t]);
+	pthread_t worker[num_queues];
+	for(int q = 0; q < num_queues; q++) {
+		worker[q] = start_thread(rx_p, xsks[q]);
 	}
 
 	rx_send_cts_ack(sockfd); // send Clear To Send ACK
@@ -2517,18 +2506,16 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 	running = false;
 
 	join_thread(trickle_pcc);
-	for(int q = 0; q < num_threads; q++) {
+	for(int q = 0; q < num_queues; q++) {
 		join_thread(worker[q]);
 	}
 
 	struct hercules_stats stats = rx_stats(rx_state);
 
-	unconfigure_queue();
-	remove_xdp_program();
-	for(int t = 0; t < num_threads; t++) {
-		close_xsk(xsks[t]);
+	unconfigure_queues();
+	for(int q = 0; q < num_queues; q++) {
+		close_xsk(xsks[q]);
 	}
-	destroy_umem(umem);
 	bitset__destroy(&rx_state->received_chunks);
 	free(rx_state);
 	close(sockfd);
@@ -2539,5 +2526,5 @@ void hercules_close()
 {
 	// Only essential cleanup.
 	remove_xdp_program();
-	unconfigure_queue();
+	unconfigure_queues();
 }

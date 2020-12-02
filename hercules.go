@@ -18,14 +18,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/BurntSushi/toml"
-	log "github.com/inconshreveable/log15"
-	"github.com/scionproto/scion/go/lib/snet"
 	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"time"
+
+	"github.com/BurntSushi/toml"
+	log "github.com/inconshreveable/log15"
+	"github.com/scionproto/scion/go/lib/snet"
 )
 
 type arrayFlags []string
@@ -34,18 +35,18 @@ type Flags struct {
 	dumpInterval     time.Duration
 	enablePCC        bool
 	ifname           string
-	localAddr        string
+	localAddrs       arrayFlags
 	maxRateLimit     int
 	mode             string
 	mtu              int
-	queue            int
-	numThreads       int
+	queueArgs        arrayFlags
 	remoteAddrs      arrayFlags
 	transmitFilename string
+	fileOffset       int
+	fileLength       int
 	outputFilename   string
 	verbose          string
 	numPaths         int
-	acceptTimeout    int
 }
 
 const (
@@ -96,19 +97,19 @@ func realMain() error {
 	flag.DurationVar(&flags.dumpInterval, "n", time.Second, "Print stats at given interval")
 	flag.BoolVar(&flags.enablePCC, "pcc", true, "Enable performance-oriented congestion control (PCC)")
 	flag.StringVar(&flags.ifname, "i", "", "interface")
-	flag.StringVar(&flags.localAddr, "l", "", "local address")
+	flag.Var(&flags.localAddrs, "l", "local address")
 	flag.IntVar(&flags.maxRateLimit, "p", 3333333, "Maximum allowed send rate in Packets per Second (default: 3'333'333, ~40Gbps)")
 	flag.StringVar(&flags.mode, "m", "", "XDP socket bind mode (Zero copy: z; Copy mode: c)")
-	flag.IntVar(&flags.queue, "q", 0, "Use queue n")
-	flag.IntVar(&flags.numThreads, "nt", 0, "Maximum number of worker threads to use")
+	flag.Var(&flags.queueArgs, "q", "Use queue n (specify a separate queue for each worker thread; default is one worker on queue 0)")
 	flag.Var(&flags.remoteAddrs, "d", "destination host address(es); omit the ia part of the address to add a receiver IP to the previous destination")
 	flag.StringVar(&flags.transmitFilename, "t", "", "transmit file (sender)")
+	flag.IntVar(&flags.fileOffset, "foffset", -1, "file offset")
+	flag.IntVar(&flags.fileLength, "flength", -1, "file length (needed if you specify an offset)")
 	flag.StringVar(&flags.outputFilename, "o", "", "output file (receiver)")
 	flag.StringVar(&flags.verbose, "v", "", "verbose output (from '' to vv)")
 	flag.IntVar(&flags.numPaths, "np", 1, "Maximum number of different paths per destination to use at the same time")
 	flag.StringVar(&configFile, "c", "", "File to parse configuration from, you may overwrite any configuration using command line arguemnts")
 	flag.IntVar(&flags.mtu, "mtu", 0, "Set the frame size to use")
-	flag.IntVar(&flags.acceptTimeout, "timeout", 0, "Abort accepting connections after this timeout (seconds)")
 	flag.BoolVar(&version, "version", false, "Output version and exit")
 	flag.Parse()
 
@@ -249,7 +250,7 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 	}
 
 	pm.choosePaths()
-	herculesInit(iface, localAddress, config.Queue, config.MTU)
+	herculesInit(iface, localAddress.IA, []*net.UDPAddr{localAddress.Host}, config.Queues, config.MTU)
 	pm.pushPaths()
 	if !pm.canSendToAllDests() {
 		return errors.New("some destinations are unreachable, abort")
@@ -259,7 +260,8 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 	go pm.syncPathsToC()
 	go statsDumper(true, config.DumpInterval, &aggregateStats)
 	go cleanupOnSignal()
-	stats := herculesTx(config.TransmitFile, destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode(), config.NumThreads)
+	stats := herculesTx(config.TransmitFile, config.FileOffset, config.FileLength,
+		destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode())
 	printSummary(stats, aggregateStats)
 	return nil
 }
@@ -269,13 +271,13 @@ func mainRx(config *HerculesReceiverConfig) error {
 	// since config is valid, there can be no errors here:
 	etherLen = config.MTU
 	iface, _ := net.InterfaceByName(config.Interface)
-	localAddr, _ := snet.ParseUDPAddr(config.LocalAddress)
+	localAddresses := config.localAddresses()
 
-	herculesInit(iface, localAddr, config.Queue, config.MTU)
+	herculesInit(iface, config.LocalAddresses.IA, localAddresses, config.Queues, config.MTU)
 	aggregateStats := aggregateStats{}
 	go statsDumper(false, config.DumpInterval, &aggregateStats)
 	go cleanupOnSignal()
-	stats := herculesRx(config.OutputFile, config.getXDPMode(), config.NumThreads, config.ConfigureQueues, config.AcceptTimeout)
+	stats := herculesRx(config.OutputFile, config.getXDPMode(), config.ConfigureQueues)
 	printSummary(stats, aggregateStats)
 	return nil
 }

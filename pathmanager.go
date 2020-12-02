@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/pathmgr"
 	"github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/snet"
@@ -24,9 +25,10 @@ import (
 )
 
 type Destination struct {
-	hostAddr *snet.UDPAddr
-	pathSpec *[]PathSpec
-	numPaths int
+	ia        addr.IA
+	hostAddrs []*net.UDPAddr
+	pathSpec  *[]PathSpec
+	numPaths  int
 }
 
 type PathManager struct {
@@ -57,17 +59,17 @@ func initNewPathManager(iface *net.Interface, dsts []*Destination, src *snet.UDP
 
 	numPathsPerDst := 0
 	pm := &PathManager{
-		iface:         iface,
-		src:           src,
-		dsts:          make([]*PathsToDestination, 0, len(dsts)),
-		syncTime:      time.Unix(0, 0),
-		maxBps:        maxBps,
-		pathResolver:  pathmgr.New(sciondConn, pathmgr.Timers{}, uint16(numPathsResolved)),
+		iface:        iface,
+		src:          src,
+		dsts:         make([]*PathsToDestination, 0, len(dsts)),
+		syncTime:     time.Unix(0, 0),
+		maxBps:       maxBps,
+		pathResolver: pathmgr.New(sciondConn, pathmgr.Timers{}, uint16(numPathsResolved)),
 	}
 
 	for _, dst := range dsts {
 		var dstState *PathsToDestination
-		if src.IA == dst.hostAddr.IA {
+		if src.IA == dst.ia {
 			dstState = initNewPathsToDestinationWithEmptyPath(pm, dst)
 		} else {
 			dstState, err = initNewPathsToDestination(pm, src, dst)

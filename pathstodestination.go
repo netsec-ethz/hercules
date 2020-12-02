@@ -51,17 +51,17 @@ type HerculesPathHeader struct {
 
 func initNewPathsToDestinationWithEmptyPath(pm *PathManager, dst *Destination) *PathsToDestination {
 	return &PathsToDestination{
-		pm:  pm,
-		dst: dst,
-		sp:  nil,
-		paths: nil,
+		pm:         pm,
+		dst:        dst,
+		sp:         nil,
+		paths:      nil,
 		modifyTime: time.Now(),
 	}
 }
 
 func initNewPathsToDestination(pm *PathManager, src *snet.UDPAddr, dst *Destination) (*PathsToDestination, error) {
 	// monitor path changes
-	sp, err := pm.pathResolver.Watch(context.Background(), src.IA, dst.hostAddr.IA)
+	sp, err := pm.pathResolver.Watch(context.Background(), src.IA, dst.ia)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +102,7 @@ func (pwd *PathsToDestination) choosePaths() bool {
 
 	availablePaths := pathData.APS
 	if len(availablePaths) == 0 {
-		log.Error(fmt.Sprintf("no paths to destination %s", pwd.dst.hostAddr.IA.String()))
+		log.Error(fmt.Sprintf("no paths to destination %s", pwd.dst.ia.String()))
 	}
 
 	previousPathAvailable := make([]bool, pwd.dst.numPaths)
@@ -132,7 +132,7 @@ func (pwd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool
 			pathMeta := &pwd.paths[i]
 			if newFingerprint == pathMeta.fingerprint {
 				if !pathMeta.enabled {
-					log.Info(fmt.Sprintf("[Destination %s] re-enabling path %d\n", pwd.dst.hostAddr.IA, i))
+					log.Info(fmt.Sprintf("[Destination %s] re-enabling path %d\n", pwd.dst.ia, i))
 					pathMeta.enabled = true
 					updated = true
 				}
@@ -149,7 +149,7 @@ func (pwd *PathsToDestination) disableVanishedPaths(previousPathAvailable *[]boo
 	for i, inUse := range *previousPathAvailable {
 		pathMeta := &pwd.paths[i]
 		if inUse == false && pathMeta.enabled {
-			log.Info(fmt.Sprintf("[Destination %s] disabling path %d\n", pwd.dst.hostAddr.IA, i))
+			log.Info(fmt.Sprintf("[Destination %s] disabling path %d\n", pwd.dst.ia, i))
 			pathMeta.enabled = false
 			updated = true
 		}
@@ -192,7 +192,7 @@ func (pwd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, ava
 		}
 	}
 
-	log.Info(fmt.Sprintf("[Destination %s] using %d paths:", pwd.dst.hostAddr.IA, len(pathSet)))
+	log.Info(fmt.Sprintf("[Destination %s] using %d paths:", pwd.dst.ia, len(pathSet)))
 	for i, path := range pathSet {
 		log.Info(fmt.Sprintf("\t%s", path))
 		pwd.paths[i].path = path
@@ -204,29 +204,36 @@ func (pwd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, ava
 	return updated
 }
 
-func (pwd *PathsToDestination) preparePath(p *snet.Path) (*HerculesPathHeader, error) {
+func (pwd *PathsToDestination) preparePath(p *snet.Path) ([]*HerculesPathHeader, error) {
 	var err error
-	curDst := pwd.dst.hostAddr
-	if *p == nil {
-		// in order to use a static empty path, we need to set the next hop on dst
-		curDst.NextHop = &net.UDPAddr{
-			IP:   pwd.dst.hostAddr.Host.IP,
-			Port: topology.EndhostPort,
+	paths := make([]*HerculesPathHeader, len(pwd.dst.hostAddrs))
+	for i, addr := range pwd.dst.hostAddrs {
+		curDst := &snet.UDPAddr{
+			IA:   pwd.dst.ia,
+			Host: addr,
 		}
-	} else {
-		curDst.Path = (*p).Path()
-		if curDst.Path != nil {
-			if err = curDst.Path.InitOffsets(); err != nil {
-				return nil, err
+		if *p == nil {
+			// in order to use a static empty path, we need to set the next hop on dst
+			curDst.NextHop = &net.UDPAddr{
+				IP:   addr.IP,
+				Port: topology.EndhostPort,
 			}
+		} else {
+			curDst.Path = (*p).Path()
+			if curDst.Path != nil {
+				if err = curDst.Path.InitOffsets(); err != nil {
+					return nil, err
+				}
+			}
+
+			curDst.NextHop = (*p).OverlayNextHop()
 		}
 
-		curDst.NextHop = (*p).OverlayNextHop()
+		path, err := prepareSCIONPacketHeader(pwd.pm.src, curDst, pwd.pm.iface)
+		if err != nil {
+			return nil, err
+		}
+		paths[i] = path
 	}
-
-	path, err := prepareSCIONPacketHeader(pwd.pm.src, curDst, pwd.pm.iface)
-	if err != nil {
-		return nil, err
-	}
-	return path, nil
+	return paths, nil
 }
