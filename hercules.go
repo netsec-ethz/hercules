@@ -35,11 +35,12 @@ type Flags struct {
 	dumpInterval     time.Duration
 	enablePCC        bool
 	ifname           string
-	localAddrs       arrayFlags
+	localAddr        string
 	maxRateLimit     int
 	mode             string
 	mtu              int
-	queueArgs        arrayFlags
+	queue            int
+	numThreads       int
 	remoteAddrs      arrayFlags
 	transmitFilename string
 	fileOffset       int
@@ -98,10 +99,11 @@ func realMain() error {
 	flag.DurationVar(&flags.dumpInterval, "n", time.Second, "Print stats at given interval")
 	flag.BoolVar(&flags.enablePCC, "pcc", true, "Enable performance-oriented congestion control (PCC)")
 	flag.StringVar(&flags.ifname, "i", "", "interface")
-	flag.Var(&flags.localAddrs, "l", "local address")
+	flag.StringVar(&flags.localAddr, "l", "", "local address")
 	flag.IntVar(&flags.maxRateLimit, "p", 3333333, "Maximum allowed send rate in Packets per Second (default: 3'333'333, ~40Gbps)")
 	flag.StringVar(&flags.mode, "m", "", "XDP socket bind mode (Zero copy: z; Copy mode: c)")
-	flag.Var(&flags.queueArgs, "q", "Use queue n (specify a separate queue for each worker thread; default is one worker on queue 0)")
+	flag.IntVar(&flags.queue, "q", 0, "Use queue n")
+	flag.IntVar(&flags.numThreads, "nt", 0, "Maximum number of worker threads to use")
 	flag.Var(&flags.remoteAddrs, "d", "destination host address(es); omit the ia part of the address to add a receiver IP to the previous destination")
 	flag.StringVar(&flags.transmitFilename, "t", "", "transmit file (sender)")
 	flag.IntVar(&flags.fileOffset, "foffset", -1, "file offset")
@@ -252,7 +254,7 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 	}
 
 	pm.choosePaths()
-	herculesInit(iface, localAddress.IA, []*net.UDPAddr{localAddress.Host}, config.Queues, config.MTU)
+	herculesInit(iface, localAddress, config.Queue, config.MTU)
 	pm.pushPaths()
 	if !pm.canSendToAllDests() {
 		return errors.New("some destinations are unreachable, abort")
@@ -263,7 +265,8 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 	go statsDumper(true, config.DumpInterval, &aggregateStats)
 	go cleanupOnSignal()
 	stats := herculesTx(config.TransmitFile, config.FileOffset, config.FileLength,
-		destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode())
+		                destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode(),
+		                config.NumThreads)
 	printSummary(stats, aggregateStats)
 	return nil
 }
@@ -273,13 +276,13 @@ func mainRx(config *HerculesReceiverConfig) error {
 	// since config is valid, there can be no errors here:
 	etherLen = config.MTU
 	iface, _ := net.InterfaceByName(config.Interface)
-	localAddresses := config.localAddresses()
+	localAddr, _ := snet.ParseUDPAddr(config.LocalAddress)
 
-	herculesInit(iface, config.LocalAddresses.IA, localAddresses, config.Queues, config.MTU)
+	herculesInit(iface, localAddr, config.Queue, config.MTU)
 	aggregateStats := aggregateStats{}
 	go statsDumper(false, config.DumpInterval, &aggregateStats)
 	go cleanupOnSignal()
-	stats := herculesRx(config.OutputFile, config.getXDPMode(), config.ConfigureQueues, config.AcceptTimeout)
+	stats := herculesRx(config.OutputFile, config.getXDPMode(), config.NumThreads, config.ConfigureQueues, config.AcceptTimeout)
 	printSummary(stats, aggregateStats)
 	return nil
 }

@@ -17,29 +17,25 @@ struct bpf_map_def SEC("maps") xsks_map = {
 		.type        = BPF_MAP_TYPE_XSKMAP,
 		.key_size    = sizeof(__u32),
 		.value_size  = sizeof(__u32),
-		.max_entries = MAX_NUM_QUEUES,
+		.max_entries = MAX_NUM_SOCKETS,
 };
 
-struct bpf_map_def SEC("maps") local_addrs = {
-		.type        = BPF_MAP_TYPE_HASH,
+struct bpf_map_def SEC("maps") num_xsks = {
+		.type        = BPF_MAP_TYPE_ARRAY,
 		.key_size    = sizeof(__u32),
 		.value_size  = sizeof(__u32),
-		.max_entries = MAX_NUM_LOCAL_ADDRS,
+		.max_entries = 2,
 };
 
-struct bpf_map_def SEC("maps") local_ports = {
+struct bpf_map_def SEC("maps") local_addr = {
 		.type        = BPF_MAP_TYPE_ARRAY,
 		.key_size    = sizeof(__u32),
-		.value_size  = sizeof(__u16),
-		.max_entries = MAX_NUM_LOCAL_ADDRS,
-};
-
-struct bpf_map_def SEC("maps") local_ia = {
-		.type        = BPF_MAP_TYPE_ARRAY,
-		.key_size    = sizeof(__u32),
-		.value_size  = sizeof(__u64),
+		.value_size  = sizeof(struct hercules_app_addr),
 		.max_entries = 1,
 };
+
+static int redirect_count = 0;
+static __u32 zero = 0;
 
 SEC("xdp")
 int xdp_prog_redirect_userspace(struct xdp_md *ctx)
@@ -64,9 +60,14 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 		return XDP_PASS; // not UDP
 	}
 
+	// get listening address
+	struct hercules_app_addr *addr = bpf_map_lookup_elem(&local_addr, &zero);
+	if(addr == NULL) {
+		return XDP_PASS; // not listening
+	}
+
 	// check if IP address matches
-	__u32 *addr_idx = bpf_map_lookup_elem(&local_addrs, &iph->daddr);
-	if(addr_idx == NULL) {
+	if(iph->daddr != addr->ip) {
 		return XDP_PASS; // not addressed to us (IP address)
 	}
 
@@ -87,12 +88,10 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	}
 
 	const struct scionaddrhdr_ipv4 *scionaddrh = (const struct scionaddrhdr_ipv4 *) (scionh + 1);
-	__u32 zero = 0;
-	__u64 *ia = bpf_map_lookup_elem(&local_ia, &zero);
-	if(ia == NULL || scionaddrh->dst_ia != *ia) {
+	if(scionaddrh->dst_ia != addr->ia) {
 		return XDP_PASS; // not addressed to us (IA)
 	}
-	if(scionaddrh->dst_ip != iph->daddr) {
+	if(scionaddrh->dst_ip != addr->ip) {
 		return XDP_PASS; // not addressed to us (IP in SCION hdr)
 	}
 	offset += scionh->header_len * 8 - // Header length is in lineLen of 8 bytes
@@ -104,14 +103,20 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	if((void *) (l4udph + 1) > data_end) {
 		return XDP_PASS; // too short after all
 	}
-	__u16 *port = bpf_map_lookup_elem(&local_ports, addr_idx);
-	if(port == NULL || l4udph->dest != *port) {
+	if(l4udph->dest != addr->port) {
 		return XDP_PASS;
 	}
 
 	// write the payload offset to the first word, so that the user space program can continue from there.
 	*(__u32 *) data = offset;
-	return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, 0);
+
+	__u32 *_num_xsks = bpf_map_lookup_elem(&num_xsks, &zero);
+	if(_num_xsks == NULL) {
+		return XDP_PASS;
+	}
+	__sync_fetch_and_add(&redirect_count, 1);
+
+	return bpf_redirect_map(&xsks_map, (redirect_count) % (*_num_xsks), 0); // XXX distribute across multiple sockets, once available
 }
 
 char _license[] SEC("license") = "GPL";
