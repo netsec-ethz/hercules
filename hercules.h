@@ -100,6 +100,6 @@ hercules_tx(const char *filename, int offset, int length,
 			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode);
 
 // Initiate receiver, waiting for a transmitter to initiate the file transfer.
-struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues);
+struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues, int accept_timeout);
 
 #endif // __HERCULES_H__

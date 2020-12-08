@@ -1867,24 +1867,27 @@ rx_handle_initial(int sockfd, struct rbudp_initial_pkt *initial, const char *buf
 	rx_state->cts_sent_at = get_nsecs();
 }
 
-static bool rx_accept(int sockfd)
+static bool rx_accept(int sockfd, int timeout)
 {
 	char buf[ether_size];
-	while(true) { // Wait for well formed startup packet
+	__u64 start_wait = get_nsecs();
+	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
+	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+
+	// Wait for well formed startup packet
+	while(timeout == 0 || start_wait + timeout * 1e9 > get_nsecs()) {
 		const char *payload;
 		int payloadlen;
 		if(recv_rbudp_control_pkt(sockfd, buf, ether_size, &payload, &payloadlen, NULL, NULL, NULL)) {
 			struct rbudp_initial_pkt parsed_pkt;
 			if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
 				rx_state = make_rx_state(parsed_pkt.filesize, parsed_pkt.chunklen, sockfd);
-				if(!rx_state)
-					return false;
-
 				rx_handle_initial(sockfd, &parsed_pkt, buf, payload, payloadlen);
 				return true;
 			}
 		}
 	}
+	return false;
 }
 
 static void rx_get_rtt_estimate(void *arg)
@@ -2494,7 +2497,7 @@ hercules_tx(const char *filename, int offset, int length,
 	return stats;
 }
 
-struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues)
+struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues, int accept_timeout)
 {
 	// Open RAW socket to receive and send control messages on
 	// Note: this socket will not receive any packets once the XSK has been
@@ -2504,8 +2507,8 @@ struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool confi
 		exit_with_error(errno);
 	}
 
-	if(!rx_accept(sockfd)) {
-		exit_with_error(EBADMSG);
+	if(!rx_accept(sockfd, accept_timeout)) {
+		exit_with_error(ETIMEDOUT);
 	}
 	pthread_t rtt_estimator;
 	if(configure_queues) {

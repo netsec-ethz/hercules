@@ -53,6 +53,7 @@ type HerculesReceiverConfig struct {
 	OutputFile      string
 	LocalAddresses  SiteConfig
 	ConfigureQueues bool
+	AcceptTimeout   int
 }
 
 type HerculesSenderConfig struct {
@@ -87,6 +88,7 @@ func (config *HerculesReceiverConfig) initializeDefaults() {
 	config.OutputFile = ""
 	config.LocalAddresses = SiteConfig{}
 	config.ConfigureQueues = false
+	config.AcceptTimeout = 0
 }
 
 // Validates configuration parameters that have been provided, does not validate for presence of mandatory arguments.
@@ -218,6 +220,9 @@ func (config *HerculesReceiverConfig) mergeFlags(flags *Flags) error {
 	if isFlagPassed("o") {
 		config.OutputFile = flags.outputFilename
 	}
+	if isFlagPassed("timeout") {
+		config.AcceptTimeout = flags.acceptTimeout
+	}
 	return nil
 }
 
@@ -348,7 +353,7 @@ func (config *HerculesSenderConfig) validateStrict() error {
 
 // Merge commandline arguments into the current configuration.
 func (config *HerculesSenderConfig) mergeFlags(flags *Flags) error {
-	if err := forbidFlags([]string{"o"}, "sending"); err != nil {
+	if err := forbidFlags([]string{"o", "timeout"}, "sending"); err != nil {
 		return err
 	}
 	if err := config.HerculesGeneralConfig.mergeFlags(flags); err != nil {
