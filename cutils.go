@@ -60,19 +60,25 @@ const XDP_ZEROCOPY = C.XDP_ZEROCOPY
 const XDP_COPY = C.XDP_COPY
 const minFrameSize = int(C.HERCULES_MAX_HEADERLEN) + 213 // sizeof(struct rbudp_initial_pkt) + rbudp_headerlen
 
-func herculesInit(iface *net.Interface, local *snet.UDPAddr, queue int, MTU int) {
-	C.hercules_init(C.int(iface.Index), toCAddr(local), C.int(queue), C.int(MTU))
+func herculesInit(iface *net.Interface, ia addr.IA, local []*net.UDPAddr, queues []int, MTU int) {
+	localC := toCLocalAddrs(local)
+	queuesC := toCIntArray(queues)
+	iaC := toCIA(ia)
+
+	C.hercules_init(C.int(iface.Index), iaC, &localC[0], C.int(len(local)), &queuesC[0], C.int(len(queues)), C.int(MTU))
 	activeInterface = iface
 }
 
-func herculesTx(filename string, offset int, length int, destinations []*Destination, pm *PathManager, maxRateLimit int,
-				enablePCC bool, xdpMode int, numThreads int) herculesStats {
+func herculesTx(filename string, offset int, length int, destinations []*Destination, pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int) herculesStats {
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
 
 	cDests := make([]C.struct_hercules_app_addr, len(destinations))
 	for d, dest := range destinations {
-		cDests[d] = toCAddr(dest.hostAddr)
+		cDests[d].ia = toCIA(dest.ia)
+		localC := toCLocalAddrs(dest.hostAddrs)
+		cDests[d].ip = localC[0].ip
+		cDests[d].port = localC[0].port
 	}
 	return herculesStatsFromC(C.hercules_tx(
 		cFilename,
@@ -86,16 +92,13 @@ func herculesTx(filename string, offset int, length int, destinations []*Destina
 		C.int(maxRateLimit),
 		C.bool(enablePCC),
 		C.int(xdpMode),
-		C.int(numThreads),
 	))
 }
 
-func herculesRx(filename string, xdpMode int, numThreads int, configureQueues bool, acceptTimeout int) herculesStats {
+func herculesRx(filename string, xdpMode int, configureQueues bool, acceptTimeout int) herculesStats {
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
-	return herculesStatsFromC(
-		C.hercules_rx(cFilename, C.int(xdpMode), C.bool(configureQueues), C.int(acceptTimeout), C.int(numThreads)),
-	)
+	return herculesStatsFromC(C.hercules_rx(cFilename, C.int(xdpMode), C.bool(configureQueues), C.int(acceptTimeout)))
 }
 
 func herculesClose() {
@@ -140,7 +143,7 @@ func HerculesGetReplyPath(headerPtr unsafe.Pointer, length C.int, replyPathStruc
 		return 1
 	}
 	// path header memory is set up by C on the stack, no need to call allocateCPathHeaderMemory() here
-	toCPath(replyPath, replyPathStruct, false, false)
+	toCPath([]*HerculesPathHeader{replyPath}, replyPathStruct, false, false)
 	return 0
 }
 
@@ -213,34 +216,56 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPathHeader, 
 	return &herculesPath, nil
 }
 
+func allocateCPathHeaderMemory(from []*HerculesPathHeader, to *C.struct_hercules_path) {
+	C.allocate_path_headers(to, C.int(len(from)))
+}
+
 // Assumes that the path header memory has already been set up; call allocateCPathHeaderMemory before, if needed
-func toCPath(from *HerculesPathHeader, to *C.struct_hercules_path, replaced, enabled bool) {
-	headerLen := len(from.Header)
-	if len(from.Header) > C.HERCULES_MAX_HEADERLEN {
-		panic(fmt.Sprintf("Header too long (%d), can't invoke hercules C API.", len(from.Header)))
+func toCPath(from []*HerculesPathHeader, to *C.struct_hercules_path, replaced, enabled bool) {
+	if len(from) < 1 {
+		panic(fmt.Sprintf("No path versions available, can't invoke hercules C API."))
 	}
-	// XXX(matzf): is there a nicer way to do this?
-	C.memcpy(unsafe.Pointer(&to.header.header),
-		unsafe.Pointer(&from.Header[0]),
-		C.ulong(len(from.Header)))
-	to.header.checksum = C.ushort(from.PartialChecksum)
+	if len(from) > 255 {
+		panic(fmt.Sprintf("Too many header versions, can't invoke hercules C API."))
+	}
+
+	headerLen := len(from[0].Header)
+	headersC := uintptr(unsafe.Pointer(to.headers))
+	for i, header := range from {
+		if len(header.Header) > C.HERCULES_MAX_HEADERLEN {
+			panic(fmt.Sprintf("Header too long (%d), can't invoke hercules C API.", len(header.Header)))
+		}
+		if headerLen != len(header.Header) {
+			panic(fmt.Sprintf("Header versions not all of equal length, can't invoke hercules C API."))
+		}
+		// XXX(matzf): is there a nicer way to do this?
+		var headerCopy C.struct_hercules_path_header                  // accessing indices on a C array does not work, so we make a local copy...
+		curHeaderC := headersC + uintptr(i)*unsafe.Sizeof(headerCopy) // ... and implement the index logic ourselves
+		C.memcpy(unsafe.Pointer(&headerCopy.header),
+			unsafe.Pointer(&header.Header[0]),
+			C.ulong(len(header.Header)))
+		headerCopy.checksum = C.ushort(header.PartialChecksum)
+		C.memcpy(unsafe.Pointer(curHeaderC), unsafe.Pointer(&headerCopy), C.ulong(unsafe.Sizeof(headerCopy)))
+	}
+
 	to.headerlen = C.int(headerLen)
 	to.payloadlen = C.int(etherLen - headerLen) // TODO(matzf): take actual MTU into account, also when building header
 	to.framelen = C.int(etherLen)               // TODO(matzf): "
+	to.num_headers = C.__u8(len(from))
 	to.replaced = C.atomic_bool(replaced)
 	to.enabled = C.atomic_bool(enabled)
 }
 
-func toCAddr(addr *snet.UDPAddr) C.struct_hercules_app_addr {
-	out := C.struct_hercules_app_addr{}
-	bufIA := toCIA(addr.IA)
-	bufIP := addr.Host.IP.To4()
-	bufPort := make([]byte, 2)
-	binary.BigEndian.PutUint16(bufPort, uint16(addr.Host.Port))
+func toCLocalAddrs(addrs []*net.UDPAddr) []C.struct_local_addr {
+	out := make([]C.struct_local_addr, len(addrs))
+	for i, in := range addrs {
+		bufIP := in.IP.To4()
+		bufPort := make([]byte, 2)
+		binary.BigEndian.PutUint16(bufPort, uint16(in.Port))
 
-	C.memcpy(unsafe.Pointer(&out.ia), unsafe.Pointer(&bufIA), C.sizeof_ia)
-	C.memcpy(unsafe.Pointer(&out.ip), unsafe.Pointer(&bufIP[0]), 4)
-	C.memcpy(unsafe.Pointer(&out.port), unsafe.Pointer(&bufPort[0]), 2)
+		C.memcpy(unsafe.Pointer(&out[i].ip), unsafe.Pointer(&bufIP[0]), 4)
+		C.memcpy(unsafe.Pointer(&out[i].port), unsafe.Pointer(&bufPort[0]), 2)
+	}
 	return out
 }
 
@@ -354,7 +379,7 @@ func prepareOverlayPacketHeader(srcIP, dstIP net.IP, dstPort uint16, iface *net.
 		return nil, err
 	}
 
-	// return only the header
+	// return only the headers
 	return buf.Bytes()[:ethHeader+ipHeader+udpHeader], nil
 }
 
@@ -485,7 +510,7 @@ func (pm *PathManager) pushPaths() {
 	defer C.free_path_lock()
 	syncTime := time.Now()
 
-	// prepare and copy header to C
+	// prepare and copy headers to C
 	for d, dst := range pm.dsts {
 		if pm.syncTime.After(dst.modifyTime) {
 			continue
@@ -529,6 +554,7 @@ func (pwd *PathsToDestination) pushPath(path *PathMeta, slot int) bool {
 			pwd.pm.cStruct.pathsPerDest[slot].enabled = false
 			return false
 		}
+		allocateCPathHeaderMemory(herculesPath, &pwd.pm.cStruct.pathsPerDest[slot])
 		toCPath(herculesPath, &pwd.pm.cStruct.pathsPerDest[slot], true, path.enabled)
 	} else {
 		pwd.pm.cStruct.pathsPerDest[slot].enabled = C.atomic_bool(path.enabled)

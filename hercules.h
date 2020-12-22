@@ -19,7 +19,8 @@
 #include <stdatomic.h>
 #include <linux/types.h>
 
-#define MAX_NUM_SOCKETS 256
+#define MAX_NUM_QUEUES 256
+#define MAX_NUM_LOCAL_ADDRS 256
 #define HERCULES_MAX_HEADERLEN 256
 
 struct hercules_path_header {
@@ -33,7 +34,8 @@ struct hercules_path {
 	int headerlen;
 	int payloadlen;
 	int framelen;	//!< length of ethernet frame; headerlen + payloadlen
-	struct hercules_path_header header;
+	struct hercules_path_header *headers; //!< separate header for each destination IP address
+	__u8 num_headers; //!< number of different versions available for this path (i.e. different destination host IP addresses)
 	atomic_bool enabled; // e.g. when a path has been revoked and no replacement is available, this will be set to false
 	atomic_bool replaced;
 };
@@ -56,7 +58,8 @@ struct local_addr { // local as in "relative to the local IA"
 typedef __u64 ia;
 
 
-void hercules_init(int ifindex, struct hercules_app_addr local_addr, int queue, int mtu);
+void hercules_init(int ifindex, ia ia, const struct local_addr *local_addrs, int num_local_addrs, int queues[],
+				   int num_queues, int mtu);
 void hercules_close();
 
 struct hercules_stats {
@@ -92,12 +95,11 @@ void free_path_lock(void);
 // Does not take ownership of `paths`.
 // Retur
 struct hercules_stats
-hercules_tx(const char *filename, int offset, int length, const struct hercules_app_addr *destinations,
-            struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths,
-            int max_rate_limit, bool enable_pcc, int xdp_mode, int num_threads);
+hercules_tx(const char *filename, int offset, int length,
+			const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest,
+			int num_dests, const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode);
 
 // Initiate receiver, waiting for a transmitter to initiate the file transfer.
-struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues, int accept_timeout,
-								  int num_threads);
+struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues, int accept_timeout);
 
 #endif // __HERCULES_H__

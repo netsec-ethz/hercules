@@ -25,8 +25,6 @@ typedef __u32 u32;
 typedef __u16 u16;
 typedef __u8 u8;
 
-#undef NDEBUG
-
 #ifndef NDEBUG
 #define debug_printf(fmt, ...) printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
 #else
@@ -36,16 +34,6 @@ typedef __u8 u8;
 #ifndef likely
 # define likely(x)              __builtin_expect(!!(x), 1)
 #endif
-
-inline u16 umin16(u16 a, u16 b)
-{
-	return (a < b) ? a : b;
-}
-
-inline u16 umax16(u16 a, u16 b)
-{
-	return (a > b) ? a : b;
-}
 
 inline u32 umin32(u32 a, u32 b)
 {
