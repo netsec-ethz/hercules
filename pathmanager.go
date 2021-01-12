@@ -104,11 +104,11 @@ func (pm *PathManager) choosePaths() bool {
 	return updated
 }
 
-func (pm *PathManager) syncPathsToC() {
+func (pm *PathManager) syncPathsToC(session *HerculesSession) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	for range ticker.C {
 		if pm.choosePaths() {
-			pm.pushPaths()
+			pm.pushPaths(session)
 		}
 	}
 }

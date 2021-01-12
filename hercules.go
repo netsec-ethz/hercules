@@ -254,17 +254,14 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 	}
 
 	pm.choosePaths()
-	herculesInit(iface, localAddress, config.Queue, config.MTU)
-	pm.pushPaths()
+	session := herculesInit(iface, localAddress, config.Queue, config.MTU)
+	pm.pushPaths(session)
 	if !pm.canSendToAllDests() {
 		return errors.New("some destinations are unreachable, abort")
 	}
 
 	aggregateStats := aggregateStats{}
-	go pm.syncPathsToC()
-	go statsDumper(true, config.DumpInterval, &aggregateStats)
-	go cleanupOnSignal()
-	stats := herculesTx(config.TransmitFile, config.FileOffset, config.FileLength,
+	stats := herculesTx(session, config.TransmitFile, config.FileOffset, config.FileLength,
 		                destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode(),
 		                config.NumThreads)
 	printSummary(stats, aggregateStats)
@@ -278,20 +275,20 @@ func mainRx(config *HerculesReceiverConfig) error {
 	iface, _ := net.InterfaceByName(config.Interface)
 	localAddr, _ := snet.ParseUDPAddr(config.LocalAddress)
 
-	herculesInit(iface, localAddr, config.Queue, config.MTU)
+	session := herculesInit(iface, localAddr, config.Queue, config.MTU)
 	aggregateStats := aggregateStats{}
-	go statsDumper(false, config.DumpInterval, &aggregateStats)
-	go cleanupOnSignal()
-	stats := herculesRx(config.OutputFile, config.getXDPMode(), config.NumThreads, config.ConfigureQueues, config.AcceptTimeout)
+	go statsDumper(session, false, config.DumpInterval, &aggregateStats)
+	go cleanupOnSignal(session)
+	stats := herculesRx(session, config.OutputFile, config.getXDPMode(), config.NumThreads, config.ConfigureQueues, config.AcceptTimeout)
 	printSummary(stats, aggregateStats)
 	return nil
 }
 
-func cleanupOnSignal() {
+func cleanupOnSignal(session *HerculesSession) {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, os.Kill)
 	// Block until any signal is received.
 	<-c
-	herculesClose()
+	herculesClose(session)
 	os.Exit(128 + 15) // Customary exit code after SIGTERM
 }

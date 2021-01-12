@@ -27,6 +27,8 @@ struct hercules_path_header {
 	__u16  checksum;	//SCION L4 checksum over header with 0 payload
 };
 
+struct hercules_session;
+
 // Path are specified as ETH/IP/UDP/SCION/UDP headers.
 struct hercules_path {
 	__u64 next_handshake_at;
@@ -48,16 +50,11 @@ struct hercules_app_addr {
 	__u16 port;
 };
 
-struct local_addr { // local as in "relative to the local IA"
-	__u32 ip;
-	__u16 port;
-};
-
 typedef __u64 ia;
 
 
-void hercules_init(int ifindex, struct hercules_app_addr local_addr, int queue, int mtu);
-void hercules_close();
+struct hercules_session *hercules_init(int ifindex, struct hercules_app_addr local_addr, int queue, int mtu);
+void hercules_close(struct hercules_session *session);
 
 struct hercules_stats {
   __u64 start_time;
@@ -78,10 +75,10 @@ struct hercules_stats {
 
 // Get the current stats of a running transfer.
 // Returns stats with `start_time==0` if no transfer is active.
-struct hercules_stats hercules_get_stats();
+struct hercules_stats hercules_get_stats(struct hercules_session *session);
 
-void allocate_path_headers(struct hercules_path *path, int num_headers);
-void push_hercules_tx_paths(void);
+void allocate_path_headers(struct hercules_session *session, struct hercules_path *path, int num_headers);
+void push_hercules_tx_paths(struct hercules_session *session);
 
 // locks for working with the shared path memory
 void acquire_path_lock(void);
@@ -92,12 +89,12 @@ void free_path_lock(void);
 // Does not take ownership of `paths`.
 // Retur
 struct hercules_stats
-hercules_tx(const char *filename, int offset, int length, const struct hercules_app_addr *destinations,
-            struct hercules_path *paths_per_dest, int num_dests, const int *num_paths, int max_paths,
-            int max_rate_limit, bool enable_pcc, int xdp_mode, int num_threads);
+hercules_tx(struct hercules_session *session, const char *filename, int offset, int length,
+            const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest, int num_dests,
+            const int *num_paths, int max_paths, int max_rate_limit, bool enable_pcc, int xdp_mode, int num_threads);
 
 // Initiate receiver, waiting for a transmitter to initiate the file transfer.
-struct hercules_stats hercules_rx(const char *filename, int xdp_mode, bool configure_queues, int accept_timeout,
-								  int num_threads);
+struct hercules_stats hercules_rx(struct hercules_session *session, const char *filename, int xdp_mode,
+								  bool configure_queues, int accept_timeout, int num_threads);
 
 #endif // __HERCULES_H__

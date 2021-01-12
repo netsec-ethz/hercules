@@ -43,12 +43,12 @@ type aggregateStats struct {
 	maxBpsGood float64
 }
 
-func statsDumper(tx bool, interval time.Duration, aggregate *aggregateStats) {
+func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggregate *aggregateStats) {
 	if interval == 0 {
 		return
 	}
 
-	statsAwaitStart()
+	statsAwaitStart(session)
 
 	if tx {
 		fmt.Printf("\n%-6s %10s %10s %20s %20s %20s %11s %11s\n",
@@ -73,14 +73,14 @@ func statsDumper(tx bool, interval time.Duration, aggregate *aggregateStats) {
 		)
 	}
 
-	prevStats := herculesGetStats()
+	prevStats := herculesGetStats(session)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
 		select {
 		default:
-			stats := herculesGetStats()
+			stats := herculesGetStats(session)
 
 			// elapsed time in seconds
 			t := stats.now
@@ -155,9 +155,9 @@ func statsDumper(tx bool, interval time.Duration, aggregate *aggregateStats) {
 }
 
 // statsAwaitStart busy-waits until hercules_get_stats indicates that the transfer has started.
-func statsAwaitStart() {
+func statsAwaitStart(session *HerculesSession) {
 	for {
-		stats := herculesGetStats()
+		stats := herculesGetStats(session)
 		if stats.startTime > 0 {
 			return
 		}

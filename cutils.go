@@ -56,17 +56,27 @@ type layerWithOpts struct {
 	Opts  gopacket.SerializeOptions
 }
 
+type HerculesSession struct {
+	session *C.struct_hercules_session
+	iface *net.Interface
+}
+
+var herculesSession *HerculesSession
+
 const XDP_ZEROCOPY = C.XDP_ZEROCOPY
 const XDP_COPY = C.XDP_COPY
 const minFrameSize = int(C.HERCULES_MAX_HEADERLEN) + 213 // sizeof(struct rbudp_initial_pkt) + rbudp_headerlen
 
-func herculesInit(iface *net.Interface, local *snet.UDPAddr, queue int, MTU int) {
-	C.hercules_init(C.int(iface.Index), toCAddr(local), C.int(queue), C.int(MTU))
-	activeInterface = iface
+func herculesInit(iface *net.Interface, local *snet.UDPAddr, queue int, MTU int) *HerculesSession {
+	herculesSession = &HerculesSession{
+		session: C.hercules_init(C.int(iface.Index), toCAddr(local), C.int(queue), C.int(MTU)),
+		iface: iface,
+	}
+	return herculesSession
 }
 
-func herculesTx(filename string, offset int, length int, destinations []*Destination, pm *PathManager, maxRateLimit int,
-				enablePCC bool, xdpMode int, numThreads int) herculesStats {
+func herculesTx(session *HerculesSession, filename string, offset int, length int, destinations []*Destination,
+				pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int, numThreads int) herculesStats {
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
 
@@ -75,6 +85,7 @@ func herculesTx(filename string, offset int, length int, destinations []*Destina
 		cDests[d] = toCAddr(dest.hostAddr)
 	}
 	return herculesStatsFromC(C.hercules_tx(
+		session.session,
 		cFilename,
 		C.int(offset),
 		C.int(length),
@@ -90,20 +101,20 @@ func herculesTx(filename string, offset int, length int, destinations []*Destina
 	))
 }
 
-func herculesRx(filename string, xdpMode int, numThreads int, configureQueues bool, acceptTimeout int) herculesStats {
+func herculesRx(session *HerculesSession, filename string, xdpMode int, numThreads int, configureQueues bool, acceptTimeout int) herculesStats {
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
 	return herculesStatsFromC(
-		C.hercules_rx(cFilename, C.int(xdpMode), C.bool(configureQueues), C.int(acceptTimeout), C.int(numThreads)),
+		C.hercules_rx(session.session, cFilename, C.int(xdpMode), C.bool(configureQueues), C.int(acceptTimeout), C.int(numThreads)),
 	)
 }
 
-func herculesClose() {
-	C.hercules_close()
+func herculesClose(session *HerculesSession) {
+	C.hercules_close(session.session)
 }
 
-func herculesGetStats() herculesStats {
-	return herculesStatsFromC(C.hercules_get_stats())
+func herculesGetStats(session *HerculesSession) herculesStats {
+	return herculesStatsFromC(C.hercules_get_stats(session.session))
 }
 
 func herculesStatsFromC(stats C.struct_hercules_stats) herculesStats {
@@ -134,7 +145,7 @@ func (cpm *CPathManagement) initialize(numDestinations int, numPathsPerDestinati
 //export HerculesGetReplyPath
 func HerculesGetReplyPath(headerPtr unsafe.Pointer, length C.int, replyPathStruct *C.struct_hercules_path) C.int {
 	buf := C.GoBytes(headerPtr, length)
-	replyPath, err := getReplyPathHeader(buf, activeInterface)
+	replyPath, err := getReplyPathHeader(buf, herculesSession.iface)
 	if err != nil {
 		log.Debug("HerculesGetReplyPath", "err", err)
 		return 1
@@ -480,7 +491,7 @@ func sendICMP(iface *net.Interface, srcIP net.IP, dstIP net.IP) (err error) {
 }
 
 // TODO rewrite path pushing: prepare in Go buffers then have a single call where C fetches them
-func (pm *PathManager) pushPaths() {
+func (pm *PathManager) pushPaths(session *HerculesSession) {
 	C.acquire_path_lock()
 	defer C.free_path_lock()
 	syncTime := time.Now()
@@ -495,7 +506,7 @@ func (pm *PathManager) pushPaths() {
 	}
 
 	pm.syncTime = syncTime
-	C.push_hercules_tx_paths()
+	C.push_hercules_tx_paths(herculesSession.session)
 }
 
 // TODO move back to pathstodestination.go
