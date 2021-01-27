@@ -16,24 +16,42 @@
 #define HERCULES_SCION_H
 
 #define SCION_ENDHOST_PORT 30041
+#define SCION_HEADER_LINELEN 4
 
 #pragma pack(push)
 #pragma pack(1)
 
-// XXX: from libscion/packet.h
+// XXX this should work in practice, according to:
+// https://stackoverflow.com/questions/15442536/why-ip-header-variable-declarations-are-swapped-depending-on-byte-order
 struct scionhdr {
-	/** Packet Type of the packet (version, dstType, srcType) */
-	__u16 ver_dst_src;
-	/** Total Length of the packet */
-	__u16 total_len;
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+	unsigned int version: 4;
+	unsigned int qos: 8;
+	unsigned int flow_id: 20;
+#elif __BYTE_ORDER == __BIG_ENDIAN
+	unsigned int flow_id:20;
+	unsigned int qos:8;
+	unsigned int version:4;
+#else
+# error	"Please fix <packet.h>"
+#endif
+	/** Type of the next header */
+	__u8 next_header;
 	/** Header length that includes the path */
 	__u8 header_len;
-	/** Offset of current Info opaque field*/
-	__u8 current_iof;
-	/** Offset of current Hop opaque field*/
-	__u8 current_hof;
-	/** next header type, shared with IP protocol number*/
-	__u8 next_header;
+	/** Total Length of the payload */
+	__u16 payload_len;
+	/** SCION path type */
+	__u8 path_type;
+	/** Type of destination address */
+	unsigned int dst_type: 2;
+	/** Type of source address */
+	unsigned int src_type: 2;
+	/** Length of destination address */
+	unsigned int dst_len: 2;
+	/** Length of source address */
+	unsigned int src_len: 2;
+	__u16 reserved;
 };
 
 struct scionaddrhdr_ipv4 {

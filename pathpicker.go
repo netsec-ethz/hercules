@@ -16,7 +16,6 @@ package main
 
 import (
 	"github.com/scionproto/scion/go/lib/snet"
-	"github.com/scionproto/scion/go/lib/spath/spathmeta"
 )
 
 type PathSpec []PathInterface
@@ -39,7 +38,7 @@ func min(a, b int) int {
 	return b
 }
 
-func makePathPicker(spec *[]PathSpec, pathSet *spathmeta.AppPathSet, numPaths int) *PathPicker {
+func makePathPicker(spec *[]PathSpec, pathSet *[]snet.Path, numPaths int) *PathPicker {
 	if len(*spec) == 0 {
 		defaultSpec := make([]PathSpec, numPaths)
 		spec = &defaultSpec
@@ -156,7 +155,7 @@ func (picker *PathPicker) nextPickIterate(idx int) bool {
 
 func (picker *PathPicker) matches(pathIdx, ruleIdx int) bool {
 	pathSpec := (*picker.pathSpec)[ruleIdx]
-	pathInterfaces := picker.availablePaths[pathIdx].Interfaces()
+	pathInterfaces := picker.availablePaths[pathIdx].Metadata().Interfaces
 	idx := 0
 	for _, iface := range pathSpec {
 		for len(pathInterfaces) > idx && !iface.match(pathInterfaces[idx]) {
@@ -185,7 +184,7 @@ func (picker *PathPicker) disjointnessScore() int {
 	interfaces := map[snet.PathInterface]int{}
 	score := 0
 	for _, pick := range picker.currentPathPick {
-		for _, path := range picker.availablePaths[pick.pathIndex].Interfaces() {
+		for _, path := range picker.availablePaths[pick.pathIndex].Metadata().Interfaces {
 			score -= interfaces[path]
 			interfaces[path]++
 		}

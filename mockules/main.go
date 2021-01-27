@@ -7,10 +7,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/netsec-ethz/scion-apps/pkg/appnet"
 	"github.com/scionproto/scion/go/lib/addr"
-	"github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/snet"
-	"github.com/scionproto/scion/go/lib/sock/reliable"
 	"io"
 	"log"
 	"math"
@@ -87,7 +86,7 @@ func rbudpTxMain(srcAddr, dstAddr, filename string, blocks uint, loss float32) e
 		path := paths[0]
 		log.Printf("Using path:\n\t%s", path)
 		dst.Path = path.Path()
-		dst.NextHop = path.OverlayNextHop()
+		dst.NextHop = path.UnderlayNextHop()
 	}
 
 	conn, err := network.Dial(context.Background(), "udp", src.Host, dst, addr.SvcNone)
@@ -258,17 +257,6 @@ func rbudpRecvNacks(conn snet.Conn, nacks chan uint32, ack chan interface{}) {
 	}
 }
 
-func initNetwork(ia addr.IA) (*snet.SCIONNetwork, *sciond.Querier, error) {
-	ds := reliable.NewDispatcher("")
-	sciondConn, err := sciond.NewService(sciond.DefaultSCIONDAddress).Connect(context.Background())
-	if err != nil {
-		return nil, nil, err
-	}
-
-	querier := sciond.Querier{
-		Connector: sciondConn,
-		IA: ia,
-	}
-	network := snet.NewNetworkWithPR(ia, ds, querier, sciond.RevHandler{Connector: sciondConn})
-	return network, &querier, nil
+func initNetwork(ia addr.IA) (*appnet.Network, snet.PathQuerier, error) {
+	return appnet.DefNetwork(), appnet.DefNetwork().PathQuerier, nil
 }

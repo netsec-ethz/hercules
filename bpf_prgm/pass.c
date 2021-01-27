@@ -6,7 +6,7 @@
 #include <bpf/src/bpf_helpers.h>
 
 SEC("xdp")
-int  xdp_prog_pass(struct xdp_md *ctx)
+int xdp_prog_pass(struct xdp_md *ctx)
 {
 	return XDP_PASS;
 }

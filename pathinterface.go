@@ -18,16 +18,16 @@ import (
 	"bytes"
 	"fmt"
 	"github.com/scionproto/scion/go/lib/addr"
-	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/snet"
+	"strconv"
 )
 
 type PathInterface struct {
 	ia   addr.IA
-	ifId common.IFIDType
+	ifId uint64
 }
 
-func (iface *PathInterface) ID() common.IFIDType {
+func (iface *PathInterface) ID() uint64 {
 	return iface.ifId
 }
 
@@ -41,9 +41,11 @@ func (iface *PathInterface) UnmarshalText(text []byte) error {
 		return fmt.Errorf("cannot unmarshal \"%s\" as PathInterface: contains too many spaces", text)
 	}
 	if len(parts) > 1 {
-		if err := iface.ifId.UnmarshalText(parts[1]); err != nil {
+		ifId, err := strconv.ParseInt(string(parts[1]), 10, 64)
+		if err != nil {
 			return err
 		}
+		iface.ifId = uint64(ifId)
 	}
 	ret := iface.ia.UnmarshalText(parts[0])
 	return ret
@@ -51,7 +53,7 @@ func (iface *PathInterface) UnmarshalText(text []byte) error {
 
 func (iface *PathInterface) match(pathIface snet.PathInterface) bool {
 	if iface.ifId == 0 {
-		return iface.IA() == pathIface.IA()
+		return iface.IA() == pathIface.IA
 	}
-	return iface.ID() == pathIface.ID() && iface.IA() == pathIface.IA()
+	return iface.ID() == uint64(pathIface.ID) && iface.IA() == pathIface.IA
 }

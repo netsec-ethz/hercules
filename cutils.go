@@ -36,11 +36,7 @@ import (
 	"github.com/google/gopacket/layers"
 	log "github.com/inconshreveable/log15"
 	"github.com/scionproto/scion/go/lib/addr"
-	"github.com/scionproto/scion/go/lib/common"
-	"github.com/scionproto/scion/go/lib/hpkt"
-	"github.com/scionproto/scion/go/lib/l4"
 	"github.com/scionproto/scion/go/lib/snet"
-	"github.com/scionproto/scion/go/lib/spkt"
 	"github.com/scionproto/scion/go/lib/topology"
 	"github.com/vishvananda/netlink"
 )
@@ -160,6 +156,11 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPathHeader, 
 	if err := packet.ErrorLayer(); err != nil {
 		return nil, fmt.Errorf("error decoding some part of the packet: %v", err)
 	}
+	eth := packet.Layer(layers.LayerTypeEthernet)
+	if eth == nil {
+		return nil, errors.New("error decoding ETH layer")
+	}
+
 	ip4 := packet.Layer(layers.LayerTypeIPv4)
 	if ip4 == nil {
 		return nil, errors.New("error decoding IPv4 layer")
@@ -171,52 +172,67 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPathHeader, 
 		return nil, errors.New("error decoding IPv4/UDP layer")
 	}
 	udpPayload := udp.(*layers.UDP).Payload
-	udpDstPort, _ := udp.(*layers.UDP).SrcPort, udp.(*layers.UDP).DstPort
+	udpDstPort := udp.(*layers.UDP).SrcPort
 
 	if len(udpPayload) < 8 { // Guard against bug in ParseScnPkt
 		return nil, errors.New("error decoding SCION packet: payload too small")
 	}
 
-	var scionPkt spkt.ScnPkt
-	// XXX: ignore checksum errors. No API to parse without payload validation
-	if err := hpkt.ParseScnPkt(&scionPkt, udpPayload); err != nil {
+	sourcePkt := snet.Packet{
+		Bytes: udpPayload,
+	}
+	if err := sourcePkt.Decode(); err != nil {
 		return nil, fmt.Errorf("error decoding SCION packet: %v", err)
 	}
 
-	scionPkt.DstIA, scionPkt.SrcIA = scionPkt.SrcIA, scionPkt.DstIA
-	scionPkt.DstHost, scionPkt.SrcHost = scionPkt.SrcHost, scionPkt.DstHost
-
-	if scionPkt.Path != nil {
-		if err := scionPkt.Path.Reverse(); err != nil {
+	if !sourcePkt.Path.IsEmpty() {
+		if err := sourcePkt.Path.Reverse(); err != nil {
 			return nil, fmt.Errorf("failed to reverse SCION path: %v", err)
 		}
-		log.Debug("getReplyPathHeader", "path", scionPkt.Path)
+		log.Debug("getReplyPathHeader", "path", sourcePkt.Path)
 	} else {
 		log.Debug("getReplyPathHeader", "path", "No SCION Path header, source and destination in same AS.")
 	}
 
-	if scionPkt.L4 == nil {
+	udpPkt, ok := sourcePkt.Payload.(snet.UDPPayload)
+	if !ok {
 		return nil, errors.New("error decoding SCION/UDP")
 	}
-	scionPkt.L4.Reverse()
 
-	overlayHeader, err := prepareOverlayPacketHeader(srcIP, dstIP, uint16(udpDstPort), iface)
+	underlayHeader, err := prepareUnderlayPacketHeader(srcIP, dstIP, uint16(udpDstPort), iface)
 	if err != nil {
 		return nil, err
 	}
 
-	scionHeaderLen := scionPkt.HdrLen() + l4.UDPLen
-	payloadLen := etherLen - len(overlayHeader) - scionHeaderLen
-	scionPkt.Pld = common.RawBytes(make([]byte, payloadLen))
+	payload := snet.UDPPayload{
+		SrcPort: udpPkt.DstPort,
+		DstPort: udpPkt.SrcPort,
+		Payload: nil,
+	}
 
-	scionHeader := make([]byte, etherLen)
-	_, err = hpkt.WriteScnPkt(&scionPkt, scionHeader) // XXX: writes bogus L4 checksum
-	if err != nil {
+	destPkt := &snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Destination: sourcePkt.Source,
+			Source:      sourcePkt.Destination,
+			Path:        sourcePkt.Path,
+			Payload:     payload,
+		},
+	}
+
+	if err = destPkt.Serialize(); err != nil {
 		return nil, err
 	}
-	scionHeader = scionHeader[:scionHeaderLen]
-	scionChecksum := binary.LittleEndian.Uint16(scionPkt.L4.GetCSum())
-	headerBuf := append(overlayHeader, scionHeader...)
+	scionHeaderLen := len(destPkt.Bytes)
+	payloadLen := etherLen - len(underlayHeader) - scionHeaderLen
+	payload.Payload = make([]byte, payloadLen)
+	destPkt.Payload = payload
+
+	if err = destPkt.Serialize(); err != nil {
+		return nil, err
+	}
+	scionHeader := destPkt.Bytes[:scionHeaderLen]
+	scionChecksum := binary.BigEndian.Uint16(scionHeader[scionHeaderLen-2:])
+	headerBuf := append(underlayHeader, scionHeader...)
 	herculesPath := HerculesPathHeader{
 		Header:          headerBuf,
 		PartialChecksum: scionChecksum,
@@ -272,35 +288,39 @@ func toCIntArray(in []int) []C.int {
 }
 
 func prepareSCIONPacketHeader(src, dst *snet.UDPAddr, iface *net.Interface) (*HerculesPathHeader, error) {
-
-	overlayHeader, err := prepareOverlayPacketHeader(src.Host.IP, dst.NextHop.IP, uint16(dst.NextHop.Port), iface)
+	underlayHeader, err := prepareUnderlayPacketHeader(src.Host.IP, dst.NextHop.IP, uint16(dst.NextHop.Port), iface)
 	if err != nil {
 		return nil, err
 	}
 
-	scionPkt := &spkt.ScnPkt{
-		DstIA:   dst.IA,
-		SrcIA:   src.IA,
-		DstHost: addr.HostFromIP(dst.Host.IP),
-		SrcHost: addr.HostFromIP(src.Host.IP),
-		Path:    dst.Path,
-		L4: &l4.UDP{
-			SrcPort: uint16(src.Host.Port),
-			DstPort: uint16(dst.Host.Port),
+	payload := snet.UDPPayload{
+		SrcPort: uint16(src.Host.Port),
+		DstPort: uint16(dst.Host.Port),
+		Payload: nil,
+	}
+
+	scionPkt := &snet.Packet{
+		PacketInfo: snet.PacketInfo{
+			Destination: snet.SCIONAddress{IA: dst.IA, Host: addr.HostFromIP(dst.Host.IP)},
+			Source:      snet.SCIONAddress{IA: src.IA, Host: addr.HostFromIP(src.Host.IP)},
+			Path:        dst.Path,
+			Payload:     payload,
 		},
 	}
-	scionHeaderLen := scionPkt.HdrLen() + l4.UDPLen
-	payloadLen := etherLen - len(overlayHeader) - scionHeaderLen
-	scionPkt.Pld = common.RawBytes(make([]byte, payloadLen))
-
-	scionHeader := make([]byte, etherLen)
-	_, err = hpkt.WriteScnPkt(scionPkt, scionHeader) // XXX: writes bogus L4 checksum
-	if err != nil {
+	if err := scionPkt.Serialize(); err != nil {
 		return nil, err
 	}
-	scionHeader = scionHeader[:scionHeaderLen]
-	scionChecksum := binary.LittleEndian.Uint16(scionPkt.L4.GetCSum())
-	buf := append(overlayHeader, scionHeader...)
+	scionHeaderLen := len(scionPkt.Bytes)
+	payloadLen := etherLen - len(underlayHeader) - scionHeaderLen
+	payload.Payload = make([]byte, payloadLen)
+	scionPkt.Payload = payload
+	if err := scionPkt.Serialize(); err != nil {
+		return nil, err
+	}
+
+	scionHeader := scionPkt.Bytes[:scionHeaderLen]
+	scionChecksum := binary.BigEndian.Uint16(scionHeader[scionHeaderLen-2:])
+	buf := append(underlayHeader, scionHeader...)
 	herculesPath := HerculesPathHeader{
 		Header:          buf,
 		PartialChecksum: scionChecksum,
@@ -308,15 +328,15 @@ func prepareSCIONPacketHeader(src, dst *snet.UDPAddr, iface *net.Interface) (*He
 	return &herculesPath, nil
 }
 
-func prepareOverlayPacketHeader(srcIP, dstIP net.IP, dstPort uint16, iface *net.Interface) ([]byte, error) {
+func prepareUnderlayPacketHeader(srcIP, dstIP net.IP, dstPort uint16, iface *net.Interface) ([]byte, error) {
+	ethHeader := 14
+	ipHeader := 20
+	udpHeader := 8
+
 	dstMAC, srcMAC, err := getAddrs(iface, dstIP)
 	if err != nil {
 		return nil, err
 	}
-
-	ethHeader := 14
-	ipHeader := 20
-	udpHeader := 8
 
 	eth := layers.Ethernet{
 		SrcMAC:       srcMAC,
@@ -510,39 +530,39 @@ func (pm *PathManager) pushPaths(session *HerculesSession) {
 }
 
 // TODO move back to pathstodestination.go
-func (pwd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
+func (ptd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
 	n := 0
 	slot := 0
-	if pwd.paths == nil {
-		pwd.canSendLocally = pwd.pushPath(&PathMeta{updated: true, enabled: true}, firstSlot)
+	if ptd.paths == nil {
+		ptd.canSendLocally = ptd.pushPath(&PathMeta{updated: true, enabled: true}, firstSlot)
 	} else {
-		for p := range pwd.paths {
-			path := &pwd.paths[p]
+		for p := range ptd.paths {
+			path := &ptd.paths[p]
 			if path.updated || path.enabled {
 				n = slot
 			}
-			if !pwd.pushPath(path, firstSlot+slot) {
+			if !ptd.pushPath(path, firstSlot+slot) {
 				path.enabled = false
 			}
 			slot += 1
 			path.updated = false
 		}
 	}
-	pwd.pm.cStruct.numPathsPerDst[pwdIdx] = C.int(n + 1)
+	ptd.pm.cStruct.numPathsPerDst[pwdIdx] = C.int(n + 1)
 }
 
 // TODO move back to pathstodestination.go
-func (pwd *PathsToDestination) pushPath(path *PathMeta, slot int) bool {
+func (ptd *PathsToDestination) pushPath(path *PathMeta, slot int) bool {
 	if path.updated {
-		herculesPath, err := pwd.preparePath(&path.path)
+		herculesPath, err := ptd.preparePath(&path.path)
 		if err != nil {
 			log.Error(err.Error() + " - path disabled")
-			pwd.pm.cStruct.pathsPerDest[slot].enabled = false
+			ptd.pm.cStruct.pathsPerDest[slot].enabled = false
 			return false
 		}
-		toCPath(herculesPath, &pwd.pm.cStruct.pathsPerDest[slot], true, path.enabled)
+		toCPath(herculesPath, &ptd.pm.cStruct.pathsPerDest[slot], true, path.enabled)
 	} else {
-		pwd.pm.cStruct.pathsPerDest[slot].enabled = C.atomic_bool(path.enabled)
+		ptd.pm.cStruct.pathsPerDest[slot].enabled = C.atomic_bool(path.enabled)
 	}
 	return true
 }

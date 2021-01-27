@@ -18,9 +18,8 @@ import (
 	"context"
 	"fmt"
 	log "github.com/inconshreveable/log15"
-	"github.com/scionproto/scion/go/lib/pathmgr"
+	"github.com/netsec-ethz/scion-apps/pkg/appnet"
 	"github.com/scionproto/scion/go/lib/snet"
-	"github.com/scionproto/scion/go/lib/spath/spathmeta"
 	"github.com/scionproto/scion/go/lib/topology"
 	"go.uber.org/atomic"
 	"net"
@@ -30,9 +29,9 @@ import (
 type PathsToDestination struct {
 	pm             *PathManager
 	dst            *Destination
-	sp             *pathmgr.SyncPaths
 	modifyTime     time.Time
 	ExtnUpdated    atomic.Bool
+	allPaths       []snet.Path
 	paths          []PathMeta // nil indicates that the destination is in the same AS as the sender and we can use an empty path
 	canSendLocally bool       // (only if destination in same AS) indicates if we can send packets
 }
@@ -53,32 +52,30 @@ func initNewPathsToDestinationWithEmptyPath(pm *PathManager, dst *Destination) *
 	return &PathsToDestination{
 		pm:         pm,
 		dst:        dst,
-		sp:         nil,
 		paths:      nil,
 		modifyTime: time.Now(),
 	}
 }
 
 func initNewPathsToDestination(pm *PathManager, src *snet.UDPAddr, dst *Destination) (*PathsToDestination, error) {
-	// monitor path changes
-	sp, err := pm.pathResolver.Watch(context.Background(), src.IA, dst.hostAddr.IA)
+	paths, err := appnet.DefNetwork().PathQuerier.Query(context.Background(), dst.hostAddr.IA)
 	if err != nil {
 		return nil, err
 	}
 	return &PathsToDestination{
 		pm:         pm,
 		dst:        dst,
-		sp:         sp,
+		allPaths:   paths,
 		paths:      make([]PathMeta, dst.numPaths),
 		modifyTime: time.Unix(0, 0),
 	}, nil
 }
 
-func (pwd *PathsToDestination) hasUsablePaths() bool {
-	if pwd.paths == nil {
-		return pwd.canSendLocally
+func (ptd *PathsToDestination) hasUsablePaths() bool {
+	if ptd.paths == nil {
+		return ptd.canSendLocally
 	}
-	for _, path := range pwd.paths {
+	for _, path := range ptd.paths {
 		if path.enabled {
 			return true
 		}
@@ -86,53 +83,52 @@ func (pwd *PathsToDestination) hasUsablePaths() bool {
 	return false
 }
 
-func (pwd *PathsToDestination) choosePaths() bool {
-	if pwd.sp == nil {
+func (ptd *PathsToDestination) choosePaths() bool {
+	if ptd.allPaths == nil {
 		return false
 	}
 
-	pathData := pwd.sp.Load()
-	if pwd.modifyTime.After(pathData.ModifyTime) {
-		if pwd.ExtnUpdated.Swap(false) {
-			pwd.modifyTime = time.Now()
+	if ptd.modifyTime.After(time.Unix(0, 0)) { // TODO this chooses paths only once
+		if ptd.ExtnUpdated.Swap(false) {
+			ptd.modifyTime = time.Now()
 			return true
 		}
 		return false
 	}
 
-	availablePaths := pathData.APS
+	availablePaths := ptd.allPaths
 	if len(availablePaths) == 0 {
-		log.Error(fmt.Sprintf("no paths to destination %s", pwd.dst.hostAddr.IA.String()))
+		log.Error(fmt.Sprintf("no paths to destination %s", ptd.dst.hostAddr.IA.String()))
 	}
 
-	previousPathAvailable := make([]bool, pwd.dst.numPaths)
-	updated := pwd.choosePreviousPaths(&previousPathAvailable, &availablePaths)
+	previousPathAvailable := make([]bool, ptd.dst.numPaths)
+	updated := ptd.choosePreviousPaths(&previousPathAvailable, &availablePaths)
 
-	if pwd.disableVanishedPaths(&previousPathAvailable) {
+	if ptd.disableVanishedPaths(&previousPathAvailable) {
 		updated = true
 	}
 	// Note: we keep vanished paths around until they can be replaced or re-enabled
 
-	if pwd.chooseNewPaths(&previousPathAvailable, &availablePaths) {
+	if ptd.chooseNewPaths(&previousPathAvailable, &availablePaths) {
 		updated = true
 	}
 
-	if pwd.ExtnUpdated.Swap(false) || updated {
-		pwd.modifyTime = time.Now()
+	if ptd.ExtnUpdated.Swap(false) || updated {
+		ptd.modifyTime = time.Now()
 		return true
 	}
 	return false
 }
 
-func (pwd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool, availablePaths *spathmeta.AppPathSet) bool {
+func (ptd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool, availablePaths *[]snet.Path) bool {
 	updated := false
 	for _, newPath := range *availablePaths {
-		newFingerprint := newPath.Fingerprint()
-		for i := range pwd.paths {
-			pathMeta := &pwd.paths[i]
+		newFingerprint := snet.Fingerprint(newPath)
+		for i := range ptd.paths {
+			pathMeta := &ptd.paths[i]
 			if newFingerprint == pathMeta.fingerprint {
 				if !pathMeta.enabled {
-					log.Info(fmt.Sprintf("[Destination %s] re-enabling path %d\n", pwd.dst.hostAddr.IA, i))
+					log.Info(fmt.Sprintf("[Destination %s] re-enabling path %d\n", ptd.dst.hostAddr.IA, i))
 					pathMeta.enabled = true
 					updated = true
 				}
@@ -144,12 +140,12 @@ func (pwd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool
 	return updated
 }
 
-func (pwd *PathsToDestination) disableVanishedPaths(previousPathAvailable *[]bool) bool {
+func (ptd *PathsToDestination) disableVanishedPaths(previousPathAvailable *[]bool) bool {
 	updated := false
 	for i, inUse := range *previousPathAvailable {
-		pathMeta := &pwd.paths[i]
+		pathMeta := &ptd.paths[i]
 		if inUse == false && pathMeta.enabled {
-			log.Info(fmt.Sprintf("[Destination %s] disabling path %d\n", pwd.dst.hostAddr.IA, i))
+			log.Info(fmt.Sprintf("[Destination %s] disabling path %d\n", ptd.dst.hostAddr.IA, i))
 			pathMeta.enabled = false
 			updated = true
 		}
@@ -157,7 +153,7 @@ func (pwd *PathsToDestination) disableVanishedPaths(previousPathAvailable *[]boo
 	return updated
 }
 
-func (pwd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, availablePaths *spathmeta.AppPathSet) bool {
+func (ptd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, availablePaths *[]snet.Path) bool {
 	updated := false
 	// XXX for now, we do not support replacing vanished paths
 	// check that no previous path available
@@ -168,11 +164,11 @@ func (pwd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, ava
 	}
 
 	// pick paths
-	picker := makePathPicker(pwd.dst.pathSpec, availablePaths, pwd.dst.numPaths)
+	picker := makePathPicker(ptd.dst.pathSpec, availablePaths, ptd.dst.numPaths)
 	var pathSet []snet.Path
 	disjointness := 0 // negative number denoting how many network interfaces are shared among paths (to be maximized)
 	maxRuleIdx := 0   // the highest index of a PathSpec that is used (to be minimized)
-	for i := pwd.dst.numPaths; i > 0; i-- {
+	for i := ptd.dst.numPaths; i > 0; i-- {
 		picker.reset(i)
 		for picker.nextRuleSet() { // iterate through different choices of PathSpecs to use
 			if pathSet != nil && maxRuleIdx < picker.maxRuleIdx() { // ignore rule set, if path set with lower maxRuleIndex is known
@@ -192,39 +188,34 @@ func (pwd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, ava
 		}
 	}
 
-	log.Info(fmt.Sprintf("[Destination %s] using %d paths:", pwd.dst.hostAddr.IA, len(pathSet)))
+	log.Info(fmt.Sprintf("[Destination %s] using %d paths:", ptd.dst.hostAddr.IA, len(pathSet)))
 	for i, path := range pathSet {
 		log.Info(fmt.Sprintf("\t%s", path))
-		pwd.paths[i].path = path
-		pwd.paths[i].fingerprint = path.Fingerprint()
-		pwd.paths[i].enabled = true
-		pwd.paths[i].updated = true
+		fingerprint := snet.Fingerprint(path)
+		ptd.paths[i].path = path
+		ptd.paths[i].fingerprint = fingerprint
+		ptd.paths[i].enabled = true
+		ptd.paths[i].updated = true
 		updated = true
 	}
 	return updated
 }
 
-func (pwd *PathsToDestination) preparePath(p *snet.Path) (*HerculesPathHeader, error) {
+func (ptd *PathsToDestination) preparePath(p *snet.Path) (*HerculesPathHeader, error) {
 	var err error
-	curDst := pwd.dst.hostAddr
+	curDst := ptd.dst.hostAddr
 	if *p == nil {
 		// in order to use a static empty path, we need to set the next hop on dst
 		curDst.NextHop = &net.UDPAddr{
-			IP:   pwd.dst.hostAddr.Host.IP,
+			IP:   ptd.dst.hostAddr.Host.IP,
 			Port: topology.EndhostPort,
 		}
 	} else {
 		curDst.Path = (*p).Path()
-		if curDst.Path != nil {
-			if err = curDst.Path.InitOffsets(); err != nil {
-				return nil, err
-			}
-		}
-
-		curDst.NextHop = (*p).OverlayNextHop()
+		curDst.NextHop = (*p).UnderlayNextHop()
 	}
 
-	path, err := prepareSCIONPacketHeader(pwd.pm.src, curDst, pwd.pm.iface)
+	path, err := prepareSCIONPacketHeader(ptd.pm.src, curDst, ptd.pm.iface)
 	if err != nil {
 		return nil, err
 	}

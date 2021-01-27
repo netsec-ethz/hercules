@@ -261,6 +261,8 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 	}
 
 	aggregateStats := aggregateStats{}
+	go statsDumper(session, true, config.DumpInterval, &aggregateStats)
+	go cleanupOnSignal(session)
 	stats := herculesTx(session, config.TransmitFile, config.FileOffset, config.FileLength,
 		                destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode(),
 		                config.NumThreads)

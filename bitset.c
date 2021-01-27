@@ -18,7 +18,7 @@
 void bitset__create(struct bitset *s, u32 num)
 {
 	s->bitmap = calloc((num + HERCULES_BITSET_WORD_BITS - 1) / HERCULES_BITSET_WORD_BITS,
-										 HERCULES_BITSET_WORD_BITS/8);
+	                   HERCULES_BITSET_WORD_BITS / 8);
 	s->num = num;
 	s->num_set = 0;
 }

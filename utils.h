@@ -25,8 +25,6 @@ typedef __u32 u32;
 typedef __u16 u16;
 typedef __u8 u8;
 
-#undef NDEBUG
-
 #ifndef NDEBUG
 #define debug_printf(fmt, ...) printf("DEBUG: %s:%d:%s(): " fmt "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
 #else
@@ -86,8 +84,8 @@ inline void sleep_until(u64 ns)
 
 inline void sleep_nsecs(u64 ns)
 {
-  // Use clock_nanosleep to avoid drift by repeated interrupts. See NOTES in man(2) nanosleep.
-  sleep_until(get_nsecs() + ns);
+	// Use clock_nanosleep to avoid drift by repeated interrupts. See NOTES in man(2) nanosleep.
+	sleep_until(get_nsecs() + ns);
 }
 
 

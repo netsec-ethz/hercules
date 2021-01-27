@@ -31,13 +31,14 @@ struct bitset {
 #define HERCULES_BITSET_WORD_BITS (8 * sizeof(unsigned int))
 
 void bitset__create(struct bitset *s, u32 num);
+
 void bitset__destroy(struct bitset *s);
 
 // Returns true iff the bit at index i in bitmap is set
 inline bool bitset__check(struct bitset *s, u32 i)
 {
-  assert(i < s->num);
-  return (s->bitmap[i/HERCULES_BITSET_WORD_BITS]) & (1u << i % HERCULES_BITSET_WORD_BITS);
+	assert(i < s->num);
+	return (s->bitmap[i / HERCULES_BITSET_WORD_BITS]) & (1u << i % HERCULES_BITSET_WORD_BITS);
 }
 
 // set bit at index i in bitmap.
@@ -45,7 +46,7 @@ inline bool bitset__check(struct bitset *s, u32 i)
 inline bool bitset__set_mt_safe(struct bitset *s, u32 i)
 {
 	unsigned int bit = 1u << i % HERCULES_BITSET_WORD_BITS;
-	unsigned int prev = atomic_fetch_or(&s->bitmap[i/HERCULES_BITSET_WORD_BITS], bit);
+	unsigned int prev = atomic_fetch_or(&s->bitmap[i / HERCULES_BITSET_WORD_BITS], bit);
 	if(!(prev & bit)) {
 		atomic_fetch_add(&s->num_set, 1);
 		return false;
@@ -58,7 +59,7 @@ inline bool bitset__set_mt_safe(struct bitset *s, u32 i)
 inline bool bitset__set(struct bitset *s, u32 i)
 {
 	const bool prev = bitset__check(s, i);
-	s->bitmap[i/HERCULES_BITSET_WORD_BITS] |= (1 << i % HERCULES_BITSET_WORD_BITS);
+	s->bitmap[i / HERCULES_BITSET_WORD_BITS] |= (1 << i % HERCULES_BITSET_WORD_BITS);
 	if(!prev) {
 		s->num_set++;
 	}
@@ -70,12 +71,12 @@ inline bool bitset__set(struct bitset *s, u32 i)
 // Returns the previous state of the bit.
 inline bool bitset__unset(struct bitset *s, u32 i)
 {
-  const bool prev = bitset__check(s, i);
-  s->bitmap[i/HERCULES_BITSET_WORD_BITS] &= ~(1u << i % HERCULES_BITSET_WORD_BITS);
-  if(prev) {
-    s->num_set--;
-  }
-  return prev;
+	const bool prev = bitset__check(s, i);
+	s->bitmap[i / HERCULES_BITSET_WORD_BITS] &= ~(1u << i % HERCULES_BITSET_WORD_BITS);
+	if(prev) {
+		s->num_set--;
+	}
+	return prev;
 }
 
 // Reset the bitmap
@@ -83,7 +84,8 @@ inline bool bitset__unset(struct bitset *s, u32 i)
 inline void bitset__reset(struct bitset *s)
 {
 	// due to rounding, need to use the same formula as for allocation
-	memset(s->bitmap, 0, ((s->num + HERCULES_BITSET_WORD_BITS - 1) / HERCULES_BITSET_WORD_BITS) * (HERCULES_BITSET_WORD_BITS/8));
+	memset(s->bitmap, 0,
+	       ((s->num + HERCULES_BITSET_WORD_BITS - 1) / HERCULES_BITSET_WORD_BITS) * (HERCULES_BITSET_WORD_BITS / 8));
 	s->num_set = 0;
 }
 
@@ -92,13 +94,13 @@ inline void bitset__reset(struct bitset *s)
 // s->num if no such index exists.
 inline u32 bitset__scan(struct bitset *s, u32 pos)
 {
-  // TODO: profile the entire application and rewrite this function to use bitscan ops
-  for(u32 i = pos; i < s->num; ++i) {
-    if(bitset__check(s, i)) {
-      return i;
-    }
-  }
-  return s->num;
+	// TODO: profile the entire application and rewrite this function to use bitscan ops
+	for(u32 i = pos; i < s->num; ++i) {
+		if(bitset__check(s, i)) {
+			return i;
+		}
+	}
+	return s->num;
 }
 
 // Find next entry NOT in the set.
@@ -106,12 +108,12 @@ inline u32 bitset__scan(struct bitset *s, u32 pos)
 // or s->num if no such index exists.
 inline u32 bitset__scan_neg(struct bitset *s, u32 pos)
 {
-  for(u32 i = pos; i < s->num; ++i) {
-    if(!bitset__check(s, i)) {
-      return i;
-    }
-  }
-  return s->num;
+	for(u32 i = pos; i < s->num; ++i) {
+		if(!bitset__check(s, i)) {
+			return i;
+		}
+	}
+	return s->num;
 }
 
 // Find nth entry NOT in the set.
@@ -119,15 +121,15 @@ inline u32 bitset__scan_neg(struct bitset *s, u32 pos)
 // or s->num if no such index exists.
 inline u32 bitset__scan_neg_n(struct bitset *s, u32 pos, u32 n)
 {
-  for(u32 i = pos; i < s->num; ++i) {
-    if(!bitset__check(s, i)) {
-      n--;
-    }
-    if (n == 0) {
-      return i;
-    }
-  }
-  return s->num;
+	for(u32 i = pos; i < s->num; ++i) {
+		if(!bitset__check(s, i)) {
+			n--;
+		}
+		if(n == 0) {
+			return i;
+		}
+	}
+	return s->num;
 }
 
 #endif // __HERCULES_BITSET_H__

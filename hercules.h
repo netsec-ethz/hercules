@@ -24,7 +24,7 @@
 
 struct hercules_path_header {
 	const char header[HERCULES_MAX_HEADERLEN]; //!< headerlen bytes
-	__u16  checksum;	//SCION L4 checksum over header with 0 payload
+	__u16 checksum;    //SCION L4 checksum over header with 0 payload
 };
 
 struct hercules_session;
@@ -34,7 +34,7 @@ struct hercules_path {
 	__u64 next_handshake_at;
 	int headerlen;
 	int payloadlen;
-	int framelen;	//!< length of ethernet frame; headerlen + payloadlen
+	int framelen;    //!< length of ethernet frame; headerlen + payloadlen
 	struct hercules_path_header header;
 	atomic_bool enabled; // e.g. when a path has been revoked and no replacement is available, this will be set to false
 	atomic_bool replaced;
@@ -57,20 +57,20 @@ struct hercules_session *hercules_init(int ifindex, struct hercules_app_addr loc
 void hercules_close(struct hercules_session *session);
 
 struct hercules_stats {
-  __u64 start_time;
-  __u64 end_time;
-  __u64 now;
+	__u64 start_time;
+	__u64 end_time;
+	__u64 now;
 
-  __u64 tx_npkts;
-  __u64 rx_npkts;
+	__u64 tx_npkts;
+	__u64 rx_npkts;
 
-  __u64 filesize;
-  __u32 framelen;
-  __u32 chunklen;
-  __u32 total_chunks;
-  __u32 completed_chunks; //!< either number of acked (for sender) or received (for receiver) chunks
+	__u64 filesize;
+	__u32 framelen;
+	__u32 chunklen;
+	__u32 total_chunks;
+	__u32 completed_chunks; //!< either number of acked (for sender) or received (for receiver) chunks
 
-  __u32 rate_limit;
+	__u32 rate_limit;
 };
 
 // Get the current stats of a running transfer.
@@ -87,7 +87,6 @@ void free_path_lock(void);
 // Initiate transfer of file over the given path.
 // Synchronous; returns when the transfer has been completed or if it has failed.
 // Does not take ownership of `paths`.
-// Retur
 struct hercules_stats
 hercules_tx(struct hercules_session *session, const char *filename, int offset, int length,
             const struct hercules_app_addr *destinations, struct hercules_path *paths_per_dest, int num_dests,
@@ -95,6 +94,6 @@ hercules_tx(struct hercules_session *session, const char *filename, int offset, 
 
 // Initiate receiver, waiting for a transmitter to initiate the file transfer.
 struct hercules_stats hercules_rx(struct hercules_session *session, const char *filename, int xdp_mode,
-								  bool configure_queues, int accept_timeout, int num_threads);
+                                  bool configure_queues, int accept_timeout, int num_threads);
 
 #endif // __HERCULES_H__

@@ -419,7 +419,7 @@ func (config *HerculesGeneralConfig) getXDPMode() (mode int) {
 	case "c":
 		mode = XDP_COPY
 	default:
-		mode = 0
+		mode = XDP_COPY
 	}
 	return mode
 }

@@ -40,22 +40,22 @@ static __u32 zero = 0;
 SEC("xdp")
 int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 {
-	void *data = (void *) (long) ctx->data;
-	void *data_end = (void *) (long) ctx->data_end;
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
 	size_t offset = sizeof(struct ether_header) +
-					sizeof(struct iphdr) +
-					sizeof(struct udphdr) +
-					sizeof(struct scionhdr) +
-					sizeof(struct scionaddrhdr_ipv4) +
-					sizeof(struct udphdr);
+	                sizeof(struct iphdr) +
+	                sizeof(struct udphdr) +
+	                sizeof(struct scionhdr) +
+	                sizeof(struct scionaddrhdr_ipv4) +
+	                sizeof(struct udphdr);
 	if(data + offset > data_end) {
 		return XDP_PASS; // too short
 	}
-	const struct ether_header *eh = (const struct ether_header *) data;
+	const struct ether_header *eh = (const struct ether_header *)data;
 	if(eh->ether_type != htons(ETHERTYPE_IP)) {
 		return XDP_PASS; // not IP
 	}
-	const struct iphdr *iph = (const struct iphdr *) (eh + 1);
+	const struct iphdr *iph = (const struct iphdr *)(eh + 1);
 	if(iph->protocol != IPPROTO_UDP) {
 		return XDP_PASS; // not UDP
 	}
@@ -72,35 +72,40 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	}
 
 	// check if UDP port matches
-	const struct udphdr *udph = (const struct udphdr *) (iph + 1);
+	const struct udphdr *udph = (const struct udphdr *)(iph + 1);
 	if(udph->uh_dport != htons(SCION_ENDHOST_PORT)) {
 		return XDP_PASS; // not addressed to us (UDP port)
 	}
 
 	// parse SCION header
-	const struct scionhdr *scionh = (const struct scionhdr *) (udph + 1);
-	const __u16 expected_ver_dst_src = htons(0 << 12 | 1 << 6 | 1 << 0); // version: 0, dst, src: 1 (IPv4)
-	if(scionh->ver_dst_src != expected_ver_dst_src) {
-		return XDP_PASS;
+	const struct scionhdr *scionh = (const struct scionhdr *)(udph + 1);
+	if(scionh->version != 0u) {
+		return XDP_PASS; // unsupported SCION version
+	}
+	if(scionh->dst_type != 0u) {
+		return XDP_PASS; // unsupported destination address type
+	}
+	if(scionh->src_type != 0u) {
+		return XDP_PASS; // unsupported source address type
 	}
 	if(scionh->next_header != IPPROTO_UDP) {
 		return XDP_PASS;
 	}
 
-	const struct scionaddrhdr_ipv4 *scionaddrh = (const struct scionaddrhdr_ipv4 *) (scionh + 1);
+	const struct scionaddrhdr_ipv4 *scionaddrh = (const struct scionaddrhdr_ipv4 *)(scionh + 1);
 	if(scionaddrh->dst_ia != addr->ia) {
 		return XDP_PASS; // not addressed to us (IA)
 	}
 	if(scionaddrh->dst_ip != addr->ip) {
 		return XDP_PASS; // not addressed to us (IP in SCION hdr)
 	}
-	offset += scionh->header_len * 8 - // Header length is in lineLen of 8 bytes
-								  sizeof(struct scionhdr) -
-								  sizeof(struct scionaddrhdr_ipv4);
+	offset += scionh->header_len * SCION_HEADER_LINELEN - // Header length is in lineLen of SCION_HEADER_LINELEN bytes
+	          sizeof(struct scionhdr) -
+	          sizeof(struct scionaddrhdr_ipv4);
 
 	// Finally parse the L4-UDP header
-	const struct udphdr *l4udph = ((void *) scionh) + scionh->header_len * 8;
-	if((void *) (l4udph + 1) > data_end) {
+	const struct udphdr *l4udph = ((void *)scionh) + scionh->header_len * SCION_HEADER_LINELEN;
+	if((void *)(l4udph + 1) > data_end) {
 		return XDP_PASS; // too short after all
 	}
 	if(l4udph->dest != addr->port) {
@@ -108,7 +113,7 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	}
 
 	// write the payload offset to the first word, so that the user space program can continue from there.
-	*(__u32 *) data = offset;
+	*(__u32 *)data = offset;
 
 	__u32 *_num_xsks = bpf_map_lookup_elem(&num_xsks, &zero);
 	if(_num_xsks == NULL) {
@@ -116,7 +121,8 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	}
 	__sync_fetch_and_add(&redirect_count, 1);
 
-	return bpf_redirect_map(&xsks_map, (redirect_count) % (*_num_xsks), 0); // XXX distribute across multiple sockets, once available
+	return bpf_redirect_map(&xsks_map, (redirect_count) % (*_num_xsks),
+	                        0); // XXX distribute across multiple sockets, once available
 }
 
 char _license[] SEC("license") = "GPL";
