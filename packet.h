@@ -77,6 +77,9 @@ struct rbudp_initial_pkt {
 // Integers all transmitted in little endian (host endianness).
 struct rbudp_ack_pkt {
 	__u8 num_acks; //!< number of (valid) entries in `acks`
+	__u32 max_seq;
+	__u32 ack_nr;
+	__u64 timestamp;
 	struct {
 		__u32 begin; //!< index of first chunk that is ACKed with this range
 		__u32 end;   //!< one-past-the-last chunk that is ACKed with this range

@@ -15,7 +15,9 @@
 package main
 
 import (
+	"fmt"
 	"github.com/scionproto/scion/go/lib/snet"
+	"github.com/vishvananda/netlink"
 	"net"
 	"time"
 )
@@ -28,13 +30,20 @@ type Destination struct {
 
 type PathManager struct {
 	numPathSlotsPerDst int
-	iface              *net.Interface
+	interfaces         map[int]*net.Interface
 	dsts               []*PathsToDestination
 	src                *snet.UDPAddr
 	syncTime           time.Time
 	maxBps             uint64
 	cStruct            CPathManagement
 }
+
+type PathWithInterface struct {
+	path  snet.Path
+	iface *net.Interface
+}
+
+type AppPathSet map[snet.PathFingerprint]PathWithInterface
 
 const numPathsResolved = 20
 
@@ -45,10 +54,15 @@ func max(a, b int) int {
 	return b
 }
 
-func initNewPathManager(iface *net.Interface, dsts []*Destination, src *snet.UDPAddr, maxBps uint64) (*PathManager, error) {
+func initNewPathManager(interfaces []*net.Interface, dsts []*Destination, src *snet.UDPAddr, maxBps uint64) (*PathManager, error) {
+	ifMap := make(map[int]*net.Interface)
+	for _, iface := range interfaces {
+		ifMap[iface.Index] = iface
+	}
+
 	numPathsPerDst := 0
 	pm := &PathManager{
-		iface:        iface,
+		interfaces:   ifMap,
 		src:          src,
 		dsts:         make([]*PathsToDestination, 0, len(dsts)),
 		syncTime:     time.Unix(0, 0),
@@ -95,11 +109,29 @@ func (pm *PathManager) choosePaths() bool {
 	return updated
 }
 
-func (pm *PathManager) syncPathsToC(session *HerculesSession) {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	for range ticker.C {
-		if pm.choosePaths() {
-			pm.pushPaths(session)
+func (pm *PathManager) filterPathsByActiveInterfaces(pathsAvail []snet.Path) AppPathSet {
+	pathsFiltered := make(AppPathSet)
+	for _, path := range pathsAvail {
+		iface, err := pm.interfaceForRoute(path.UnderlayNextHop().IP)
+		if err != nil {
+		} else {
+			pathsFiltered[snet.Fingerprint(path)] = PathWithInterface{path, iface}
 		}
 	}
+	return pathsFiltered
+}
+
+func (pm *PathManager) interfaceForRoute(ip net.IP) (*net.Interface, error) {
+	routes, err := netlink.RouteGet(ip)
+	if err != nil {
+		return nil, fmt.Errorf("could not find route for destination %s: %s", ip, err)
+	}
+
+	for _, route := range routes {
+		if iface, ok := pm.interfaces[route.LinkIndex]; ok {
+			fmt.Printf("sending via #%d (%s) to %s\n", route.LinkIndex, pm.interfaces[route.LinkIndex].Name, ip)
+			return iface, nil
+		}
+	}
+	return nil, fmt.Errorf("no interface active for sending to %s", ip)
 }

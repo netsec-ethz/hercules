@@ -58,7 +58,8 @@ void send_queue_push(struct send_queue *queue);
 bool send_queue_pop(struct send_queue *queue, struct send_queue_unit *unit);
 
 // Pops a send_queue_unit off the queue and fills it into *unit.
-// If the queue is empty, this function blocks until som send_queue_unit is available.
-void send_queue_pop_wait(struct send_queue *queue, struct send_queue_unit *unit);
+// If the queue is empty and block is true, this function blocks until some send_queue_unit is available.
+// As soon as *block is false, send_queue_pop_wait stops blocking.
+void send_queue_pop_wait(struct send_queue *queue, struct send_queue_unit *unit, bool *block);
 
 #endif //__HERCULES_SEND_QUEUE_H__

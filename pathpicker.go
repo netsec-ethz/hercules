@@ -38,14 +38,14 @@ func min(a, b int) int {
 	return b
 }
 
-func makePathPicker(spec *[]PathSpec, pathSet *[]snet.Path, numPaths int) *PathPicker {
+func makePathPicker(spec *[]PathSpec, pathSet *AppPathSet, numPaths int) *PathPicker {
 	if len(*spec) == 0 {
 		defaultSpec := make([]PathSpec, numPaths)
 		spec = &defaultSpec
 	}
 	paths := make([]snet.Path, 0, len(*pathSet))
 	for _, path := range *pathSet {
-		paths = append(paths, path)
+		paths = append(paths, path.path)
 	}
 	picker := &PathPicker{
 		pathSpec:       spec,

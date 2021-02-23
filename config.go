@@ -30,15 +30,17 @@ import (
 )
 
 type HerculesGeneralConfig struct {
-	Direction    string
-	DumpInterval time.Duration
-	Interface    string
-	Mode         string
-	MTU          int
-	Queue        int
-	NumThreads   int
-	Verbosity    string
-	LocalAddress string
+	Direction            string
+	DumpInterval         time.Duration
+	Interfaces           []string
+	Mode                 string
+	MTU                  int
+	Queue                int
+	NumThreads           int
+	Verbosity            string
+	LocalAddress         string
+	PerPathStatsFile     string
+	PCCBenchMarkDuration time.Duration
 }
 
 type SiteConfig struct {
@@ -52,6 +54,7 @@ type HerculesReceiverConfig struct {
 	OutputFile      string
 	ConfigureQueues bool
 	AcceptTimeout   int
+	ExpectNumPaths  int
 }
 
 type HerculesSenderConfig struct {
@@ -77,6 +80,7 @@ func (config *HerculesReceiverConfig) initializeDefaults() {
 	config.OutputFile = ""
 	config.ConfigureQueues = false
 	config.AcceptTimeout = 0
+	config.ExpectNumPaths = 1
 }
 
 // Validates configuration parameters that have been provided, does not validate for presence of mandatory arguments.
@@ -110,8 +114,10 @@ func (config *HerculesReceiverConfig) validateLoose() error {
 	}
 
 	if config.ConfigureQueues {
-		if !configurableInterfaceRegexp.MatchString(config.Interface) {
-			return fmt.Errorf("cannot configure interface '%s' - escaping not implemented", config.Interface)
+		for _, ifName := range config.Interfaces {
+			if !configurableInterfaceRegexp.MatchString(ifName) {
+				return fmt.Errorf("cannot configure interface '%s' - escaping not implemented", ifName)
+			}
 		}
 	}
 	return nil
@@ -145,6 +151,9 @@ func (config *HerculesReceiverConfig) mergeFlags(flags *Flags) error {
 	}
 	if isFlagPassed("timeout") {
 		config.AcceptTimeout = flags.acceptTimeout
+	}
+	if isFlagPassed("ep") {
+		config.ExpectNumPaths = flags.expectPaths
 	}
 	return nil
 }
@@ -235,7 +244,7 @@ func (config *HerculesSenderConfig) validateStrict() error {
 
 // Merge commandline arguments into the current configuration.
 func (config *HerculesSenderConfig) mergeFlags(flags *Flags) error {
-	if err := forbidFlags([]string{"o", "timeout"}, "sending"); err != nil {
+	if err := forbidFlags([]string{"o", "timeout", "ep"}, "sending"); err != nil {
 		return err
 	}
 	if err := config.HerculesGeneralConfig.mergeFlags(flags); err != nil {
@@ -291,36 +300,40 @@ func (config *HerculesSenderConfig) destinations() []*Destination {
 	return dests
 }
 
-// helpers
+// for both, sender and receiver
 
 func (config *HerculesGeneralConfig) initializeDefaults() {
 	config.Direction = ""
 	config.DumpInterval = 1 * time.Second
-	config.Interface = ""
 	config.Mode = ""
 	config.MTU = 1500
 	config.NumThreads = 1
 	config.Queue = 0
 	config.Verbosity = ""
 	config.LocalAddress = ""
+	config.PerPathStatsFile = ""
+	config.PCCBenchMarkDuration = 0
 }
 
 func (config *HerculesGeneralConfig) validateLoose() error {
-	var iface *net.Interface
+	var ifaces []*net.Interface
 	if config.Direction != "" && config.Direction != "upload" && config.Direction != "download" {
 		return errors.New("field Direction must either be 'upload', 'download' or empty")
 	}
 	if config.DumpInterval <= 0 {
 		return errors.New("field DumpInterval must be strictly positive")
 	}
-	if config.Interface != "" {
-		var err error
-		iface, err = net.InterfaceByName(config.Interface)
-		if err != nil {
-			return err
-		}
-		if iface.Flags&net.FlagUp == 0 {
-			return errors.New("interface is not up")
+	if len(config.Interfaces) != 0 {
+		for _, ifName := range config.Interfaces {
+			var err error
+			iface, err := net.InterfaceByName(ifName)
+			if err != nil {
+				return err
+			}
+			if iface.Flags&net.FlagUp == 0 {
+				return fmt.Errorf("interface %s is not up", iface.Name)
+			}
+			ifaces = append(ifaces, iface)
 		}
 	}
 	if config.Mode != "z" && config.Mode != "c" && config.Mode != "" {
@@ -339,7 +352,7 @@ func (config *HerculesGeneralConfig) validateLoose() error {
 		if (udpAddress.IA == addr.IA{}) {
 			return errors.New("must provide IA for local address")
 		}
-		if iface != nil {
+		for _, iface := range ifaces {
 			if err := checkAssignedIP(iface, udpAddress.Host.IP); err != nil {
 				return err
 			}
@@ -372,8 +385,8 @@ func (config *HerculesGeneralConfig) validateLoose() error {
 // WARNING: this function does not validate the contents of the options to avoid duplicate calls to validateLoose(),
 // as this function is called within Hercules(Sender|Receiver)Config.validateLoose() already.
 func (config *HerculesGeneralConfig) validateStrict() error {
-	if config.Interface == "" {
-		return errors.New("you must specify a network interface to use")
+	if len(config.Interfaces) == 0 {
+		return errors.New("you must specify at least one network interface to use")
 	}
 	if config.LocalAddress == "" {
 		return errors.New("you must specify a local address")
@@ -389,7 +402,7 @@ func (config *HerculesGeneralConfig) mergeFlags(flags *Flags) error {
 		config.DumpInterval = flags.dumpInterval * time.Second
 	}
 	if isFlagPassed("i") {
-		config.Interface = flags.ifname
+		config.Interfaces = flags.ifNames
 	}
 	if isFlagPassed("m") {
 		config.Mode = flags.mode
@@ -409,6 +422,12 @@ func (config *HerculesGeneralConfig) mergeFlags(flags *Flags) error {
 	if isFlagPassed("mtu") {
 		config.MTU = flags.mtu
 	}
+	if isFlagPassed("ps") {
+		config.PerPathStatsFile = flags.perPathStats
+	}
+	if isFlagPassed("pccbd") {
+		config.PCCBenchMarkDuration = time.Duration(flags.pccBenchmarkDuration) * time.Second
+	}
 	return nil
 }
 
@@ -423,6 +442,20 @@ func (config *HerculesGeneralConfig) getXDPMode() (mode int) {
 	}
 	return mode
 }
+
+func (config *HerculesGeneralConfig) interfaces() ([]*net.Interface, error) {
+	var interfaces []*net.Interface
+	for _, ifName := range config.Interfaces {
+		iface, err := net.InterfaceByName(ifName)
+		if err != nil {
+			return nil, err
+		}
+		interfaces = append(interfaces, iface)
+	}
+	return interfaces, nil
+}
+
+// helpers
 
 // Checks that none of flags are passed by the command line.
 // mode should either be "sending" or "receiving" and is only used in errors

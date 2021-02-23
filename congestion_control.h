@@ -3,6 +3,7 @@
 
 #include "bitset.h"
 #include "hercules.h"
+#include <pthread.h>
 
 #define RCTS_INTERVALS 4 // Must be even
 
@@ -34,6 +35,11 @@ struct ccontrol_state {
 	// Monitoring interval values
 	sequence_number mi_seq_start;
 	sequence_number mi_seq_end;
+	sequence_number excess_npkts;
+	sequence_number mi_seq_min;
+	sequence_number mi_seq_max;
+	sequence_number mi_seq_max_rcvd;
+	u32 num_nacks, num_nack_pkts;
 	struct bitset mi_nacked;
 
 	sequence_number last_seqnr;
@@ -45,13 +51,19 @@ struct ccontrol_state {
 	float sign;
 	int adjust_iter;
 	unsigned long mi_start;
+	unsigned long mi_end;
 	u32 mi_tx_npkts;
 	u32 mi_tx_npkts_monitored;
+	u32 total_tx_npkts;
 
 	u32 rate_before_rcts;
 	struct rct rcts[RCTS_INTERVALS];
 	int rcts_iter;
 	enum pcc_state state;
+
+	bool ignored_first_mi;
+
+	pthread_spinlock_t lock;
 };
 
 

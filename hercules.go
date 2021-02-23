@@ -18,7 +18,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -32,23 +31,26 @@ import (
 type arrayFlags []string
 
 type Flags struct {
-	dumpInterval     time.Duration
-	enablePCC        bool
-	ifname           string
-	localAddr        string
-	maxRateLimit     int
-	mode             string
-	mtu              int
-	queue            int
-	numThreads       int
-	remoteAddrs      arrayFlags
-	transmitFilename string
-	fileOffset       int
-	fileLength       int
-	outputFilename   string
-	verbose          string
-	numPaths         int
-	acceptTimeout    int
+	dumpInterval         time.Duration
+	enablePCC            bool
+	ifNames              arrayFlags
+	localAddr            string
+	maxRateLimit         int
+	mode                 string
+	mtu                  int
+	queue                int
+	numThreads           int
+	remoteAddrs          arrayFlags
+	transmitFilename     string
+	fileOffset           int
+	fileLength           int
+	outputFilename       string
+	verbose              string
+	numPaths             int
+	acceptTimeout        int
+	perPathStats         string
+	expectPaths          int
+	pccBenchmarkDuration int
 }
 
 const (
@@ -57,7 +59,6 @@ const (
 
 var (
 	startupVersion  string         // Add detailed version information to binary for reproducible tests
-	activeInterface *net.Interface // activeInterface remembers the chosen interface for callbacks from C
 	etherLen        int
 )
 
@@ -98,7 +99,7 @@ func realMain() error {
 	)
 	flag.DurationVar(&flags.dumpInterval, "n", time.Second, "Print stats at given interval")
 	flag.BoolVar(&flags.enablePCC, "pcc", true, "Enable performance-oriented congestion control (PCC)")
-	flag.StringVar(&flags.ifname, "i", "", "interface")
+	flag.Var(&flags.ifNames, "i", "interface")
 	flag.StringVar(&flags.localAddr, "l", "", "local address")
 	flag.IntVar(&flags.maxRateLimit, "p", 3333333, "Maximum allowed send rate in Packets per Second (default: 3'333'333, ~40Gbps)")
 	flag.StringVar(&flags.mode, "m", "", "XDP socket bind mode (Zero copy: z; Copy mode: c)")
@@ -115,6 +116,9 @@ func realMain() error {
 	flag.IntVar(&flags.mtu, "mtu", 0, "Set the frame size to use")
 	flag.IntVar(&flags.acceptTimeout, "timeout", 0, "Abort accepting connections after this timeout (seconds)")
 	flag.BoolVar(&version, "version", false, "Output version and exit")
+	flag.StringVar(&flags.perPathStats, "ps", "", "Write per-path statistics to this file (CSV)")
+	flag.IntVar(&flags.expectPaths, "ep", 1, "Number of paths to expect for collecting per-path statistics (receiver only)")
+	flag.IntVar(&flags.pccBenchmarkDuration, "pccbd", 0, "PCC benchmark duration in (seconds). ")
 	flag.Parse()
 
 	if version {
@@ -188,6 +192,9 @@ func realMain() error {
 	}
 
 	if sendMode {
+		if senderConfig.PerPathStatsFile != "" && !senderConfig.EnablePCC {
+			return errors.New("in send mode, path stats are currently only available with PCC")
+		}
 		if err := senderConfig.validateLoose(); err != nil {
 			return errors.New("in config file: " + err.Error())
 		}
@@ -241,11 +248,11 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 	// since config is valid, there can be no errors here:
 	etherLen = config.MTU
 	localAddress, _ := snet.ParseUDPAddr(config.LocalAddress)
-	iface, _ := net.InterfaceByName(config.Interface)
+	interfaces, _ := config.interfaces()
 	destinations := config.destinations()
 
 	pm, err := initNewPathManager(
-		iface,
+		interfaces,
 		destinations,
 		localAddress,
 		uint64(config.RateLimit)*uint64(config.MTU))
@@ -254,19 +261,23 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 	}
 
 	pm.choosePaths()
-	session := herculesInit(iface, localAddress, config.Queue, config.MTU)
+	session := herculesInit(interfaces, localAddress, config.Queue, config.MTU)
 	pm.pushPaths(session)
 	if !pm.canSendToAllDests() {
 		return errors.New("some destinations are unreachable, abort")
 	}
 
 	aggregateStats := aggregateStats{}
-	go statsDumper(session, true, config.DumpInterval, &aggregateStats)
+	done := make(chan struct{}, 1)
+	go statsDumper(session, true, config.DumpInterval, &aggregateStats, config.PerPathStatsFile, config.NumPathsPerDest * len(config.Destinations), done, config.PCCBenchMarkDuration)
 	go cleanupOnSignal(session)
 	stats := herculesTx(session, config.TransmitFile, config.FileOffset, config.FileLength,
 		                destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode(),
 		                config.NumThreads)
+	done <- struct{}{}
 	printSummary(stats, aggregateStats)
+	<-done // wait for path stats to be flushed
+	herculesClose(session)
 	return nil
 }
 
@@ -274,15 +285,24 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 func mainRx(config *HerculesReceiverConfig) error {
 	// since config is valid, there can be no errors here:
 	etherLen = config.MTU
-	iface, _ := net.InterfaceByName(config.Interface)
+	interfaces, _ := config.interfaces()
 	localAddr, _ := snet.ParseUDPAddr(config.LocalAddress)
 
-	session := herculesInit(iface, localAddr, config.Queue, config.MTU)
+	isPCCBenchmark := false
+	if config.PCCBenchMarkDuration > 0 {
+		isPCCBenchmark = true
+	}
+	session := herculesInit(interfaces, localAddr, config.Queue, config.MTU)
 	aggregateStats := aggregateStats{}
-	go statsDumper(session, false, config.DumpInterval, &aggregateStats)
+	done := make(chan struct{}, 1)
+	go statsDumper(session, false, config.DumpInterval, &aggregateStats, config.PerPathStatsFile, config.ExpectNumPaths, done, config.PCCBenchMarkDuration)
 	go cleanupOnSignal(session)
-	stats := herculesRx(session, config.OutputFile, config.getXDPMode(), config.NumThreads, config.ConfigureQueues, config.AcceptTimeout)
+	stats := herculesRx(session, config.OutputFile, config.getXDPMode(), config.NumThreads, config.ConfigureQueues,
+		config.AcceptTimeout, isPCCBenchmark)
+	done <- struct{}{}
 	printSummary(stats, aggregateStats)
+	<-done // wait for path stats to be flushed
+	herculesClose(session)
 	return nil
 }
 

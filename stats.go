@@ -15,8 +15,12 @@
 package main
 
 import (
+	"encoding/csv"
 	"fmt"
+	"github.com/prometheus/common/log"
 	"math"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -35,6 +39,7 @@ type herculesStats struct {
 	completedChunks uint32 //!< either number of acked (for sender) or received (for receiver) chunks
 
 	rateLimit uint32
+	paths     []perPathStats
 }
 
 type aggregateStats struct {
@@ -43,7 +48,11 @@ type aggregateStats struct {
 	maxBpsGood float64
 }
 
-func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggregate *aggregateStats) {
+type perPathStats struct {
+	total_packets, pps_target int64
+}
+
+func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggregate *aggregateStats, pathStatsFile string, numPaths int, done chan struct{}, benchmarkDuration time.Duration) {
 	if interval == 0 {
 		return
 	}
@@ -73,14 +82,52 @@ func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggr
 		)
 	}
 
-	prevStats := herculesGetStats(session)
+	var pStats *pathStats
+	var psWriter *csv.Writer
+	if pathStatsFile != "" {
+		pStats = makePerPathStatsBuffer(numPaths)
+		file, err := os.Create(pathStatsFile)
+		if err != nil {
+			log.Errorf("Cannot open %s for writing", pathStatsFile)
+			os.Exit(1)
+		}
+
+		psWriter = csv.NewWriter(file)
+		defer func() {
+			psWriter.Flush()
+			if err := psWriter.Error(); err != nil {
+				log.Error(err)
+			}
+			_ = file.Close()
+			done <- struct{}{}
+		}()
+
+		header := make([]string, 1, 1+2*numPaths)
+		header[0] = "Time"
+		for i := 0; i < numPaths; i++ {
+			header = append(header,
+				fmt.Sprintf("Path %d target [bit/s]", i),
+				fmt.Sprintf("Path %d throughput [bit/s]", i),
+			)
+		}
+		if err = psWriter.Write(header); err != nil {
+			log.Error("Cannot write header")
+			os.Exit(1)
+		}
+	} else {
+		defer func() { done <- struct{}{} }()
+	}
+
+	prevStats := herculesGetStats(session, pStats)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
 		select {
-		default:
-			stats := herculesGetStats(session)
+		case <-done:
+			return
+		case <-ticker.C:
+			stats := herculesGetStats(session, pStats)
 
 			// elapsed time in seconds
 			t := stats.now
@@ -93,6 +140,21 @@ func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggr
 			chunklen := float64(stats.chunkLen)
 			framelen := float64(stats.frameLen)
 			completion := float64(stats.completedChunks) / float64(stats.totalChunks)
+
+			if stats.paths != nil {
+				record := make([]string, 1, 1+2*len(stats.paths))
+				record[0] = strconv.FormatFloat(dttot, 'f', 1, 64)
+				for i, ps := range stats.paths {
+					record = append(record,
+						strconv.FormatInt(8*int64(framelen)*ps.pps_target, 10),
+						strconv.FormatInt(8*int64(framelen)*(ps.total_packets-prevStats.paths[i].total_packets), 10),
+					)
+				}
+				if err := psWriter.Write(record); err != nil {
+					log.Errorf("could not write path stats record: %s", err)
+					os.Exit(1)
+				}
+			}
 
 			if tx {
 
@@ -147,6 +209,11 @@ func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggr
 			}
 
 			if stats.endTime > 0 || stats.startTime == 0 { // explicitly finished or already de-initialized
+				<-done // wait for signal before returning (signalling done back)
+				return
+			}
+			if benchmarkDuration > 0 && dttot > float64(benchmarkDuration / time.Second) { // benchmark over
+				herculesClose(session)
 				return
 			}
 			prevStats = stats
@@ -157,7 +224,7 @@ func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggr
 // statsAwaitStart busy-waits until hercules_get_stats indicates that the transfer has started.
 func statsAwaitStart(session *HerculesSession) {
 	for {
-		stats := herculesGetStats(session)
+		stats := herculesGetStats(session, nil)
 		if stats.startTime > 0 {
 			return
 		}
@@ -170,7 +237,7 @@ func printSummary(stats herculesStats, aggregate aggregateStats) {
 	dttot := float64(stats.endTime-stats.startTime) / 1e9
 	filesize := stats.filesize
 	goodputBytePS := float64(filesize) / dttot
-	fmt.Printf("\nTransfer completed:\n  %-12s%10.3fs\n  %-12s%11s\n  %-13s%11s (%s)\n  %-11s%11.3f\n  %-11s%11.3f\n  %-13s%11s (%s)\n  %-13s%11s\n",
+	fmt.Printf("\nTransfer completed:\n  %-12s%10.3fs\n  %-12s%11s\n  %-13s%11s (%s)\n  %-11s%11.3f\n  %-11s%11.3f\n  %-13s%11s (%s)\n  %-13s%11s\n  %-11s%10d\n  %-11s%10d\n  %-11s%10d\n",
 		"Duration:", dttot,
 		"Filesize:", humanReadableSize(filesize, "B"),
 		"Rate:", humanReadable(8*goodputBytePS, "b/s"), humanReadableSize(uint64(goodputBytePS), "B/s"),
@@ -178,6 +245,9 @@ func printSummary(stats herculesStats, aggregate aggregateStats) {
 		"Rcvd/Chunk:", float64(stats.rxNpkts)/float64(stats.totalChunks),
 		"Max thr.put:", humanReadable(aggregate.maxBpsThru, "b/s"), humanReadable(aggregate.maxPps, "P/s"),
 		"Max goodput:", humanReadable(aggregate.maxBpsGood, "b/s"),
+		"Chks:", stats.totalChunks,
+		"Sent:", stats.txNpkts,
+		"Rcvd:", stats.rxNpkts,
 	)
 }
 

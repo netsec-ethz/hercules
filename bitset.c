@@ -21,6 +21,7 @@ void bitset__create(struct bitset *s, u32 num)
 	                   HERCULES_BITSET_WORD_BITS / 8);
 	s->num = num;
 	s->num_set = 0;
+	pthread_spin_init(&s->lock, PTHREAD_PROCESS_PRIVATE);
 }
 
 void bitset__destroy(struct bitset *s)

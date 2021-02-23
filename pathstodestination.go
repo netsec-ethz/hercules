@@ -39,6 +39,7 @@ type PathsToDestination struct {
 type PathMeta struct {
 	path        snet.Path
 	fingerprint snet.PathFingerprint
+	iface       *net.Interface
 	enabled     bool // Indicates whether this path can be used at the moment
 	updated     bool // Indicates whether this path needs to be synced to the C path
 }
@@ -96,7 +97,7 @@ func (ptd *PathsToDestination) choosePaths() bool {
 		return false
 	}
 
-	availablePaths := ptd.allPaths
+	availablePaths := ptd.pm.filterPathsByActiveInterfaces(ptd.allPaths)
 	if len(availablePaths) == 0 {
 		log.Error(fmt.Sprintf("no paths to destination %s", ptd.dst.hostAddr.IA.String()))
 	}
@@ -120,10 +121,9 @@ func (ptd *PathsToDestination) choosePaths() bool {
 	return false
 }
 
-func (ptd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool, availablePaths *[]snet.Path) bool {
+func (ptd *PathsToDestination) choosePreviousPaths(previousPathAvailable *[]bool, availablePaths *AppPathSet) bool {
 	updated := false
-	for _, newPath := range *availablePaths {
-		newFingerprint := snet.Fingerprint(newPath)
+	for newFingerprint := range *availablePaths {
 		for i := range ptd.paths {
 			pathMeta := &ptd.paths[i]
 			if newFingerprint == pathMeta.fingerprint {
@@ -153,7 +153,7 @@ func (ptd *PathsToDestination) disableVanishedPaths(previousPathAvailable *[]boo
 	return updated
 }
 
-func (ptd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, availablePaths *[]snet.Path) bool {
+func (ptd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, availablePaths *AppPathSet) bool {
 	updated := false
 	// XXX for now, we do not support replacing vanished paths
 	// check that no previous path available
@@ -196,26 +196,34 @@ func (ptd *PathsToDestination) chooseNewPaths(previousPathAvailable *[]bool, ava
 		ptd.paths[i].fingerprint = fingerprint
 		ptd.paths[i].enabled = true
 		ptd.paths[i].updated = true
+		ptd.paths[i].iface = (*availablePaths)[fingerprint].iface
 		updated = true
 	}
 	return updated
 }
 
-func (ptd *PathsToDestination) preparePath(p *snet.Path) (*HerculesPathHeader, error) {
+func (ptd *PathsToDestination) preparePath(p *PathMeta) (*HerculesPathHeader, error) {
 	var err error
+	var iface *net.Interface
 	curDst := ptd.dst.hostAddr
-	if *p == nil {
+	if (*p).path == nil {
 		// in order to use a static empty path, we need to set the next hop on dst
 		curDst.NextHop = &net.UDPAddr{
 			IP:   ptd.dst.hostAddr.Host.IP,
 			Port: topology.EndhostPort,
 		}
+		iface, err = ptd.pm.interfaceForRoute(ptd.dst.hostAddr.Host.IP)
+		if err != nil {
+			return nil, err
+		}
 	} else {
-		curDst.Path = (*p).Path()
-		curDst.NextHop = (*p).UnderlayNextHop()
+		curDst.Path = (*p).path.Path()
+
+		curDst.NextHop = (*p).path.UnderlayNextHop()
+		iface = p.iface
 	}
 
-	path, err := prepareSCIONPacketHeader(ptd.pm.src, curDst, ptd.pm.iface)
+	path, err := prepareSCIONPacketHeader(ptd.pm.src, curDst, iface)
 	if err != nil {
 		return nil, err
 	}

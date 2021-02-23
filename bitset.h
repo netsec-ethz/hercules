@@ -20,12 +20,16 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <string.h>
+#include <pthread.h>
+#include "bpf/src/libbpf_util.h"
 
 /** Simple bit-set that keeps track of number of elements in the set. */
 struct bitset {
 	unsigned int *bitmap;
 	u32 num;
 	u32 num_set;
+	u32 max_set;
+	pthread_spinlock_t lock;
 };
 
 #define HERCULES_BITSET_WORD_BITS (8 * sizeof(unsigned int))
@@ -45,12 +49,24 @@ inline bool bitset__check(struct bitset *s, u32 i)
 // Returns the previous state of the bit.
 inline bool bitset__set_mt_safe(struct bitset *s, u32 i)
 {
+	pthread_spin_lock(&s->lock);
+	libbpf_smp_rmb();
 	unsigned int bit = 1u << i % HERCULES_BITSET_WORD_BITS;
 	unsigned int prev = atomic_fetch_or(&s->bitmap[i / HERCULES_BITSET_WORD_BITS], bit);
 	if(!(prev & bit)) {
 		atomic_fetch_add(&s->num_set, 1);
+		u32 tmp_max = atomic_load(&s->max_set);
+		while(tmp_max < i) {
+			if(atomic_compare_exchange_weak(&s->max_set, &tmp_max, i)) {
+				pthread_spin_unlock(&s->lock);
+				return false;
+			}
+		}
+		pthread_spin_unlock(&s->lock);
 		return false;
 	}
+	libbpf_smp_wmb();
+	pthread_spin_unlock(&s->lock);
 	return true;
 }
 
@@ -62,6 +78,9 @@ inline bool bitset__set(struct bitset *s, u32 i)
 	s->bitmap[i / HERCULES_BITSET_WORD_BITS] |= (1 << i % HERCULES_BITSET_WORD_BITS);
 	if(!prev) {
 		s->num_set++;
+		if(s->max_set < i) {
+			s->max_set = i;
+		}
 	}
 	return prev;
 }
@@ -95,7 +114,7 @@ inline void bitset__reset(struct bitset *s)
 inline u32 bitset__scan(struct bitset *s, u32 pos)
 {
 	// TODO: profile the entire application and rewrite this function to use bitscan ops
-	for(u32 i = pos; i < s->num; ++i) {
+	for(u32 i = pos; i < s->max_set; ++i) {
 		if(bitset__check(s, i)) {
 			return i;
 		}

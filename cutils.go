@@ -14,7 +14,7 @@
 
 package main
 
-// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=broadwell -mtune=broadwell
+// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=sandybridge -mtune=broadwell
 // #cgo LDFLAGS: ${SRCDIR}/bpf/src/libbpf.a -lm -lelf -pthread -lz
 // #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
 // #include "hercules.h"
@@ -54,19 +54,24 @@ type layerWithOpts struct {
 
 type HerculesSession struct {
 	session *C.struct_hercules_session
-	iface *net.Interface
 }
 
-var herculesSession *HerculesSession
+type pathStats struct {
+	statsBuffer *C.struct_path_stats
+}
 
 const XDP_ZEROCOPY = C.XDP_ZEROCOPY
 const XDP_COPY = C.XDP_COPY
 const minFrameSize = int(C.HERCULES_MAX_HEADERLEN) + 213 // sizeof(struct rbudp_initial_pkt) + rbudp_headerlen
 
-func herculesInit(iface *net.Interface, local *snet.UDPAddr, queue int, MTU int) *HerculesSession {
-	herculesSession = &HerculesSession{
-		session: C.hercules_init(C.int(iface.Index), toCAddr(local), C.int(queue), C.int(MTU)),
-		iface: iface,
+func herculesInit(interfaces []*net.Interface, local *snet.UDPAddr, queue int, MTU int) *HerculesSession {
+	var ifIndices []int
+	for _, iface := range interfaces {
+		ifIndices = append(ifIndices, iface.Index)
+	}
+	ifacesC := toCIntArray(ifIndices)
+	herculesSession := &HerculesSession{
+		session: C.hercules_init(&ifacesC[0], C.int(len(interfaces)), toCAddr(local), C.int(queue), C.int(MTU)),
 	}
 	return herculesSession
 }
@@ -94,14 +99,15 @@ func herculesTx(session *HerculesSession, filename string, offset int, length in
 		C.bool(enablePCC),
 		C.int(xdpMode),
 		C.int(numThreads),
-	))
+	), nil)
 }
 
-func herculesRx(session *HerculesSession, filename string, xdpMode int, numThreads int, configureQueues bool, acceptTimeout int) herculesStats {
+func herculesRx(session *HerculesSession, filename string, xdpMode int, numThreads int, configureQueues bool, acceptTimeout int, isPCCBenchmark bool) herculesStats {
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
 	return herculesStatsFromC(
-		C.hercules_rx(session.session, cFilename, C.int(xdpMode), C.bool(configureQueues), C.int(acceptTimeout), C.int(numThreads)),
+			C.hercules_rx(session.session, cFilename, C.int(xdpMode), C.bool(configureQueues), C.int(acceptTimeout), C.int(numThreads), C.bool(isPCCBenchmark)),
+		nil,
 	)
 }
 
@@ -109,11 +115,32 @@ func herculesClose(session *HerculesSession) {
 	C.hercules_close(session.session)
 }
 
-func herculesGetStats(session *HerculesSession) herculesStats {
-	return herculesStatsFromC(C.hercules_get_stats(session.session))
+func makePerPathStatsBuffer(numPaths int) *pathStats {
+	return &pathStats{
+		statsBuffer: C.make_path_stats_buffer(C.int(numPaths)),
+	}
 }
 
-func herculesStatsFromC(stats C.struct_hercules_stats) herculesStats {
+func herculesGetStats(session *HerculesSession, pStats *pathStats) herculesStats {
+	var statsBuffer *C.struct_path_stats = nil
+	if pStats != nil {
+		statsBuffer = pStats.statsBuffer
+	}
+	return herculesStatsFromC(C.hercules_get_stats(session.session, statsBuffer), pStats)
+}
+
+func herculesStatsFromC(stats C.struct_hercules_stats, pStats *pathStats) herculesStats {
+	var ppStats []perPathStats
+	if pStats != nil {
+		numPaths := int(pStats.statsBuffer.num_paths)
+		ppStats = make([]perPathStats, numPaths, numPaths)
+		// circumvent Go range checking and pStats.statsBuffer.paths as dynamic struct member
+		statsBuffer := (*[1 << 30]C.struct_path_stats_path)(unsafe.Pointer(&pStats.statsBuffer.paths[0]))[:numPaths:numPaths]
+		for i := 0; i < numPaths; i++ {
+			ppStats[i].pps_target = int64(statsBuffer[i].pps_target)
+			ppStats[i].total_packets = int64(statsBuffer[i].total_packets)
+		}
+	}
 	return herculesStats{
 		startTime:       uint64(stats.start_time),
 		endTime:         uint64(stats.end_time),
@@ -126,6 +153,7 @@ func herculesStatsFromC(stats C.struct_hercules_stats) herculesStats {
 		totalChunks:     uint32(stats.total_chunks),
 		completedChunks: uint32(stats.completed_chunks),
 		rateLimit:       uint32(stats.rate_limit),
+		paths:           ppStats,
 	}
 }
 
@@ -141,17 +169,17 @@ func (cpm *CPathManagement) initialize(numDestinations int, numPathsPerDestinati
 //export HerculesGetReplyPath
 func HerculesGetReplyPath(headerPtr unsafe.Pointer, length C.int, replyPathStruct *C.struct_hercules_path) C.int {
 	buf := C.GoBytes(headerPtr, length)
-	replyPath, err := getReplyPathHeader(buf, herculesSession.iface)
+	replyPath, err := getReplyPathHeader(buf)
 	if err != nil {
 		log.Debug("HerculesGetReplyPath", "err", err)
 		return 1
 	}
-	// path header memory is set up by C on the stack, no need to call allocateCPathHeaderMemory() here
-	toCPath(replyPath, replyPathStruct, false, false)
+	// the interface index is handled C-internally
+	toCPath(nil, replyPath, replyPathStruct, false, false)
 	return 0
 }
 
-func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPathHeader, error) {
+func getReplyPathHeader(buf []byte) (*HerculesPathHeader, error) {
 	packet := gopacket.NewPacket(buf, layers.LayerTypeEthernet, gopacket.Default)
 	if err := packet.ErrorLayer(); err != nil {
 		return nil, fmt.Errorf("error decoding some part of the packet: %v", err)
@@ -160,6 +188,7 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPathHeader, 
 	if eth == nil {
 		return nil, errors.New("error decoding ETH layer")
 	}
+	dstMAC, srcMAC := eth.(*layers.Ethernet).SrcMAC, eth.(*layers.Ethernet).DstMAC
 
 	ip4 := packet.Layer(layers.LayerTypeIPv4)
 	if ip4 == nil {
@@ -189,9 +218,6 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPathHeader, 
 		if err := sourcePkt.Path.Reverse(); err != nil {
 			return nil, fmt.Errorf("failed to reverse SCION path: %v", err)
 		}
-		log.Debug("getReplyPathHeader", "path", sourcePkt.Path)
-	} else {
-		log.Debug("getReplyPathHeader", "path", "No SCION Path header, source and destination in same AS.")
 	}
 
 	udpPkt, ok := sourcePkt.Payload.(snet.UDPPayload)
@@ -199,7 +225,7 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPathHeader, 
 		return nil, errors.New("error decoding SCION/UDP")
 	}
 
-	underlayHeader, err := prepareUnderlayPacketHeader(srcIP, dstIP, uint16(udpDstPort), iface)
+	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, srcIP, dstIP, uint16(udpDstPort))
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +267,7 @@ func getReplyPathHeader(buf []byte, iface *net.Interface) (*HerculesPathHeader, 
 }
 
 // Assumes that the path header memory has already been set up; call allocateCPathHeaderMemory before, if needed
-func toCPath(from *HerculesPathHeader, to *C.struct_hercules_path, replaced, enabled bool) {
+func toCPath(iface *net.Interface, from *HerculesPathHeader, to *C.struct_hercules_path, replaced, enabled bool) {
 	headerLen := len(from.Header)
 	if len(from.Header) > C.HERCULES_MAX_HEADERLEN {
 		panic(fmt.Sprintf("Header too long (%d), can't invoke hercules C API.", len(from.Header)))
@@ -254,6 +280,9 @@ func toCPath(from *HerculesPathHeader, to *C.struct_hercules_path, replaced, ena
 	to.headerlen = C.int(headerLen)
 	to.payloadlen = C.int(etherLen - headerLen) // TODO(matzf): take actual MTU into account, also when building header
 	to.framelen = C.int(etherLen)               // TODO(matzf): "
+	if iface != nil {
+		to.ifid = C.int(iface.Index)
+	}
 	to.replaced = C.atomic_bool(replaced)
 	to.enabled = C.atomic_bool(enabled)
 }
@@ -288,7 +317,12 @@ func toCIntArray(in []int) []C.int {
 }
 
 func prepareSCIONPacketHeader(src, dst *snet.UDPAddr, iface *net.Interface) (*HerculesPathHeader, error) {
-	underlayHeader, err := prepareUnderlayPacketHeader(src.Host.IP, dst.NextHop.IP, uint16(dst.NextHop.Port), iface)
+	dstMAC, srcMAC, err := getAddrs(iface, dst.NextHop.IP)
+	if err != nil {
+		return nil, err
+	}
+
+	underlayHeader, err := prepareUnderlayPacketHeader(srcMAC, dstMAC, src.Host.IP, dst.NextHop.IP, uint16(dst.NextHop.Port))
 	if err != nil {
 		return nil, err
 	}
@@ -328,15 +362,10 @@ func prepareSCIONPacketHeader(src, dst *snet.UDPAddr, iface *net.Interface) (*He
 	return &herculesPath, nil
 }
 
-func prepareUnderlayPacketHeader(srcIP, dstIP net.IP, dstPort uint16, iface *net.Interface) ([]byte, error) {
+func prepareUnderlayPacketHeader(srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, dstPort uint16) ([]byte, error) {
 	ethHeader := 14
 	ipHeader := 20
 	udpHeader := 8
-
-	dstMAC, srcMAC, err := getAddrs(iface, dstIP)
-	if err != nil {
-		return nil, err
-	}
 
 	eth := layers.Ethernet{
 		SrcMAC:       srcMAC,
@@ -377,7 +406,7 @@ func prepareUnderlayPacketHeader(srcIP, dstIP net.IP, dstPort uint16, iface *net
 		FixLengths:       false,
 		ComputeChecksums: true,
 	}
-	err = serializeLayersWOpts(buf,
+	err := serializeLayersWOpts(buf,
 		layerWithOpts{&eth, serializeOpts},
 		layerWithOpts{&ip, serializeOptsChecked},
 		layerWithOpts{&udp, serializeOpts})
@@ -526,7 +555,7 @@ func (pm *PathManager) pushPaths(session *HerculesSession) {
 	}
 
 	pm.syncTime = syncTime
-	C.push_hercules_tx_paths(herculesSession.session)
+	//C.push_hercules_tx_paths(herculesSession.session) not needed atm
 }
 
 // TODO move back to pathstodestination.go
@@ -534,7 +563,9 @@ func (ptd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
 	n := 0
 	slot := 0
 	if ptd.paths == nil {
-		ptd.canSendLocally = ptd.pushPath(&PathMeta{updated: true, enabled: true}, firstSlot)
+		for _, iface := range ptd.pm.interfaces {
+			ptd.canSendLocally = ptd.pushPath(&PathMeta{updated: true, enabled: true, iface: iface}, firstSlot)
+		}
 	} else {
 		for p := range ptd.paths {
 			path := &ptd.paths[p]
@@ -554,13 +585,13 @@ func (ptd *PathsToDestination) pushPaths(pwdIdx, firstSlot int) {
 // TODO move back to pathstodestination.go
 func (ptd *PathsToDestination) pushPath(path *PathMeta, slot int) bool {
 	if path.updated {
-		herculesPath, err := ptd.preparePath(&path.path)
+		herculesPath, err := ptd.preparePath(path)
 		if err != nil {
 			log.Error(err.Error() + " - path disabled")
 			ptd.pm.cStruct.pathsPerDest[slot].enabled = false
 			return false
 		}
-		toCPath(herculesPath, &ptd.pm.cStruct.pathsPerDest[slot], true, path.enabled)
+		toCPath(path.iface, herculesPath, &ptd.pm.cStruct.pathsPerDest[slot], true, path.enabled)
 	} else {
 		ptd.pm.cStruct.pathsPerDest[slot].enabled = C.atomic_bool(path.enabled)
 	}

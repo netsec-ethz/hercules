@@ -22,6 +22,7 @@ init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, size_t num_paths, size
 		cc_state->max_rate_limit = max_rate_limit;
 		cc_state->num_paths = num_paths;
 		cc_state->total_num_paths = total_num_paths;
+		pthread_spin_init(&cc_state->lock, PTHREAD_PROCESS_PRIVATE);
 
 		continue_ccontrol(cc_state);
 	}
@@ -31,8 +32,10 @@ init_ccontrol_state(u32 max_rate_limit, u32 total_chunks, size_t num_paths, size
 void ccontrol_start_monitoring_interval(struct ccontrol_state *cc_state)
 {
 	cc_state->mi_start = get_nsecs();
+	cc_state->mi_end = cc_state->mi_start + cc_state->pcc_mi_duration * 1e9;
 	cc_state->mi_seq_start = cc_state->last_seqnr;
-	cc_state->mi_seq_end = cc_state->mi_seq_start + cc_state->curr_rate * cc_state->pcc_mi_duration;
+	cc_state->mi_seq_end = 0;
+	cc_state->excess_npkts = 0;
 	atomic_store(&cc_state->mi_tx_npkts, 0);
 	atomic_store(&cc_state->mi_tx_npkts_monitored, 0);
 	if(cc_state->mi_nacked.bitmap != NULL) {
@@ -75,6 +78,7 @@ void continue_ccontrol(struct ccontrol_state *cc_state)
 {
 	cc_state->prev_rate = cc_state->curr_rate;
 	cc_state->state = pcc_uninitialized;
+	cc_state->ignored_first_mi = false;
 	cc_state->eps = EPS_MIN;
 	cc_state->sign = 1;
 	cc_state->rcts_iter = -1;
@@ -88,6 +92,8 @@ u32 ccontrol_can_send_npkts(struct ccontrol_state *cc_state, u64 now)
 	if(cc_state->state == pcc_uninitialized) {
 		cc_state->state = pcc_startup;
 		cc_state->mi_start = get_nsecs();
+		cc_state->mi_end = cc_state->mi_start + cc_state->pcc_mi_duration * 1e9;
+		now = cc_state->mi_start;
 	}
 	u64 dt = now - cc_state->mi_start;
 
@@ -97,13 +103,13 @@ u32 ccontrol_can_send_npkts(struct ccontrol_state *cc_state, u64 now)
 	if(tx_pps > cc_state->curr_rate) {
 		return 0;
 	}
-	return cc_state->curr_rate - tx_pps;
+	return (cc_state->curr_rate - tx_pps) * cc_state->pcc_mi_duration;
 }
 
 void kick_ccontrol(struct ccontrol_state *cc_state)
 {
-	// TODO maybe use lower startup factor
-	cc_state->state = pcc_startup;
+	// TODO can / should we get rid of this?
+	//cc_state->state = pcc_startup;
 }
 
 void destroy_ccontrol_state(struct ccontrol_state *cc_states, size_t num_paths)
@@ -128,7 +134,7 @@ static float pcc_utility(float throughput, float loss)
 }
 
 // Startup state
-static u32 pcc_control_startup(struct ccontrol_state *cc_state, float utility, float loss)
+static u32 pcc_control_startup(struct ccontrol_state *cc_state, float utility, float loss, u32 actual_rate)
 {
 	if(utility > cc_state->prev_utility) {
 		cc_state->state = pcc_startup;
@@ -137,7 +143,22 @@ static u32 pcc_control_startup(struct ccontrol_state *cc_state, float utility, f
 		// Update state: Startup -> Decision
 		cc_state->state = pcc_decision;
 		return cc_state->prev_rate * (1 - loss);
+		//return umin32(actual_rate, cc_state->prev_rate * (1 - loss));
 	}
+}
+
+static inline u32 calculate_rate(double mi_duration, u32 prev_rate, float factor) {
+	u32 new_rate = prev_rate * factor;
+	if(factor < 1) {
+		if((u32) (new_rate * mi_duration) > (u32) (prev_rate * mi_duration) - 10) {
+			new_rate = (prev_rate * mi_duration - 10) / mi_duration;
+		}
+	} else {
+		if((u32) (new_rate * mi_duration) < (u32) (prev_rate * mi_duration) + 10) {
+			new_rate = (prev_rate * mi_duration + 10) / mi_duration;
+		}
+	}
+	return new_rate;
 }
 
 // Setup randomized controlled trials
@@ -152,7 +173,7 @@ static void setup_rcts(struct ccontrol_state *cc_state)
 		} else {
 			sign = 1.f;
 		}
-		struct rct trial = {.rate = cc_state->prev_rate * (1.f + sign * eps), .utility = 0.f};
+		struct rct trial = {.rate = calculate_rate(cc_state->pcc_mi_duration, cc_state->prev_rate, 1.f + sign * eps), .utility = 0.f};
 		cc_state->rcts[i] = trial;
 	}
 	cc_state->rcts_iter = 0;
@@ -182,7 +203,7 @@ static enum rcts_result rcts_decision(struct ccontrol_state *cc_state)
 }
 
 // Decision making state
-static u32 pcc_control_decision(struct ccontrol_state *cc_state, float utility)
+static u32 pcc_control_decision(struct ccontrol_state *cc_state, float utility, u32 actual_rate)
 {
 	if(cc_state->rcts_iter == -1) {
 		// Init RCTs
@@ -230,14 +251,14 @@ static u32 pcc_control_decision(struct ccontrol_state *cc_state, float utility)
 }
 
 // Rate adjusting state
-static u32 pcc_control_adjust(struct ccontrol_state *cc_state, float utility)
+static u32 pcc_control_adjust(struct ccontrol_state *cc_state, float utility, u32 actual_rate)
 {
 	if(utility > cc_state->prev_utility) {
 		int n = cc_state->adjust_iter;
 		float sign = cc_state->sign;
 		cc_state->adjust_iter += 1;
 		cc_state->state = pcc_adjust;
-		return cc_state->prev_rate * (1.f + sign * n * EPS_MIN);
+		return calculate_rate(cc_state->pcc_mi_duration, cc_state->prev_rate, 1.f + sign * n * EPS_MIN);
 	} else {
 		// Update state: Adjust -> Decision
 		cc_state->state = pcc_decision;
@@ -260,20 +281,20 @@ u32 pcc_control(struct ccontrol_state *cc_state, float throughput, float loss)
 	enum pcc_state current_pcc_state = cc_state->state;
 	switch(current_pcc_state) {
 		case pcc_startup:
-			new_rate = pcc_control_startup(cc_state, utility, loss);
+			new_rate = pcc_control_startup(cc_state, utility, loss, throughput);
 			break;
 		case pcc_decision:
-			new_rate = pcc_control_decision(cc_state, utility);
+			new_rate = pcc_control_decision(cc_state, utility, throughput);
 			break;
 		case pcc_adjust:
-			new_rate = pcc_control_adjust(cc_state, utility);
+			new_rate = pcc_control_adjust(cc_state, utility, throughput);
 			break;
 		default:
 			fprintf(stderr, "Invalid PCC state: %d\n", current_pcc_state);
 			cc_state->state = pcc_startup;
 	}
 
-	new_rate = umin32(umax32(1, new_rate), cc_state->max_rate_limit);
+	new_rate = umin32(umax32(1000, new_rate), cc_state->max_rate_limit);
 
 	cc_state->prev_utility = utility;
 	cc_state->curr_rate = new_rate;
