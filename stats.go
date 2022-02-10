@@ -237,7 +237,7 @@ func printSummary(stats herculesStats, aggregate aggregateStats) {
 	dttot := float64(stats.endTime-stats.startTime) / 1e9
 	filesize := stats.filesize
 	goodputBytePS := float64(filesize) / dttot
-	fmt.Printf("\nTransfer completed:\n  %-12s%10.3fs\n  %-12s%11s\n  %-13s%11s (%s)\n  %-11s%11.3f\n  %-11s%11.3f\n  %-13s%11s (%s)\n  %-13s%11s\n  %-11s%10d\n  %-11s%10d\n  %-11s%10d\n",
+	fmt.Printf("\nTransfer completed:\n  %-12s%10.3fs\n  %-12s%11s\n  %-13s%11s (%s)\n  %-11s%11.3f\n  %-11s%11.3f\n  %-13s%11s (%s)\n  %-13s%11s\n  %-11s%10d\n  %-11s%10d\n  %-11s%10d\n  %-13s%10d\n  %-13s%10d\n",
 		"Duration:", dttot,
 		"Filesize:", humanReadableSize(filesize, "B"),
 		"Rate:", humanReadable(8*goodputBytePS, "b/s"), humanReadableSize(uint64(goodputBytePS), "B/s"),
@@ -248,6 +248,8 @@ func printSummary(stats herculesStats, aggregate aggregateStats) {
 		"Chks:", stats.totalChunks,
 		"Sent:", stats.txNpkts,
 		"Rcvd:", stats.rxNpkts,
+        "LChunk:", stats.chunkLen,
+        "LFrame:", stats.frameLen,
 	)
 }
 
