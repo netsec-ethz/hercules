@@ -15,7 +15,7 @@
 package main
 
 import (
-	"github.com/scionproto/scion/go/lib/snet"
+	"github.com/scionproto/scion/pkg/snet"
 )
 
 type PathSpec []PathInterface
@@ -57,7 +57,7 @@ func makePathPicker(spec *[]PathSpec, pathSet *AppPathSet, numPaths int) *PathPi
 
 func (picker *PathPicker) reset(numPaths int) {
 	descriptor := make([]PathPickDescriptor, numPaths)
-	for i, _ := range descriptor {
+	for i := range descriptor {
 		descriptor[i].ruleIndex = -1
 		descriptor[i].pathIndex = -1
 	}
@@ -88,7 +88,7 @@ func (picker *PathPicker) numPaths() int {
 func (picker *PathPicker) nextRuleSet() bool {
 	ret := picker.nextRuleSetIterate(len(picker.currentPathPick) - 1)
 	if ret {
-		for i, _ := range picker.currentPathPick {
+		for i := range picker.currentPathPick {
 			picker.currentPathPick[i].pathIndex = -1
 		}
 	}

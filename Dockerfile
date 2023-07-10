@@ -34,12 +34,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV PATH /usr/local/go/bin:$PATH
 
-RUN wget https://go.dev/dl/go1.17.9.linux-amd64.tar.gz && \
-    echo "9dacf782028fdfc79120576c872dee488b81257b1c48e9032d122cfdb379cca6 go1.17.9.linux-amd64.tar.gz" | sha256sum -c && \
-    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.17.9.linux-amd64.tar.gz
+RUN wget https://go.dev/dl/go1.19.10.linux-amd64.tar.gz && \
+    echo "8b045a483d3895c6edba2e90a9189262876190dbbd21756870cdd63821810677 go1.19.10.linux-amd64.tar.gz" | sha256sum -c && \
+    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.19.10.linux-amd64.tar.gz
 ENV PATH /usr/local/go/bin:$PATH
-
-RUN go version
 
 RUN groupadd --gid $GID --non-unique buildboy
 RUN useradd buildboy --create-home --shell /bin/bash --non-unique --uid $UID --gid $GID

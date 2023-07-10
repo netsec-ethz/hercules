@@ -25,7 +25,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	log "github.com/inconshreveable/log15"
-	"github.com/scionproto/scion/go/lib/snet"
+	"github.com/scionproto/scion/pkg/snet"
 )
 
 type arrayFlags []string
@@ -58,8 +58,8 @@ const (
 )
 
 var (
-	startupVersion  string         // Add detailed version information to binary for reproducible tests
-	etherLen        int
+	startupVersion string // Add detailed version information to binary for reproducible tests
+	etherLen       int
 )
 
 func (i *arrayFlags) String() string {
@@ -84,7 +84,7 @@ func isFlagPassed(name string) bool {
 func main() {
 	err := realMain()
 	if err != nil {
-		log.Error(err.Error())
+		fmt.Println(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 }
@@ -269,11 +269,11 @@ func mainTx(config *HerculesSenderConfig) (err error) {
 
 	aggregateStats := aggregateStats{}
 	done := make(chan struct{}, 1)
-	go statsDumper(session, true, config.DumpInterval, &aggregateStats, config.PerPathStatsFile, config.NumPathsPerDest * len(config.Destinations), done, config.PCCBenchMarkDuration)
+	go statsDumper(session, true, config.DumpInterval, &aggregateStats, config.PerPathStatsFile, config.NumPathsPerDest*len(config.Destinations), done, config.PCCBenchMarkDuration)
 	go cleanupOnSignal(session)
 	stats := herculesTx(session, config.TransmitFile, config.FileOffset, config.FileLength,
-		                destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode(),
-		                config.NumThreads)
+		destinations, pm, config.RateLimit, config.EnablePCC, config.getXDPMode(),
+		config.NumThreads)
 	done <- struct{}{}
 	printSummary(stats, aggregateStats)
 	<-done // wait for path stats to be flushed

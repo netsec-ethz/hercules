@@ -37,7 +37,7 @@ bpf/src/libbpf.a: builder
 		docker exec -w /`basename $(PWD)`/bpf/src hercules-builder $(MAKE) install_headers DESTDIR=build OBJDIR=.; \
 	fi
 
-mockules: builder mockules/main.go
+mockules: builder mockules/main.go mockules/network.go
 	docker exec -w /`basename $(PWD)`/mockules hercules-builder go build
 
 builder: builder_image

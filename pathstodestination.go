@@ -18,9 +18,8 @@ import (
 	"context"
 	"fmt"
 	log "github.com/inconshreveable/log15"
-	"github.com/netsec-ethz/scion-apps/pkg/appnet"
-	"github.com/scionproto/scion/go/lib/snet"
-	"github.com/scionproto/scion/go/lib/topology"
+	"github.com/scionproto/scion/pkg/snet"
+	"github.com/scionproto/scion/private/topology"
 	"go.uber.org/atomic"
 	"net"
 	"time"
@@ -59,7 +58,7 @@ func initNewPathsToDestinationWithEmptyPath(pm *PathManager, dst *Destination) *
 }
 
 func initNewPathsToDestination(pm *PathManager, src *snet.UDPAddr, dst *Destination) (*PathsToDestination, error) {
-	paths, err := appnet.DefNetwork().PathQuerier.Query(context.Background(), dst.hostAddr.IA)
+	paths, err := newPathQuerier().Query(context.Background(), dst.hostAddr.IA)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +216,7 @@ func (ptd *PathsToDestination) preparePath(p *PathMeta) (*HerculesPathHeader, er
 			return nil, err
 		}
 	} else {
-		curDst.Path = (*p).path.Path()
+		curDst.Path = (*p).path.Dataplane()
 
 		curDst.NextHop = (*p).path.UnderlayNextHop()
 		iface = p.iface

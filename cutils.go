@@ -35,9 +35,9 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	log "github.com/inconshreveable/log15"
-	"github.com/scionproto/scion/go/lib/addr"
-	"github.com/scionproto/scion/go/lib/snet"
-	"github.com/scionproto/scion/go/lib/topology"
+	"github.com/scionproto/scion/pkg/addr"
+	"github.com/scionproto/scion/pkg/snet"
+	"github.com/scionproto/scion/private/topology"
 	"github.com/vishvananda/netlink"
 )
 
@@ -77,7 +77,7 @@ func herculesInit(interfaces []*net.Interface, local *snet.UDPAddr, queue int, M
 }
 
 func herculesTx(session *HerculesSession, filename string, offset int, length int, destinations []*Destination,
-				pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int, numThreads int) herculesStats {
+	pm *PathManager, maxRateLimit int, enablePCC bool, xdpMode int, numThreads int) herculesStats {
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
 
@@ -106,7 +106,7 @@ func herculesRx(session *HerculesSession, filename string, xdpMode int, numThrea
 	cFilename := C.CString(filename)
 	defer C.free(unsafe.Pointer(cFilename))
 	return herculesStatsFromC(
-			C.hercules_rx(session.session, cFilename, C.int(xdpMode), C.bool(configureQueues), C.int(acceptTimeout), C.int(numThreads), C.bool(isPCCBenchmark)),
+		C.hercules_rx(session.session, cFilename, C.int(xdpMode), C.bool(configureQueues), C.int(acceptTimeout), C.int(numThreads), C.bool(isPCCBenchmark)),
 		nil,
 	)
 }
@@ -166,6 +166,7 @@ func (cpm *CPathManagement) initialize(numDestinations int, numPathsPerDestinati
 // HerculesGetReplyPath creates a reply path header for the packet header in headerPtr with given length.
 // Returns 0 iff successful.
 // This function is exported to C and called to obtain a reply path to send NACKs from the receiver (slow path).
+//
 //export HerculesGetReplyPath
 func HerculesGetReplyPath(headerPtr unsafe.Pointer, length C.int, replyPathStruct *C.struct_hercules_path) C.int {
 	buf := C.GoBytes(headerPtr, length)
@@ -214,10 +215,16 @@ func getReplyPathHeader(buf []byte) (*HerculesPathHeader, error) {
 		return nil, fmt.Errorf("error decoding SCION packet: %v", err)
 	}
 
-	if !sourcePkt.Path.IsEmpty() {
-		if err := sourcePkt.Path.Reverse(); err != nil {
+	rpath, ok := sourcePkt.Path.(snet.RawPath)
+	if !ok {
+		return nil, fmt.Errorf("error decoding SCION packet: unexpected dataplane path type")
+	}
+	if len(rpath.Raw) != 0 {
+		replyPath, err := snet.DefaultReplyPather{}.ReplyPath(rpath)
+		if err != nil {
 			return nil, fmt.Errorf("failed to reverse SCION path: %v", err)
 		}
+		sourcePkt.Path = replyPath
 	}
 
 	udpPkt, ok := sourcePkt.Payload.(snet.UDPPayload)
@@ -303,7 +310,7 @@ func toCAddr(addr *snet.UDPAddr) C.struct_hercules_app_addr {
 func toCIA(in addr.IA) C.ia {
 	var out C.ia
 	bufIA := make([]byte, 8)
-	in.Write(bufIA)
+	binary.BigEndian.PutUint64(bufIA, uint64(in))
 	C.memcpy(unsafe.Pointer(&out), unsafe.Pointer(&bufIA[0]), 8)
 	return out
 }

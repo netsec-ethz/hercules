@@ -22,7 +22,7 @@ Option
    Requires:
     - gcc/clang
     - linux kernel headers >= 5.0
-    - go >= 1.15
+    - go 1.19
 
 
 ## Running
