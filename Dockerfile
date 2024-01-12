@@ -1,9 +1,3 @@
-# ubuntu/disco with go-1.15
-# copy pasted from
-#  https://github.com/docker-library/golang/blob/master/1.15/buster/Dockerfile
-# but with a different base image (ubuntu:disco instead of debian:stretch); we
-# need the newer kernel headers to build XDP C code against
-
 FROM ubuntu:focal
 ARG UID=1001
 ARG GID=1001
