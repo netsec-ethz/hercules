@@ -34,9 +34,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV PATH /usr/local/go/bin:$PATH
 
-RUN wget https://go.dev/dl/go1.19.10.linux-amd64.tar.gz && \
-    echo "8b045a483d3895c6edba2e90a9189262876190dbbd21756870cdd63821810677 go1.19.10.linux-amd64.tar.gz" | sha256sum -c && \
-    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.19.10.linux-amd64.tar.gz
+RUN wget https://golang.org/dl/go1.21.6.linux-amd64.tar.gz && \
+    echo "3f934f40ac360b9c01f616a9aa1796d227d8b0328bf64cb045c7b8c4ee9caea4 go1.21.6.linux-amd64.tar.gz" | sha256sum -c && \
+    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.21.6.linux-amd64.tar.gz
 ENV PATH /usr/local/go/bin:$PATH
 
 RUN groupadd --gid $GID --non-unique buildboy

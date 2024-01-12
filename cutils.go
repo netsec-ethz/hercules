@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"syscall"
 	"time"
 	"unsafe"
@@ -340,10 +341,18 @@ func prepareSCIONPacketHeader(src, dst *snet.UDPAddr, iface *net.Interface) (*He
 		Payload: nil,
 	}
 
+	dstHostIP, ok := netip.AddrFromSlice(dst.Host.IP)
+	if !ok {
+		return nil, errors.New("invalid dst host IP")
+	}
+	srcHostIP, ok := netip.AddrFromSlice(src.Host.IP)
+	if !ok {
+		return nil, errors.New("invalid src host IP")
+	}
 	scionPkt := &snet.Packet{
 		PacketInfo: snet.PacketInfo{
-			Destination: snet.SCIONAddress{IA: dst.IA, Host: addr.HostFromIP(dst.Host.IP)},
-			Source:      snet.SCIONAddress{IA: src.IA, Host: addr.HostFromIP(src.Host.IP)},
+			Destination: snet.SCIONAddress{IA: dst.IA, Host: addr.HostIP(dstHostIP)},
+			Source:      snet.SCIONAddress{IA: src.IA, Host: addr.HostIP(srcHostIP)},
 			Path:        dst.Path,
 			Payload:     payload,
 		},
