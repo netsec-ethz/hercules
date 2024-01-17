@@ -50,10 +50,7 @@
 #include "send_queue.h"
 #include "bpf_prgms.h"
 
-
 #define L4_SCMP 1
-// #define L4_UDP 17 //  == IPPROTO_UDP
-
 
 #define NUM_FRAMES (4 * 1024)
 #define BATCH_SIZE 64
@@ -383,6 +380,7 @@ static const char *parse_pkt_fast_path(const char *pkt, size_t length, bool chec
 	if(offset == UINT32_MAX) {
 		offset = *(int *)pkt;
 	}
+check=false;
 	if(check) {
 		// we compute these pointers here again so that we do not have to pass it from kernel space into user space
 		// which could negatively affect the performance in the case when the checksum is not verified
@@ -467,11 +465,30 @@ static const char *parse_pkt(const struct hercules_session *session, const char 
 	if(scionh->src_type != 0u) {
 		debug_printf("unsupported source address type: %u != 0 (IPv4)", scionh->src_type);
 	}
-	if(scionh->next_header != IPPROTO_UDP) {
-		if(scionh->next_header == L4_SCMP) {
+
+	__u8 next_header = scionh->next_header;
+	size_t next_offset = offset + scionh->header_len * SCION_HEADER_LINELEN;
+	while(next_header == SCION_HEADER_HBH) {
+		if(next_offset + 2 > length) {
+			debug_printf("too short for SCION HBH header: %zu %zu", next_offset, length);
+			return NULL;
+		}
+		next_header = pkt[next_offset];
+		next_offset += ((__u8)pkt[next_offset + 1] + 1) * SCION_HEADER_LINELEN;
+	}
+	while(next_header == SCION_HEADER_E2E) {
+		if(next_offset + 2 > length) {
+			debug_printf("too short for SCION E2E header: %zu %zu", next_offset, length);
+			return NULL;
+		}
+		next_header = pkt[next_offset];
+		next_offset += ((__u8)pkt[next_offset + 1] + 1) * SCION_HEADER_LINELEN;
+	}
+	if(next_header != IPPROTO_UDP) {
+		if(next_header == L4_SCMP) {
 			debug_printf("SCION/SCMP L4: not implemented, ignoring...");
 		} else {
-			debug_printf("unknown SCION L4: %u", scionh->next_header);
+			debug_printf("unknown SCION L4: %u", next_header);
 		}
 		return NULL;
 	}
@@ -487,7 +504,7 @@ static const char *parse_pkt(const struct hercules_session *session, const char 
 		return NULL;
 	}
 
-	offset += scionh->header_len * SCION_HEADER_LINELEN; // Header length is in lineLen of SCION_HEADER_LINELEN bytes
+	offset = next_offset;
 
 	// Finally parse the L4-UDP header
 	if(offset + sizeof(struct udphdr) > length) {
