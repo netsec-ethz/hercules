@@ -470,19 +470,29 @@ static const char *parse_pkt(const struct hercules_session *session, const char 
 	size_t next_offset = offset + scionh->header_len * SCION_HEADER_LINELEN;
 	while(next_header == SCION_HEADER_HBH) {
 		if(next_offset + 2 > length) {
-			debug_printf("too short for SCION HBH header: %zu %zu", next_offset, length);
+			debug_printf("too short for SCION HBH options header: %zu %zu", next_offset, length);
 			return NULL;
 		}
-		next_header = pkt[next_offset];
-		next_offset += ((__u8)pkt[next_offset + 1] + 1) * SCION_HEADER_LINELEN;
+		next_header = *((__u8 *)pkt + next_offset);
+		size_t header_len = (*((__u8 *)pkt + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+		if(header_len == 0) {
+			debug_printf("invalid SCION HBH options header");
+			return NULL;
+		}
+		next_offset += header_len;
 	}
 	while(next_header == SCION_HEADER_E2E) {
 		if(next_offset + 2 > length) {
-			debug_printf("too short for SCION E2E header: %zu %zu", next_offset, length);
+			debug_printf("too short for SCION E2E options header: %zu %zu", next_offset, length);
 			return NULL;
 		}
-		next_header = pkt[next_offset];
-		next_offset += ((__u8)pkt[next_offset + 1] + 1) * SCION_HEADER_LINELEN;
+		next_header = *((__u8 *)pkt + next_offset);
+		size_t header_len = (*((__u8 *)pkt + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+		if(header_len == 0) {
+			debug_printf("invalid SCION E2E options header");
+			return NULL;
+		}
+		next_offset += header_len;
 	}
 	if(next_header != IPPROTO_UDP) {
 		if(next_header == L4_SCMP) {

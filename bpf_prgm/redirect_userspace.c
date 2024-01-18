@@ -88,37 +88,32 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	if(scionh->src_type != 0u) {
 		return XDP_PASS; // unsupported source address type
 	}
-	const char dbg_str[] = "@@@: %d";
-	int n;
 	__u8 next_header = scionh->next_header;
 	size_t next_offset = sizeof(struct ether_header) +
 	                     sizeof(struct iphdr) +
 	                     sizeof(struct udphdr) +
 	                     scionh->header_len * SCION_HEADER_LINELEN;
 	#pragma unroll
-	for(n = 0; n != SCION_MAX_HBH_HEADERS; n++) {
+	for(int n = 0; n != SCION_MAX_HBH_HEADERS; n++) {
 		if(next_header == SCION_HEADER_HBH) {
 			if(data + next_offset + 2 > data_end) {
-				bpf_trace_printk(dbg_str, sizeof dbg_str, 0);
 				return XDP_PASS;
 			}
-			next_header = ((__u8 *)data)[next_offset];
-			next_offset += (((__u8 *)data)[next_offset] + 1) * SCION_HEADER_LINELEN;
+			next_header = *((__u8 *)data + next_offset);
+			next_offset += (*((__u8 *)data + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
 		}
 	}
 	#pragma unroll
-	for(n = 0; n != SCION_MAX_E2E_HEADERS; n++) {
+	for(int n = 0; n != SCION_MAX_E2E_HEADERS; n++) {
 		if(next_header == SCION_HEADER_E2E) {
-			if(data + next_offset + 3 > data_end) {
-				bpf_trace_printk(dbg_str, sizeof dbg_str, 1);
+			if(data + next_offset + 2 > data_end) {
 				return XDP_PASS;
 			}
-			next_header = ((__u8 *)data)[next_offset];
-			next_offset += (((__u8 *)data)[next_offset + 1] + 1) * SCION_HEADER_LINELEN;
+			next_header = *((__u8 *)data + next_offset);
+			next_offset += (*((__u8 *)data + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
 		}
 	}
 	if(next_header != IPPROTO_UDP) {
-		bpf_trace_printk(dbg_str, sizeof dbg_str, 2);
 		return XDP_PASS;
 	}
 
@@ -130,20 +125,20 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 		return XDP_PASS; // not addressed to us (IP in SCION hdr)
 	}
 
+	size_t offset = next_offset;
+
 	// Finally parse the L4-UDP header
-	const struct udphdr *l4udph = (struct udphdr *)&(((__u8 *)data)[next_offset]);
+	const struct udphdr *l4udph = (struct udphdr *)(data + offset);
 	if((void *)(l4udph + 1) > data_end) {
-		bpf_trace_printk(dbg_str, sizeof dbg_str, 3);
 		return XDP_PASS; // too short after all
 	}
 	if(l4udph->dest != addr->port) {
-		bpf_trace_printk(dbg_str, sizeof dbg_str, 4);
 		return XDP_PASS;
 	}
-	next_offset += sizeof(struct udphdr);
+	offset += sizeof(struct udphdr);
 
 	// write the payload offset to the first word, so that the user space program can continue from there.
-	*(__u32 *)data = next_offset;
+	*(__u32 *)data = offset;
 
 	__u32 *_num_xsks = bpf_map_lookup_elem(&num_xsks, &zero);
 	if(_num_xsks == NULL) {
