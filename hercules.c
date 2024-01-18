@@ -380,7 +380,6 @@ static const char *parse_pkt_fast_path(const char *pkt, size_t length, bool chec
 	if(offset == UINT32_MAX) {
 		offset = *(int *)pkt;
 	}
-check=false;
 	if(check) {
 		// we compute these pointers here again so that we do not have to pass it from kernel space into user space
 		// which could negatively affect the performance in the case when the checksum is not verified

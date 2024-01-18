@@ -14,7 +14,7 @@
 
 package main
 
-// #cgo CFLAGS: -O3 -Wall -D_GNU_SOURCE -march=sandybridge -mtune=broadwell
+// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE -march=sandybridge -mtune=broadwell
 // #cgo LDFLAGS: ${SRCDIR}/bpf/src/libbpf.a -lm -lelf -pthread -lz
 // #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
 // #include "hercules.h"
