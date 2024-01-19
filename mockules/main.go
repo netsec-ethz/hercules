@@ -7,9 +7,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/netsec-ethz/scion-apps/pkg/appnet"
-	"github.com/scionproto/scion/go/lib/addr"
-	"github.com/scionproto/scion/go/lib/snet"
+	"github.com/scionproto/scion/pkg/addr"
+	"github.com/scionproto/scion/pkg/snet"
 	"io"
 	"log"
 	"math"
@@ -66,11 +65,8 @@ func rbudpTxMain(srcAddr, dstAddr, filename string, blocks uint, loss float32) e
 		return err
 	}
 
-    network, querier, err := initNetwork(src.IA)
-    if err != nil {
-    	return err
-	}
-
+	network := newNetwork()
+	querier := newPathQuerier()
 
 	if !dst.IA.Equal(src.IA) {
 		ctx, cancelF := context.WithTimeout(context.Background(), 5*time.Second)
@@ -85,7 +81,7 @@ func rbudpTxMain(srcAddr, dstAddr, filename string, blocks uint, loss float32) e
 
 		path := paths[0]
 		log.Printf("Using path:\n\t%s", path)
-		dst.Path = path.Path()
+		dst.Path = path.Dataplane()
 		dst.NextHop = path.UnderlayNextHop()
 	}
 
@@ -255,8 +251,4 @@ func rbudpRecvNacks(conn snet.Conn, nacks chan uint32, ack chan interface{}) {
 			}
 		}
 	}
-}
-
-func initNetwork(ia addr.IA) (*appnet.Network, snet.PathQuerier, error) {
-	return appnet.DefNetwork(), appnet.DefNetwork().PathQuerier, nil
 }

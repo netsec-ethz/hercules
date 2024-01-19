@@ -22,7 +22,7 @@ Option
    Requires:
     - gcc/clang
     - linux kernel headers >= 5.0
-    - go >= 1.15
+    - go 1.21
 
 
 ## Running
@@ -42,7 +42,7 @@ Option
   Additionally, you may need to postpone step 2 until the handshake has succeeded.
 
 1. Make sure that SCION endhost services (sciond, dispatcher) are configured and running on both sender and receiver machines.
-   For the most recent versions of Hercules, use a SCION version compatible to `v2020.03-scionlab`.
+   For the most recent versions of Hercules, use a SCION version compatible to `https://github.com/scionproto/scion/releases/tag/v0.10.0`.
 
 1. Configure queue network interfaces to particular queue (if supported by device); in this example queue 0 is used. 
 

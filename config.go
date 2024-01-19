@@ -25,8 +25,7 @@ import (
 	"time"
 
 	log "github.com/inconshreveable/log15"
-	"github.com/scionproto/scion/go/lib/addr"
-	"github.com/scionproto/scion/go/lib/snet"
+	"github.com/scionproto/scion/pkg/snet"
 )
 
 type HerculesGeneralConfig struct {
@@ -204,7 +203,7 @@ func (config *HerculesSenderConfig) validateLoose() error {
 	}
 
 	// validate destinations
-	for d, _ := range config.Destinations {
+	for d := range config.Destinations {
 		if config.Destinations[d].NumPaths > maxPathsPerReceiver {
 			return fmt.Errorf("can use at most %d paths per destination; max for destination %d is too large (%d)", maxPathsPerReceiver, d, config.Destinations[d].NumPaths)
 		}
@@ -216,7 +215,7 @@ func (config *HerculesSenderConfig) validateLoose() error {
 		if udpAddress.Host.Port == 0 {
 			return errors.New("must specify a destination port")
 		}
-		if (udpAddress.IA == addr.IA{}) {
+		if udpAddress.IA == 0 {
 			return errors.New("must provide IA for destination address")
 		}
 	}
@@ -349,7 +348,7 @@ func (config *HerculesGeneralConfig) validateLoose() error {
 		if udpAddress.Host.Port == 0 {
 			return errors.New("must specify a source port")
 		}
-		if (udpAddress.IA == addr.IA{}) {
+		if udpAddress.IA == 0 {
 			return errors.New("must provide IA for local address")
 		}
 		for _, iface := range ifaces {

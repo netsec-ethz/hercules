@@ -17,7 +17,6 @@ package main
 import (
 	"encoding/csv"
 	"fmt"
-	"github.com/prometheus/common/log"
 	"math"
 	"os"
 	"strconv"
@@ -88,7 +87,7 @@ func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggr
 		pStats = makePerPathStatsBuffer(numPaths)
 		file, err := os.Create(pathStatsFile)
 		if err != nil {
-			log.Errorf("Cannot open %s for writing", pathStatsFile)
+			fmt.Fprintf(os.Stderr, "Cannot open %s for writing", pathStatsFile)
 			os.Exit(1)
 		}
 
@@ -96,7 +95,7 @@ func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggr
 		defer func() {
 			psWriter.Flush()
 			if err := psWriter.Error(); err != nil {
-				log.Error(err)
+				fmt.Println(os.Stderr, err)
 			}
 			_ = file.Close()
 			done <- struct{}{}
@@ -111,7 +110,7 @@ func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggr
 			)
 		}
 		if err = psWriter.Write(header); err != nil {
-			log.Error("Cannot write header")
+			fmt.Fprintf(os.Stderr, "Cannot write header")
 			os.Exit(1)
 		}
 	} else {
@@ -151,7 +150,7 @@ func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggr
 					)
 				}
 				if err := psWriter.Write(record); err != nil {
-					log.Errorf("could not write path stats record: %s", err)
+					fmt.Fprintf(os.Stderr, "could not write path stats record: %s", err)
 					os.Exit(1)
 				}
 			}
@@ -212,7 +211,7 @@ func statsDumper(session *HerculesSession, tx bool, interval time.Duration, aggr
 				<-done // wait for signal before returning (signalling done back)
 				return
 			}
-			if benchmarkDuration > 0 && dttot > float64(benchmarkDuration / time.Second) { // benchmark over
+			if benchmarkDuration > 0 && dttot > float64(benchmarkDuration/time.Second) { // benchmark over
 				herculesClose(session)
 				return
 			}
@@ -248,8 +247,8 @@ func printSummary(stats herculesStats, aggregate aggregateStats) {
 		"Chks:", stats.totalChunks,
 		"Sent:", stats.txNpkts,
 		"Rcvd:", stats.rxNpkts,
-        "LChunk:", stats.chunkLen,
-        "LFrame:", stats.frameLen,
+		"LChunk:", stats.chunkLen,
+		"LFrame:", stats.frameLen,
 	)
 }
 

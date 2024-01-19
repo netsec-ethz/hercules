@@ -16,7 +16,7 @@ package main
 
 import (
 	"fmt"
-	"github.com/scionproto/scion/go/lib/snet"
+	"github.com/scionproto/scion/pkg/snet"
 	"github.com/vishvananda/netlink"
 	"net"
 	"time"
@@ -62,11 +62,11 @@ func initNewPathManager(interfaces []*net.Interface, dsts []*Destination, src *s
 
 	numPathsPerDst := 0
 	pm := &PathManager{
-		interfaces:   ifMap,
-		src:          src,
-		dsts:         make([]*PathsToDestination, 0, len(dsts)),
-		syncTime:     time.Unix(0, 0),
-		maxBps:       maxBps,
+		interfaces: ifMap,
+		src:        src,
+		dsts:       make([]*PathsToDestination, 0, len(dsts)),
+		syncTime:   time.Unix(0, 0),
+		maxBps:     maxBps,
 	}
 
 	for _, dst := range dsts {
