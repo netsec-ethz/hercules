@@ -1,3 +1,9 @@
+# ubuntu/focal with go-1.21.6
+# copy pasted from
+# https://github.com/docker-library/golang/blob/master/1.21/bullseye/Dockerfile
+# but with a different base image (ubuntu:focal instead of debian:bullseye); we
+# need the newer kernel headers to build XDP C code against
+
 FROM ubuntu:focal
 ARG UID=1001
 ARG GID=1001
