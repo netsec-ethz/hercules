@@ -93,25 +93,19 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	                     sizeof(struct iphdr) +
 	                     sizeof(struct udphdr) +
 	                     scionh->header_len * SCION_HEADER_LINELEN;
-	#pragma unroll
-	for(int n = 0; n != SCION_MAX_HBH_HEADERS; n++) {
-		if(next_header == SCION_HEADER_HBH) {
-			if(data + next_offset + 2 > data_end) {
-				return XDP_PASS;
-			}
-			next_header = *((__u8 *)data + next_offset);
-			next_offset += (*((__u8 *)data + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	if(next_header == SCION_HEADER_HBH) {
+		if(data + next_offset + 2 > data_end) {
+			return XDP_PASS;
 		}
+		next_header = *((__u8 *)data + next_offset);
+		next_offset += (*((__u8 *)data + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
 	}
-	#pragma unroll
-	for(int n = 0; n != SCION_MAX_E2E_HEADERS; n++) {
-		if(next_header == SCION_HEADER_E2E) {
-			if(data + next_offset + 2 > data_end) {
-				return XDP_PASS;
-			}
-			next_header = *((__u8 *)data + next_offset);
-			next_offset += (*((__u8 *)data + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	if(next_header == SCION_HEADER_E2E) {
+		if(data + next_offset + 2 > data_end) {
+			return XDP_PASS;
 		}
+		next_header = *((__u8 *)data + next_offset);
+		next_offset += (*((__u8 *)data + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
 	}
 	if(next_header != IPPROTO_UDP) {
 		return XDP_PASS;
