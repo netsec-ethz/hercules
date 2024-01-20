@@ -50,6 +50,8 @@
 #include "send_queue.h"
 #include "bpf_prgms.h"
 
+#define MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE 128
+
 #define L4_SCMP 1
 
 #define NUM_FRAMES (4 * 1024)
@@ -318,7 +320,7 @@ static inline struct hercules_interface *get_interface_by_id(struct hercules_ses
  * Calculate UDP checksum
  * Same as regular IP/UDP checksum but IP addrs replaced with SCION addrs
  * buf: Pointer to start of SCION packet
- * len: SCION packet length
+ * len: Length of the upper-layer header and data
  * return value: Checksum value or 0 iff input is invalid
  */
 u16 scion_udp_checksum(const u8 *buf, int len)
@@ -342,11 +344,24 @@ u16 scion_udp_checksum(const u8 *buf, int len)
 		pseudo_header[i] = ntohl(addr_hdr[i]);
 	}
 	struct scionhdr *scion_hdr = (struct scionhdr *)buf;
-	pseudo_header[i++] = ntohs(scion_hdr->payload_len);
-	pseudo_header[i++] = scion_hdr->next_header;
+
+	pseudo_header[i++] = len;
+
+	__u8 next_header = scion_hdr->next_header;
+	size_t next_offset = scion_hdr->header_len * SCION_HEADER_LINELEN;
+	if(next_header == SCION_HEADER_HBH) {
+		next_header = *(buf + next_offset);
+		next_offset += (*(buf + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+	if(next_header == SCION_HEADER_E2E) {
+		next_header = *(buf + next_offset);
+		next_offset += (*(buf + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+
+	pseudo_header[i++] = next_header;
 
 	// UDP header
-	const u32 *udp_hdr = (const u32 *)(buf + scion_hdr->header_len * SCION_HEADER_LINELEN); // skip over SCION header
+	const u32 *udp_hdr = (const u32 *)(buf + next_offset); // skip over SCION header and extension headers
 	for(int offset = i; i - offset < sizeof(struct udphdr) / sizeof(u32); i++) {
 		pseudo_header[i] = ntohl(udp_hdr[i - offset]);
 	}
@@ -357,7 +372,7 @@ u16 scion_udp_checksum(const u8 *buf, int len)
 	struct udphdr *udphdr = (struct udphdr *)udp_hdr;
 	u16 payload_len = ntohs(udphdr->len) - sizeof(struct udphdr);
 	if(payload_len != len - sizeof(struct udphdr)) {
-		debug_printf("Invalid payload_len: Got %u, Expected: %d", payload_len, len - 8);
+		debug_printf("Invalid payload_len: Got %u, Expected: %d", payload_len, len - (int)sizeof(struct udphdr));
 		return 0;
 	}
 	const u8 *payload = (u8 *)(udphdr + 1); // skip over UDP header
@@ -1101,7 +1116,7 @@ static void tx_recv_control_messages(struct sender_state *tx_state)
 {
 	struct timeval to = {.tv_sec = 0, .tv_usec = 100};
 	setsockopt(tx_state->session->control_sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
-	char buf[tx_state->session->config.ether_size];
+	char buf[tx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE];
 
 	// packet receive timeouts
 	u64 last_pkt_rcvd[tx_state->num_receivers];
@@ -1128,7 +1143,7 @@ static void tx_recv_control_messages(struct sender_state *tx_state)
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
 		const struct udphdr *udphdr;
 		u8 path_idx;
-		if(recv_rbudp_control_pkt(tx_state->session, buf, tx_state->session->config.ether_size, &payload, &payloadlen,
+		if(recv_rbudp_control_pkt(tx_state->session, buf, sizeof buf, &payload, &payloadlen,
 								  &scionaddrhdr, &udphdr, &path_idx, NULL)) {
 			const struct hercules_control_packet *control_pkt = (const struct hercules_control_packet *) payload;
 			if((u32) payloadlen < sizeof(control_pkt->type)) {
@@ -1207,14 +1222,14 @@ static bool tx_await_cts(struct sender_state *tx_state)
 	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
 	setsockopt(tx_state->session->control_sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
-	char buf[tx_state->session->config.ether_size];
+	char buf[tx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE];
 	const char *payload;
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
 	// Wait up to 20 seconds for the receiver to get ready
 	for(u64 start = get_nsecs(); start + 300e9l > get_nsecs();) {
-		if(recv_rbudp_control_pkt(tx_state->session, buf, tx_state->session->config.ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr, NULL, NULL)) {
+		if(recv_rbudp_control_pkt(tx_state->session, buf, sizeof buf, &payload, &payloadlen, &scionaddrhdr, &udphdr, NULL, NULL)) {
 			if(tx_handle_cts(tx_state, payload, payloadlen, rcvr_by_src_address(tx_state, scionaddrhdr, udphdr))) {
 				received++;
 				if(received >= tx_state->num_receivers) {
@@ -1228,7 +1243,7 @@ static bool tx_await_cts(struct sender_state *tx_state)
 
 static void tx_send_handshake_ack(struct sender_state *tx_state, u32 rcvr)
 {
-	char buf[tx_state->session->config.ether_size];
+	char buf[tx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE];
 	struct hercules_path *path = &tx_state->receiver[rcvr].paths[0];
 	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
 
@@ -1242,7 +1257,7 @@ static void tx_send_handshake_ack(struct sender_state *tx_state, u32 rcvr)
 	atomic_fetch_add(&tx_state->session->tx_npkts, 1);
 }
 
-static bool tx_await_rtt_ack(struct sender_state *tx_state, char *buf, const struct scionaddrhdr_ipv4 **scionaddrhdr, const struct udphdr **udphdr)
+static bool tx_await_rtt_ack(struct sender_state *tx_state, char *buf, size_t buflen, const struct scionaddrhdr_ipv4 **scionaddrhdr, const struct udphdr **udphdr)
 {
 	const struct scionaddrhdr_ipv4 *scionaddrhdr_fallback;
 	if(scionaddrhdr == NULL) {
@@ -1260,7 +1275,7 @@ static bool tx_await_rtt_ack(struct sender_state *tx_state, char *buf, const str
 
 	const char *payload;
 	int payloadlen;
-	if(recv_rbudp_control_pkt(tx_state->session, buf, tx_state->session->config.ether_size, &payload, &payloadlen, scionaddrhdr, udphdr, NULL, NULL)) {
+	if(recv_rbudp_control_pkt(tx_state->session, buf, buflen, &payload, &payloadlen, scionaddrhdr, udphdr, NULL, NULL)) {
 		struct rbudp_initial_pkt parsed_pkt;
 		u32 rcvr = rcvr_by_src_address(tx_state, *scionaddrhdr, *udphdr);
 		if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
@@ -1289,7 +1304,7 @@ static void
 tx_send_initial(struct hercules_session *session, const struct hercules_path *path, size_t filesize, u32 chunklen,
 				unsigned long timestamp, u32 path_index, bool set_return_path)
 {
-	char buf[session->config.ether_size];
+	char buf[session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE];
 	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
 
 	struct hercules_control_packet pld = {
@@ -1325,11 +1340,11 @@ static bool tx_handshake(struct sender_state *tx_state)
 			}
 		}
 
-		char buf[tx_state->session->config.ether_size];
+		char buf[tx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE];
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
 		const struct udphdr *udphdr;
 		for(u64 start_wait = get_nsecs(); get_nsecs() < start_wait + tx_handshake_retry_after;) {
-			if(tx_await_rtt_ack(tx_state, buf, &scionaddrhdr, &udphdr)) {
+			if(tx_await_rtt_ack(tx_state, buf, sizeof buf, &scionaddrhdr, &udphdr)) {
 				u32 rcvr = rcvr_by_src_address(tx_state, scionaddrhdr, udphdr);
 				if(rcvr < tx_state->num_receivers && !succeeded[rcvr]) {
 					tx_state->receiver[rcvr].paths[0].next_handshake_at = UINT64_MAX;
@@ -2186,7 +2201,7 @@ static void rx_send_rtt_ack(struct receiver_state *rx_state, struct rbudp_initia
 		return;
 	}
 
-	char buf[rx_state->session->config.ether_size];
+	char buf[rx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE];
 	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
 
 	struct hercules_control_packet control_pkt = {
@@ -2216,7 +2231,7 @@ static void rx_handle_initial(struct receiver_state *rx_state, struct rbudp_init
 
 static struct receiver_state *rx_accept(struct hercules_session *session, int timeout, bool is_pcc_benchmark)
 {
-	char buf[session->config.ether_size];
+	char buf[session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE];
 	__u64 start_wait = get_nsecs();
 	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
 	setsockopt(session->control_sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
@@ -2226,7 +2241,7 @@ static struct receiver_state *rx_accept(struct hercules_session *session, int ti
 		const char *payload;
 		int payloadlen;
 		int ifid;
-		if(recv_rbudp_control_pkt(session, buf, session->config.ether_size, &payload, &payloadlen, NULL, NULL, NULL, &ifid)) {
+		if(recv_rbudp_control_pkt(session, buf, sizeof buf, &payload, &payloadlen, NULL, NULL, NULL, &ifid)) {
 			struct rbudp_initial_pkt parsed_pkt;
 			if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
 				struct receiver_state *rx_state = make_rx_state(session, parsed_pkt.filesize, parsed_pkt.chunklen,
@@ -2242,13 +2257,13 @@ static struct receiver_state *rx_accept(struct hercules_session *session, int ti
 static void rx_get_rtt_estimate(void *arg)
 {
 	struct receiver_state *rx_state = arg;
-	char buf[rx_state->session->config.ether_size];
+	char buf[rx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE];
 	const char *payload;
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
 	for(u64 timeout = get_nsecs() + 5e9; timeout > get_nsecs();) {
-		if(recv_rbudp_control_pkt(rx_state->session, buf, rx_state->session->config.ether_size, &payload, &payloadlen,
+		if(recv_rbudp_control_pkt(rx_state->session, buf, sizeof buf, &payload, &payloadlen,
 								  &scionaddrhdr, &udphdr, NULL, NULL)) {
 			u64 now = get_nsecs();
 			rx_state->handshake_rtt = (now - rx_state->cts_sent_at) / 1000;
@@ -2346,7 +2361,7 @@ static void rx_send_cts_ack(struct receiver_state *rx_state)
 		return;
 	}
 
-	char buf[rx_state->session->config.ether_size];
+	char buf[rx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE];
 	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
 
 	struct hercules_control_packet control_pkt = {
@@ -2364,7 +2379,7 @@ static void rx_send_cts_ack(struct receiver_state *rx_state)
 
 static void rx_send_ack_pkt(struct receiver_state *rx_state, struct hercules_control_packet *control_pkt,
                             struct hercules_path *path) {
-	char buf[rx_state->session->config.ether_size];
+	char buf[rx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE];
 	void *rbudp_pkt = mempcpy(buf, path->header.header, path->headerlen);
 
 	fill_rbudp_pkt(rbudp_pkt, UINT_MAX, PCC_NO_PATH, 0, (char *)control_pkt,
@@ -2423,7 +2438,7 @@ static void rx_send_path_nacks(struct receiver_state *rx_state, struct receiver_
 		return;
 	}
 
-	char buf[rx_state->session->config.ether_size];
+	char buf[rx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSIONS_SIZE];
 	void *rbudp_pkt = mempcpy(buf, path.header.header, path.headerlen);
 
 	// XXX: could write ack payload directly to buf, but
