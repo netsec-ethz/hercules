@@ -396,19 +396,21 @@ static const char *parse_pkt_fast_path(const char *pkt, size_t length, bool chec
 		offset = *(int *)pkt;
 	}
 	if(check) {
-		// we compute these pointers here again so that we do not have to pass it from kernel space into user space
-		// which could negatively affect the performance in the case when the checksum is not verified
-		struct scionhdr *scionh = (struct scionhdr *)
-				(pkt + sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct udphdr));
 		struct udphdr *l4udph = (struct udphdr *)(pkt + offset) - 1;
-
 		u16 header_checksum = l4udph->check;
-		u16 computed_checksum = scion_udp_checksum((u8 *)scionh, length - offset + sizeof(struct udphdr));
-		if(header_checksum != computed_checksum) {
-			debug_printf("Checksum in SCION/UDP header %u "
-			             "does not match computed checksum %u",
-			             ntohs(header_checksum), ntohs(computed_checksum));
-			return NULL;
+		if(header_checksum != 0) {
+			// we compute these pointers here again so that we do not have to pass it from kernel space into user space
+			// which could negatively affect the performance in the case when the checksum is not verified
+			struct scionhdr *scionh = (struct scionhdr *)
+					(pkt + sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct udphdr));
+
+			u16 computed_checksum = scion_udp_checksum((u8 *)scionh, length - offset + sizeof(struct udphdr));
+			if(header_checksum != computed_checksum) {
+				debug_printf("Checksum in SCION/UDP header %u "
+				             "does not match computed checksum %u",
+				             ntohs(header_checksum), ntohs(computed_checksum));
+				return NULL;
+			}
 		}
 	}
 	return pkt + offset;
