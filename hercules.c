@@ -50,10 +50,9 @@
 #include "send_queue.h"
 #include "bpf_prgms.h"
 
+#define MAX_MIDDLEBOX_PROTO_EXTENSION_SIZE 128 // E.g., SCION SPAO header added by LightningFilter
 
 #define L4_SCMP 1
-// #define L4_UDP 17 //  == IPPROTO_UDP
-
 
 #define NUM_FRAMES (4 * 1024)
 #define BATCH_SIZE 64
@@ -321,7 +320,7 @@ static inline struct hercules_interface *get_interface_by_id(struct hercules_ses
  * Calculate UDP checksum
  * Same as regular IP/UDP checksum but IP addrs replaced with SCION addrs
  * buf: Pointer to start of SCION packet
- * len: SCION packet length
+ * len: Length of the upper-layer header and data
  * return value: Checksum value or 0 iff input is invalid
  */
 u16 scion_udp_checksum(const u8 *buf, int len)
@@ -345,11 +344,24 @@ u16 scion_udp_checksum(const u8 *buf, int len)
 		pseudo_header[i] = ntohl(addr_hdr[i]);
 	}
 	struct scionhdr *scion_hdr = (struct scionhdr *)buf;
-	pseudo_header[i++] = ntohs(scion_hdr->payload_len);
-	pseudo_header[i++] = scion_hdr->next_header;
+
+	pseudo_header[i++] = len;
+
+	__u8 next_header = scion_hdr->next_header;
+	size_t next_offset = scion_hdr->header_len * SCION_HEADER_LINELEN;
+	if(next_header == SCION_HEADER_HBH) {
+		next_header = *(buf + next_offset);
+		next_offset += (*(buf + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+	if(next_header == SCION_HEADER_E2E) {
+		next_header = *(buf + next_offset);
+		next_offset += (*(buf + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+
+	pseudo_header[i++] = next_header;
 
 	// UDP header
-	const u32 *udp_hdr = (const u32 *)(buf + scion_hdr->header_len * SCION_HEADER_LINELEN); // skip over SCION header
+	const u32 *udp_hdr = (const u32 *)(buf + next_offset); // skip over SCION header and extension headers
 	for(int offset = i; i - offset < sizeof(struct udphdr) / sizeof(u32); i++) {
 		pseudo_header[i] = ntohl(udp_hdr[i - offset]);
 	}
@@ -360,7 +372,7 @@ u16 scion_udp_checksum(const u8 *buf, int len)
 	struct udphdr *udphdr = (struct udphdr *)udp_hdr;
 	u16 payload_len = ntohs(udphdr->len) - sizeof(struct udphdr);
 	if(payload_len != len - sizeof(struct udphdr)) {
-		debug_printf("Invalid payload_len: Got %u, Expected: %d", payload_len, len - 8);
+		debug_printf("Invalid payload_len: Got %u, Expected: %d", payload_len, len - (int)sizeof(struct udphdr));
 		return 0;
 	}
 	const u8 *payload = (u8 *)(udphdr + 1); // skip over UDP header
@@ -467,11 +479,30 @@ static const char *parse_pkt(const struct hercules_session *session, const char 
 	if(scionh->src_type != 0u) {
 		debug_printf("unsupported source address type: %u != 0 (IPv4)", scionh->src_type);
 	}
-	if(scionh->next_header != IPPROTO_UDP) {
-		if(scionh->next_header == L4_SCMP) {
+
+	__u8 next_header = scionh->next_header;
+	size_t next_offset = offset + scionh->header_len * SCION_HEADER_LINELEN;
+	if(next_header == SCION_HEADER_HBH) {
+		if(next_offset + 2 > length) {
+			debug_printf("too short for SCION HBH options header: %zu %zu", next_offset, length);
+			return NULL;
+		}
+		next_header = *((__u8 *)pkt + next_offset);
+		next_offset += (*((__u8 *)pkt + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+	if(next_header == SCION_HEADER_E2E) {
+		if(next_offset + 2 > length) {
+			debug_printf("too short for SCION E2E options header: %zu %zu", next_offset, length);
+			return NULL;
+		}
+		next_header = *((__u8 *)pkt + next_offset);
+		next_offset += (*((__u8 *)pkt + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+	if(next_header != IPPROTO_UDP) {
+		if(next_header == L4_SCMP) {
 			debug_printf("SCION/SCMP L4: not implemented, ignoring...");
 		} else {
-			debug_printf("unknown SCION L4: %u", scionh->next_header);
+			debug_printf("unknown SCION L4: %u", next_header);
 		}
 		return NULL;
 	}
@@ -487,7 +518,7 @@ static const char *parse_pkt(const struct hercules_session *session, const char 
 		return NULL;
 	}
 
-	offset += scionh->header_len * SCION_HEADER_LINELEN; // Header length is in lineLen of SCION_HEADER_LINELEN bytes
+	offset = next_offset;
 
 	// Finally parse the L4-UDP header
 	if(offset + sizeof(struct udphdr) > length) {
@@ -1085,7 +1116,7 @@ static void tx_recv_control_messages(struct sender_state *tx_state)
 {
 	struct timeval to = {.tv_sec = 0, .tv_usec = 100};
 	setsockopt(tx_state->session->control_sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
-	char buf[tx_state->session->config.ether_size];
+	char buf[tx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSION_SIZE];
 
 	// packet receive timeouts
 	u64 last_pkt_rcvd[tx_state->num_receivers];
@@ -1112,7 +1143,7 @@ static void tx_recv_control_messages(struct sender_state *tx_state)
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
 		const struct udphdr *udphdr;
 		u8 path_idx;
-		if(recv_rbudp_control_pkt(tx_state->session, buf, tx_state->session->config.ether_size, &payload, &payloadlen,
+		if(recv_rbudp_control_pkt(tx_state->session, buf, sizeof buf, &payload, &payloadlen,
 								  &scionaddrhdr, &udphdr, &path_idx, NULL)) {
 			const struct hercules_control_packet *control_pkt = (const struct hercules_control_packet *) payload;
 			if((u32) payloadlen < sizeof(control_pkt->type)) {
@@ -1191,14 +1222,14 @@ static bool tx_await_cts(struct sender_state *tx_state)
 	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
 	setsockopt(tx_state->session->control_sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
 
-	char buf[tx_state->session->config.ether_size];
+	char buf[tx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSION_SIZE];
 	const char *payload;
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
 	// Wait up to 20 seconds for the receiver to get ready
 	for(u64 start = get_nsecs(); start + 300e9l > get_nsecs();) {
-		if(recv_rbudp_control_pkt(tx_state->session, buf, tx_state->session->config.ether_size, &payload, &payloadlen, &scionaddrhdr, &udphdr, NULL, NULL)) {
+		if(recv_rbudp_control_pkt(tx_state->session, buf, sizeof buf, &payload, &payloadlen, &scionaddrhdr, &udphdr, NULL, NULL)) {
 			if(tx_handle_cts(tx_state, payload, payloadlen, rcvr_by_src_address(tx_state, scionaddrhdr, udphdr))) {
 				received++;
 				if(received >= tx_state->num_receivers) {
@@ -1226,7 +1257,7 @@ static void tx_send_handshake_ack(struct sender_state *tx_state, u32 rcvr)
 	atomic_fetch_add(&tx_state->session->tx_npkts, 1);
 }
 
-static bool tx_await_rtt_ack(struct sender_state *tx_state, char *buf, const struct scionaddrhdr_ipv4 **scionaddrhdr, const struct udphdr **udphdr)
+static bool tx_await_rtt_ack(struct sender_state *tx_state, char *buf, size_t buflen, const struct scionaddrhdr_ipv4 **scionaddrhdr, const struct udphdr **udphdr)
 {
 	const struct scionaddrhdr_ipv4 *scionaddrhdr_fallback;
 	if(scionaddrhdr == NULL) {
@@ -1244,7 +1275,7 @@ static bool tx_await_rtt_ack(struct sender_state *tx_state, char *buf, const str
 
 	const char *payload;
 	int payloadlen;
-	if(recv_rbudp_control_pkt(tx_state->session, buf, tx_state->session->config.ether_size, &payload, &payloadlen, scionaddrhdr, udphdr, NULL, NULL)) {
+	if(recv_rbudp_control_pkt(tx_state->session, buf, buflen, &payload, &payloadlen, scionaddrhdr, udphdr, NULL, NULL)) {
 		struct rbudp_initial_pkt parsed_pkt;
 		u32 rcvr = rcvr_by_src_address(tx_state, *scionaddrhdr, *udphdr);
 		if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
@@ -1309,11 +1340,11 @@ static bool tx_handshake(struct sender_state *tx_state)
 			}
 		}
 
-		char buf[tx_state->session->config.ether_size];
+		char buf[tx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSION_SIZE];
 		const struct scionaddrhdr_ipv4 *scionaddrhdr;
 		const struct udphdr *udphdr;
 		for(u64 start_wait = get_nsecs(); get_nsecs() < start_wait + tx_handshake_retry_after;) {
-			if(tx_await_rtt_ack(tx_state, buf, &scionaddrhdr, &udphdr)) {
+			if(tx_await_rtt_ack(tx_state, buf, sizeof buf, &scionaddrhdr, &udphdr)) {
 				u32 rcvr = rcvr_by_src_address(tx_state, scionaddrhdr, udphdr);
 				if(rcvr < tx_state->num_receivers && !succeeded[rcvr]) {
 					tx_state->receiver[rcvr].paths[0].next_handshake_at = UINT64_MAX;
@@ -2200,7 +2231,7 @@ static void rx_handle_initial(struct receiver_state *rx_state, struct rbudp_init
 
 static struct receiver_state *rx_accept(struct hercules_session *session, int timeout, bool is_pcc_benchmark)
 {
-	char buf[session->config.ether_size];
+	char buf[session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSION_SIZE];
 	__u64 start_wait = get_nsecs();
 	struct timeval to = {.tv_sec = 1, .tv_usec = 0};
 	setsockopt(session->control_sockfd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
@@ -2210,7 +2241,7 @@ static struct receiver_state *rx_accept(struct hercules_session *session, int ti
 		const char *payload;
 		int payloadlen;
 		int ifid;
-		if(recv_rbudp_control_pkt(session, buf, session->config.ether_size, &payload, &payloadlen, NULL, NULL, NULL, &ifid)) {
+		if(recv_rbudp_control_pkt(session, buf, sizeof buf, &payload, &payloadlen, NULL, NULL, NULL, &ifid)) {
 			struct rbudp_initial_pkt parsed_pkt;
 			if(rbudp_parse_initial(payload, payloadlen, &parsed_pkt)) {
 				struct receiver_state *rx_state = make_rx_state(session, parsed_pkt.filesize, parsed_pkt.chunklen,
@@ -2226,13 +2257,13 @@ static struct receiver_state *rx_accept(struct hercules_session *session, int ti
 static void rx_get_rtt_estimate(void *arg)
 {
 	struct receiver_state *rx_state = arg;
-	char buf[rx_state->session->config.ether_size];
+	char buf[rx_state->session->config.ether_size + MAX_MIDDLEBOX_PROTO_EXTENSION_SIZE];
 	const char *payload;
 	int payloadlen;
 	const struct scionaddrhdr_ipv4 *scionaddrhdr;
 	const struct udphdr *udphdr;
 	for(u64 timeout = get_nsecs() + 5e9; timeout > get_nsecs();) {
-		if(recv_rbudp_control_pkt(rx_state->session, buf, rx_state->session->config.ether_size, &payload, &payloadlen,
+		if(recv_rbudp_control_pkt(rx_state->session, buf, sizeof buf, &payload, &payloadlen,
 								  &scionaddrhdr, &udphdr, NULL, NULL)) {
 			u64 now = get_nsecs();
 			rx_state->handshake_rtt = (now - rx_state->cts_sent_at) / 1000;

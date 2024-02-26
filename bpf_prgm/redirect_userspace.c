@@ -42,13 +42,13 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 {
 	void *data = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
-	size_t offset = sizeof(struct ether_header) +
+	size_t min_len = sizeof(struct ether_header) +
 	                sizeof(struct iphdr) +
 	                sizeof(struct udphdr) +
 	                sizeof(struct scionhdr) +
 	                sizeof(struct scionaddrhdr_ipv4) +
 	                sizeof(struct udphdr);
-	if(data + offset > data_end) {
+	if(data + min_len > data_end) {
 		return XDP_PASS; // too short
 	}
 	const struct ether_header *eh = (const struct ether_header *)data;
@@ -88,7 +88,26 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	if(scionh->src_type != 0u) {
 		return XDP_PASS; // unsupported source address type
 	}
-	if(scionh->next_header != IPPROTO_UDP) {
+	__u8 next_header = scionh->next_header;
+	size_t next_offset = sizeof(struct ether_header) +
+	                     sizeof(struct iphdr) +
+	                     sizeof(struct udphdr) +
+	                     scionh->header_len * SCION_HEADER_LINELEN;
+	if(next_header == SCION_HEADER_HBH) {
+		if(data + next_offset + 2 > data_end) {
+			return XDP_PASS;
+		}
+		next_header = *((__u8 *)data + next_offset);
+		next_offset += (*((__u8 *)data + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+	if(next_header == SCION_HEADER_E2E) {
+		if(data + next_offset + 2 > data_end) {
+			return XDP_PASS;
+		}
+		next_header = *((__u8 *)data + next_offset);
+		next_offset += (*((__u8 *)data + next_offset + 1) + 1) * SCION_HEADER_LINELEN;
+	}
+	if(next_header != IPPROTO_UDP) {
 		return XDP_PASS;
 	}
 
@@ -99,18 +118,18 @@ int xdp_prog_redirect_userspace(struct xdp_md *ctx)
 	if(scionaddrh->dst_ip != addr->ip) {
 		return XDP_PASS; // not addressed to us (IP in SCION hdr)
 	}
-	offset += scionh->header_len * SCION_HEADER_LINELEN - // Header length is in lineLen of SCION_HEADER_LINELEN bytes
-	          sizeof(struct scionhdr) -
-	          sizeof(struct scionaddrhdr_ipv4);
+
+	size_t offset = next_offset;
 
 	// Finally parse the L4-UDP header
-	const struct udphdr *l4udph = ((void *)scionh) + scionh->header_len * SCION_HEADER_LINELEN;
+	const struct udphdr *l4udph = (struct udphdr *)(data + offset);
 	if((void *)(l4udph + 1) > data_end) {
 		return XDP_PASS; // too short after all
 	}
 	if(l4udph->dest != addr->port) {
 		return XDP_PASS;
 	}
+	offset += sizeof(struct udphdr);
 
 	// write the payload offset to the first word, so that the user space program can continue from there.
 	*(__u32 *)data = offset;

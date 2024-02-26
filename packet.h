@@ -17,6 +17,8 @@
 
 #define SCION_ENDHOST_PORT 30041
 #define SCION_HEADER_LINELEN 4
+#define SCION_HEADER_HBH 200
+#define SCION_HEADER_E2E 201
 
 #pragma pack(push)
 #pragma pack(1)
