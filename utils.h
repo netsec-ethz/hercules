@@ -35,58 +35,18 @@ typedef __u8 u8;
 # define likely(x)              __builtin_expect(!!(x), 1)
 #endif
 
-inline u16 umin16(u16 a, u16 b)
-{
-	return (a < b) ? a : b;
-}
+u16 umin16(u16 a, u16 b);
+u16 umax16(u16 a, u16 b);
 
-inline u16 umax16(u16 a, u16 b)
-{
-	return (a > b) ? a : b;
-}
+u32 umin32(u32 a, u32 b);
+u32 umax32(u32 a, u32 b);
 
-inline u32 umin32(u32 a, u32 b)
-{
-	return (a < b) ? a : b;
-}
+u64 umin64(u64 a, u64 b);
+u64 umax64(u64 a, u64 b);
 
-inline u32 umax32(u32 a, u32 b)
-{
-	return (a > b) ? a : b;
-}
+u64 get_nsecs(void);
 
-inline u64 umin64(u64 a, u64 b)
-{
-	return (a < b) ? a : b;
-}
-
-inline u64 umax64(u64 a, u64 b)
-{
-	return (a > b) ? a : b;
-}
-
-
-inline u64 get_nsecs(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec * 1000000000UL + ts.tv_nsec;
-}
-
-inline void sleep_until(u64 ns)
-{
-	struct timespec req;
-	req.tv_sec = (time_t)(ns / 1000000000UL);
-	req.tv_nsec = (long)(ns % 1000000000UL);
-	clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &req, NULL);
-}
-
-inline void sleep_nsecs(u64 ns)
-{
-	// Use clock_nanosleep to avoid drift by repeated interrupts. See NOTES in man(2) nanosleep.
-	sleep_until(get_nsecs() + ns);
-}
-
+void sleep_until(u64 ns);
+void sleep_nsecs(u64 ns);
 
 #endif

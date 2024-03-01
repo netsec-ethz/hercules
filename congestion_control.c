@@ -147,7 +147,7 @@ static u32 pcc_control_startup(struct ccontrol_state *cc_state, float utility, f
 	}
 }
 
-static inline u32 calculate_rate(double mi_duration, u32 prev_rate, float factor) {
+static u32 calculate_rate(double mi_duration, u32 prev_rate, float factor) {
 	u32 new_rate = prev_rate * factor;
 	if(factor < 1) {
 		if((u32) (new_rate * mi_duration) > (u32) (prev_rate * mi_duration) - 10) {
