@@ -305,7 +305,7 @@ static void close_xsk(struct xsk_socket_info *xsk)
 	free(xsk);
 }
 
-static inline struct hercules_interface *get_interface_by_id(struct hercules_session *session, int ifid)
+static struct hercules_interface *get_interface_by_id(struct hercules_session *session, int ifid)
 {
 	for(int i = 0; i < session->num_ifaces; i++) {
 		if(session->ifaces[i].ifid == ifid) {
@@ -812,7 +812,7 @@ static void pop_completion_ring(struct hercules_session *session, struct xsk_ume
 	}
 }
 
-static inline void pop_completion_rings(struct hercules_session *session)
+static void pop_completion_rings(struct hercules_session *session)
 {
 	for(int i = 0; i < session->num_ifaces; i++) {
 		pop_completion_ring(session, session->ifaces[i].umem);
@@ -1384,7 +1384,7 @@ static void rx_handle_initial(struct receiver_state *rx_state, struct rbudp_init
 static void
 submit_rx_frames(struct hercules_session *session, struct xsk_umem_info *umem, const u64 *addrs, size_t num_frames)
 {
-	u32 idx_fq;
+	u32 idx_fq = 0;
 	pthread_spin_lock(&umem->lock);
 	size_t reserved = xsk_ring_prod__reserve(&umem->fq, num_frames, &idx_fq);
 	while(reserved != num_frames) {
@@ -1624,7 +1624,7 @@ static char *prepare_frame(struct xsk_socket_info *xsk, u64 addr, u32 prod_tx_id
 static short flowIdCtr = 0;
 #endif
 
-static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_state, struct xsk_socket_info *xsk,
+static void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_state, struct xsk_socket_info *xsk,
 													   int ifid, u64 frame_addrs[SEND_QUEUE_ENTRIES_PER_UNIT],
 													   struct send_queue_unit *unit)
 {
@@ -1683,7 +1683,7 @@ static inline void tx_handle_send_queue_unit_for_iface(struct sender_state *tx_s
 	xsk_ring_prod__submit(&xsk->tx, num_chunks_in_unit);
 }
 
-static inline void tx_handle_send_queue_unit(struct sender_state *tx_state, struct xsk_socket_info *xsks[],
+static void tx_handle_send_queue_unit(struct sender_state *tx_state, struct xsk_socket_info *xsks[],
 											 u64 frame_addrs[][SEND_QUEUE_ENTRIES_PER_UNIT],
 											 struct send_queue_unit *unit)
 {
@@ -1728,7 +1728,7 @@ produce_batch(struct sender_state *tx_state, const u8 *path_by_rcvr, const u32 *
 	}
 }
 
-static inline void allocate_tx_frames(struct hercules_session *session,
+static void allocate_tx_frames(struct hercules_session *session,
 									  u64 frame_addrs[][SEND_QUEUE_ENTRIES_PER_UNIT])
 {
 	for(int i = 0; i < session->num_ifaces; i++) {
@@ -1920,7 +1920,7 @@ static u32 prepare_rcvr_chunks(struct sender_state *tx_state, u32 rcvr_idx, u32 
 	return num_chunks_prepared;
 }
 
-inline bool pcc_has_active_mi(struct ccontrol_state *cc_state, u64 now)
+bool pcc_has_active_mi(struct ccontrol_state *cc_state, u64 now)
 {
 	return cc_state->state != pcc_terminated &&
 	       cc_state->state != pcc_uninitialized &&
