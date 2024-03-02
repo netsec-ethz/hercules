@@ -14,9 +14,9 @@
 
 package main
 
-// #cgo CFLAGS: -O1 -Wall -DNDEBUG -D_GNU_SOURCE
+// #cgo CFLAGS: -O3 -Wall -DNDEBUG -D_GNU_SOURCE
 // #cgo LDFLAGS: ${SRCDIR}/bpf/src/libbpf.a -lm -lelf -pthread -lz
-// #pragma GCC diagnostic ignored "-Wunused-variable"
+// #pragma GCC diagnostic ignored "-Wunused-variable" // Hide warning in cgo-gcc-prolog
 // #include "hercules.h"
 // #include <linux/if_xdp.h>
 // #include <stdint.h>
