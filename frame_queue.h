@@ -26,7 +26,7 @@ struct frame_queue {
 	u16 index_mask;
 };
 
-int frame_queue__init(struct frame_queue *fq, u16 size)
+inline int frame_queue__init(struct frame_queue *fq, u16 size)
 {
 	if((size == 0) || ((size & (size - 1)) != 0)) {
 		return EINVAL; // size is zero or not a power of two
@@ -41,32 +41,32 @@ int frame_queue__init(struct frame_queue *fq, u16 size)
 	return EXIT_SUCCESS;
 }
 
-u16 frame_queue__prod_reserve(struct frame_queue *fq, u16 num)
+inline u16 frame_queue__prod_reserve(struct frame_queue *fq, u16 num)
 {
 	return umin16(atomic_load(&fq->cons) - fq->prod, num);
 }
 
-void frame_queue__prod_fill(struct frame_queue *fq, u16 offset, u64 addr)
+inline void frame_queue__prod_fill(struct frame_queue *fq, u16 offset, u64 addr)
 {
 	fq->addrs[(fq->prod + offset) & fq->index_mask] = addr >> XSK_UMEM__DEFAULT_FRAME_SHIFT;
 }
 
-void frame_queue__push(struct frame_queue *fq, u16 num)
+inline void frame_queue__push(struct frame_queue *fq, u16 num)
 {
 	atomic_fetch_add(&fq->prod, num);
 }
 
-u16 frame_queue__cons_reserve(struct frame_queue *fq, u16 num)
+inline u16 frame_queue__cons_reserve(struct frame_queue *fq, u16 num)
 {
 	return umin16(atomic_load(&fq->prod) - fq->cons + fq->size, num);
 }
 
-u64 frame_queue__cons_fetch(struct frame_queue *fq, u16 offset)
+inline u64 frame_queue__cons_fetch(struct frame_queue *fq, u16 offset)
 {
 	return fq->addrs[(fq->cons + offset) & fq->index_mask] << XSK_UMEM__DEFAULT_FRAME_SHIFT;
 }
 
-void frame_queue__pop(struct frame_queue *fq, u16 num)
+inline void frame_queue__pop(struct frame_queue *fq, u16 num)
 {
 	atomic_fetch_add(&fq->cons, num);
 }
